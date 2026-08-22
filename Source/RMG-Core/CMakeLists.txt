@@ -31,6 +31,7 @@ set(RMG_CORE_SOURCES
     MediaLoader.cpp
     Screenshot.cpp
     RomHeader.cpp
+    GameStats.cpp
     Emulation.cpp
     SaveState.cpp
     RollbackNetcode.cpp

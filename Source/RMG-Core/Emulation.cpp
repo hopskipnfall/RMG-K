@@ -10,6 +10,7 @@
 #define CORE_INTERNAL
 #include "MediaLoader.hpp"
 #include "RomSettings.hpp"
+#include "GameStats.hpp"
 #include "Emulation.hpp"
 #include "RomHeader.hpp"
 #include "Settings.hpp"
@@ -255,6 +256,7 @@ static bool pif_channel_has_command(const pif_channel& channel)
 static void FrameCallback(unsigned int frameIndex)
 {
     s_CurrentFrame = frameIndex;
+    CoreUpdateGameStats(frameIndex);
 #ifdef NETPLAY
     // Reset sync flag at the start of each new frame
     // This ensures we sync exactly once per frame regardless of PIF polling timing
@@ -1020,6 +1022,8 @@ CORE_EXPORT bool CoreStartEmulation(std::filesystem::path n64rom, std::filesyste
         s_CurrentFrame = 0;
         m64p::Core.DoCommand(M64CMD_SET_FRAME_CALLBACK, 0, (void*)FrameCallback);
 
+        CoreInitGameStats();
+
 #ifdef NETPLAY
         // Reset Kaillera sync state to prevent stale cache from previous sessions
         s_LastSyncFrame = -1;
@@ -1162,6 +1166,8 @@ CORE_EXPORT bool CoreStopEmulation(void)
     // Clear Kaillera player number when stopping
     CoreSetKailleraPlayerNumber(0);
 #endif
+
+    CoreStopGameStats();
 
     return ret == M64ERR_SUCCESS;
 }
