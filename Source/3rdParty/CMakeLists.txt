@@ -95,6 +95,38 @@ if (WIN32)
     set(SDL3NET_LDLIBS_FOR_CORE "${SDL3NET_LDLIBS_FOR_CORE} -liphlpapi -lws2_32")
 endif (WIN32)
 
+# DEBUGGER=1 pulls src/debugger/*.c into the core build, which needs SDL.h.
+# The core Makefile can normally auto-detect this itself via pkg-config, but
+# that detection doesn't reliably resolve when invoked from inside this
+# ExternalProject build step, so pass the already-known-good SDL3 flags
+# (from the pkg_check_modules(SDL3 ...) call above, already relied on for
+# SDL3_net) through explicitly instead. SDL3_CFLAGS/SDL3_LDFLAGS are
+# semicolon-separated CMake lists; they must be flattened to a single
+# space-separated string before use here, otherwise CMake splits them into
+# separate BUILD_COMMAND arguments and `make` sees each flag as its own
+# (mis-parsed) command-line option instead of part of SDL_CFLAGS/SDL_LDLIBS.
+#
+# SDL3's pkg-config Cflags only points at the parent include dir (e.g.
+# -I/usr/local/include, expecting the modern #include <SDL3/SDL.h> style).
+# mupen64plus-core's debugger sources predate SDL3 and use the legacy bare
+# #include <SDL.h>, so an extra -I directly into the SDL3/ subdirectory is
+# needed for that to resolve.
+string(REPLACE ";" " " SDL3_CFLAGS_FLAT "${SDL3_CFLAGS}")
+string(REPLACE ";" " " SDL3_LDFLAGS_FLAT "${SDL3_LDFLAGS}")
+set(SDL3_LEGACY_INCLUDE_DIRS "${SDL3_INCLUDE_DIRS}")
+list(TRANSFORM SDL3_LEGACY_INCLUDE_DIRS APPEND "/SDL3")
+list(TRANSFORM SDL3_LEGACY_INCLUDE_DIRS PREPEND "-I")
+string(REPLACE ";" " " SDL3_LEGACY_INCLUDE_FLAGS "${SDL3_LEGACY_INCLUDE_DIRS}")
+# mupen64plus-core's debugger sources also still use SDL2's semaphore API
+# (SDL_sem, SDL_SemWait, SDL_SemPost, ...), renamed in SDL3. Force-include
+# SDL3's own compatibility shim (SDL_oldnames.h), which #defines the old
+# names to their SDL3 equivalents, instead of patching the vendored source.
+# dbg_breakpoints.c also calls sprintf() without #include <stdio.h> (relied
+# on it coming in transitively via old SDL2 headers) -- force-include that
+# too rather than patch the vendored source for the same reason.
+set(SDL_CFLAGS_FOR_CORE "-DUSE_SDL3 ${SDL3_CFLAGS_FLAT} ${SDL3_LEGACY_INCLUDE_FLAGS} -include SDL3/SDL_oldnames.h -include stdio.h")
+set(SDL_LDLIBS_FOR_CORE "${SDL3_LDFLAGS_FLAT}")
+
 ExternalProject_Add(mupen64plus-core
     SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/mupen64plus-core/
 
@@ -113,6 +145,7 @@ ExternalProject_Add(mupen64plus-core
         # TODO: when SDL3_net has made a release,
         # remove the vendored SDL3_net
         SDLNET_CFLAGS=${SDL3NET_CFLAGS_FOR_CORE} SDLNET_LDLIBS=${SDL3NET_LDLIBS_FOR_CORE}
+        SDL_CFLAGS=${SDL_CFLAGS_FOR_CORE} SDL_LDLIBS=${SDL_LDLIBS_FOR_CORE}
     BUILD_IN_SOURCE False
     BUILD_ALWAYS True
     BINARY_DIR ${M64P_CORE_BUILD_DIR}
