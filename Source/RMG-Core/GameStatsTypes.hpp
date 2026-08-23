@@ -29,7 +29,8 @@
 
 #define RMGK_GAMESTATS_SHM_NAME "RMGK_GameStats"
 #define RMGK_GAMESTATS_MAGIC 0x4B474D52u // 'RMGK' (little-endian bytes)
-#define RMGK_GAMESTATS_VERSION 3u
+#define RMGK_GAMESTATS_VERSION 4u
+#define RMGK_GAMESTATS_TAG_LEN 32
 #define RMGK_GAMESTATS_MAX_PLAYERS 4
 
 #pragma pack(push, 1)
@@ -49,6 +50,11 @@ struct GameStatsPlayerFrame
     float    positionX;
     float    positionY;
     uint32_t state;           // action/state id
+    char     tag[RMGK_GAMESTATS_TAG_LEN]; // null-terminated UTF-8 netplay
+                               // room name/tag for this seat; empty ("")
+                               // whenever this port has no netplay seat
+                               // (offline play, no netplay session, etc).
+                               // Comes from room metadata, not game memory.
 };
 
 struct GameStatsSharedFrame

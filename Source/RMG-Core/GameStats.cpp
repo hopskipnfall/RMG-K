@@ -32,6 +32,15 @@
 #include <unistd.h>
 #endif
 
+#ifdef RMGK_HAVE_P2P_TRANSPORT
+// Canonical slot(port)-indexed player-name table, already kept up to date by
+// every netplay path (rollback lobby, legacy Kaillera, p2p core itself) as
+// part of preparing the .krec recording header. Defined in
+// Source/n02/n02_client.cpp; declared here directly (rather than including
+// the internal n02 header) since this is the only symbol needed from it.
+extern char recording_player_names[4][32];
+#endif
+
 namespace
 {
 #ifdef _WIN32
@@ -115,6 +124,14 @@ bool read_player_frame(int port, GameStatsPlayerFrame& out)
         out.positionX = read_f32(positionVec + 0x00);
         out.positionY = read_f32(positionVec + 0x04);
     }
+
+#ifdef RMGK_HAVE_P2P_TRANSPORT
+    // Room metadata, not game memory: empty ("") whenever this port isn't a
+    // named netplay seat (offline play, no netplay session, CPU-filled slot
+    // that was never assigned a seat, etc).
+    std::memcpy(out.tag, recording_player_names[port], sizeof(out.tag));
+    out.tag[sizeof(out.tag) - 1] = '\0';
+#endif
 
     out.active = 1;
     return true;
