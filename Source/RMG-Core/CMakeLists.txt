@@ -64,6 +64,10 @@ if (PORTABLE_INSTALL)
     add_definitions(-DPORTABLE_INSTALL)
 endif(PORTABLE_INSTALL)
 
+if (GAME_STATS)
+    add_definitions(-DRMGK_GAME_STATS)
+endif(GAME_STATS)
+
 add_library(RMG-Core SHARED ${RMG_CORE_SOURCES})
 
 if(TARGET GekkoNet)
