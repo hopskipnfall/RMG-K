@@ -88,6 +88,7 @@ bool read_player_frame(int port, GameStatsPlayerFrame& out)
     {
         return false;
     }
+    out.isHuman = (slotType == 0) ? 1 : 0; // 0 = human, 1 = CPU per the match struct
 
     const uint32_t playerObject = m64p::Core.DebugMemRead32(matchStruct + GameStatsAddresses::Port_PlayerObject);
     if (!is_valid_pointer(playerObject)) // port occupied but not currently in a live match

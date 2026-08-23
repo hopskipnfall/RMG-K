@@ -29,7 +29,7 @@
 
 #define RMGK_GAMESTATS_SHM_NAME "RMGK_GameStats"
 #define RMGK_GAMESTATS_MAGIC 0x4B474D52u // 'RMGK' (little-endian bytes)
-#define RMGK_GAMESTATS_VERSION 2u
+#define RMGK_GAMESTATS_VERSION 3u
 #define RMGK_GAMESTATS_MAX_PLAYERS 4
 
 #pragma pack(push, 1)
@@ -40,6 +40,12 @@ struct GameStatsPlayerFrame
                                // all other fields are only meaningful when active == 1
     uint8_t  character;
     int8_t   facingDirection; // 1 = right, -1 = left
+    uint8_t  isHuman;         // 1 = human-controlled, 0 = CPU. Does NOT
+                               // distinguish which human is "you" in local
+                               // multiplayer, and has no netplay-specific
+                               // "which port is the local player" concept
+                               // (that's tracked separately in RMG-K but not
+                               // yet exposed here) -- see interface doc.
     float    positionX;
     float    positionY;
     uint32_t state;           // action/state id
