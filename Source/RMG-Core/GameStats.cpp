@@ -40,9 +40,10 @@ HANDLE s_MappingHandle = nullptr;
 int s_ShmFd = -1;
 #endif
 
-GameStatsSharedFrame* s_SharedFrame  = nullptr;
-bool                  s_StatsEnabled = false;
-bool                  s_WarnedOnce   = false;
+GameStatsSharedFrame* s_SharedFrame     = nullptr;
+bool                  s_StatsEnabled    = false;
+bool                  s_DebuggerChecked = false;
+bool                  s_WarnedOnce      = false;
 
 void warn_once(const std::string& message)
 {
@@ -234,8 +235,9 @@ void destroy_shared_memory(void)
 
 CORE_EXPORT void CoreInitGameStats(void)
 {
-    s_WarnedOnce   = false;
-    s_StatsEnabled = false;
+    s_WarnedOnce      = false;
+    s_StatsEnabled    = false;
+    s_DebuggerChecked = false;
 
     if (!m64p::Core.IsHooked() || m64p::Core.DebugMemGetPointer == nullptr)
     {
@@ -243,14 +245,12 @@ CORE_EXPORT void CoreInitGameStats(void)
         return;
     }
 
-    // DebugMem* functions are always exported, but only functional (return
-    // non-NULL/non-zero) when the core was built with DEBUGGER=1
-    if (m64p::Core.DebugMemGetPointer(M64P_DBG_PTR_RDRAM) == nullptr)
-    {
-        warn_once("CoreInitGameStats: core was not built with DEBUGGER=1, game stats disabled");
-        return;
-    }
-
+    // Whether the core was actually built with DEBUGGER=1 can't be checked
+    // here yet: DebugMemGetPointer(RDRAM) only returns non-NULL once RDRAM
+    // has been allocated, which happens later on the emulation thread (in
+    // main_run() -> init_device()), not during this synchronous setup call.
+    // That check happens lazily on the first CoreUpdateGameStats() instead,
+    // by which point a frame has actually run.
     if (!create_shared_memory())
     {
         return;
@@ -270,6 +270,21 @@ CORE_EXPORT void CoreUpdateGameStats(unsigned int frameIndex)
     if (!s_StatsEnabled || s_SharedFrame == nullptr)
     {
         return;
+    }
+
+    if (!s_DebuggerChecked)
+    {
+        s_DebuggerChecked = true;
+        // DebugMem* functions are always exported, but only functional
+        // (return non-NULL/non-zero) when the core was built with
+        // DEBUGGER=1. RDRAM is guaranteed to exist by now since a frame is
+        // actually running.
+        if (m64p::Core.DebugMemGetPointer(M64P_DBG_PTR_RDRAM) == nullptr)
+        {
+            warn_once("CoreUpdateGameStats: core was not built with DEBUGGER=1, game stats disabled");
+            s_StatsEnabled = false;
+            return;
+        }
     }
 
     GameStatsPlayerFrame players[RMGK_GAMESTATS_MAX_PLAYERS] = {};
