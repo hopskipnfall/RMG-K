@@ -13,15 +13,24 @@
 // New, independent per-match ".rmgr" replay recorder. Entirely separate
 // from Source/n02's .krec format - does not read, write, or otherwise
 // touch anything under Source/n02/.
+//
+// Thread safety: OnFrame() is called from the emulation thread while
+// OnEmulationStart()/OnEmulationStop() are called from the UI thread. All
+// three are internally synchronized (a mutex is held for the duration of
+// each call), so callers don't need any of their own locking.
 namespace Replay
 {
 // Call once, right after CoreStartEmulation registers the frame callback.
 // Reads SettingsID::GameStats_ReplayEnabled and arms (or doesn't) the
-// per-match state machine driven by OnFrame().
+// per-match state machine driven by OnFrame(). Also defensively closes
+// any file left open from an abnormal prior session end.
 void OnEmulationStart(void);
 
-// Call from CoreStopEmulation. Finalizes (patches the length field and
-// closes) any file still open, e.g. if the user quit mid-match.
+// Call from CoreStopEmulation, and also from any UI-thread path that ends
+// emulation without necessarily going through CoreStopEmulation (see
+// MainWindow::on_Emulation_Finished). Finalizes (patches the length field
+// and closes) any file still open, e.g. if the user quit mid-match. Safe
+// to call when nothing is open/recording.
 void OnEmulationStop(void);
 
 // Call once per real emulated frame (i.e. from the same place krec's

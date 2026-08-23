@@ -11,6 +11,7 @@
 #include "ReplayMemory.hpp"
 #include "Settings.hpp"
 #include "Directories.hpp"
+#include "Callback.hpp"
 #ifdef RMGK_HAVE_P2P_TRANSPORT
 #include "kailleraclient.h"
 #endif
@@ -21,6 +22,7 @@
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <string>
 
 namespace
@@ -119,6 +121,15 @@ std::ofstream s_File;
 int32_t       s_FrameNumber = 0;
 uint32_t      s_StreamBytesWritten = 0;
 
+// Guards s_State/s_File (and, transitively, everything the helpers below
+// touch). OnFrame() runs on the emulation thread while OnEmulationStop()
+// is always called from the UI thread (via CoreStopEmulation() and, for
+// paths that don't reach that, MainWindow::on_Emulation_Finished), so
+// without this a quit-mid-match can have both threads touching s_File at
+// once. Locked at the top of each of the 3 public entry points; every
+// static helper here is only ever reached through one of those.
+std::mutex s_Mutex;
+
 template <typename T>
 void WriteEvent(EventCode code, const T& payload)
 {
@@ -182,9 +193,14 @@ std::string SanitizeForFilename(const std::string& input)
 std::string BuildFileName(void)
 {
     time_t now = time(nullptr);
-    tm* localNow = localtime(&now);
+    tm localNow{};
+#ifdef _WIN32
+    localtime_s(&localNow, &now);
+#else
+    localtime_r(&now, &localNow);
+#endif
     char datePart[16];
-    strftime(datePart, sizeof(datePart), "%y%m%d%H%M%S", localNow);
+    strftime(datePart, sizeof(datePart), "%y%m%d%H%M%S", &localNow);
 
     std::string filename = datePart;
 
@@ -203,8 +219,16 @@ std::string BuildFileName(void)
     return filename;
 }
 
-void OpenNewFile(const ReplayMemory::MatchInfo& matchInfo)
+// Returns true if the file was opened and the header/GameStart event were
+// written successfully; false if the caller should not transition into the
+// Recording state (e.g. open() failed).
+bool OpenNewFile(const ReplayMemory::MatchInfo& matchInfo)
 {
+    // Reset regardless of whether the open below succeeds, so a failed
+    // open never leaves stale counts around for the next attempt.
+    s_FrameNumber = 0;
+    s_StreamBytesWritten = 0;
+
     std::filesystem::path directory = CoreGetUserDataDirectory() / "Replays";
     std::filesystem::create_directories(directory);
 
@@ -212,8 +236,13 @@ void OpenNewFile(const ReplayMemory::MatchInfo& matchInfo)
     s_File.open(path, std::ios::binary | std::ios::trunc);
     if (!s_File.is_open())
     {
-        return;
+        CoreAddCallbackMessage(CoreDebugMessageType::Warning,
+            "Replay: failed to open " + path.string() + " for recording");
+        return false;
     }
+
+    CoreAddCallbackMessage(CoreDebugMessageType::Info,
+        "Replay: recording to " + path.string());
 
     FileHeader header{};
     std::memcpy(header.magic, "RMGR", 4);
@@ -221,7 +250,6 @@ void OpenNewFile(const ReplayMemory::MatchInfo& matchInfo)
     header.streamLength = 0;
     s_File.write(reinterpret_cast<const char*>(&header), sizeof(header));
 
-    s_StreamBytesWritten = 0;
     WriteEventPayloadsEvent();
 
     GameStartEvent startEvent{};
@@ -247,7 +275,7 @@ void OpenNewFile(const ReplayMemory::MatchInfo& matchInfo)
 
     WriteEvent(EventCode::GameStart, startEvent);
 
-    s_FrameNumber = 0;
+    return true;
 }
 
 void FinalizeFile(uint8_t endReason, const ReplayMemory::MatchInfo& matchInfo)
@@ -325,6 +353,19 @@ namespace Replay
 {
 void OnEmulationStart(void)
 {
+    std::lock_guard<std::mutex> lock(s_Mutex);
+
+    // Defensively handle a leftover open file from an abnormal prior
+    // session end (e.g. OnEmulationStop() never ran on that session).
+    // open()'ing an already-open ofstream just sets failbit and leaves
+    // the old stream open/is_open()==true, which would otherwise silently
+    // disable recording for the rest of the process.
+    if (s_File.is_open())
+    {
+        s_File.close();
+        s_File.clear();
+    }
+
     bool enabled = CoreSettingsGetBoolValue(SettingsID::GameStats_ReplayEnabled);
     s_State = enabled ? State::WaitingForMatch : State::Idle;
     s_FrameNumber = 0;
@@ -333,6 +374,8 @@ void OnEmulationStart(void)
 
 void OnEmulationStop(void)
 {
+    std::lock_guard<std::mutex> lock(s_Mutex);
+
     if (s_State == State::Recording)
     {
         ReplayMemory::MatchInfo matchInfo = ReplayMemory::ReadMatchInfo();
@@ -343,6 +386,8 @@ void OnEmulationStop(void)
 
 void OnFrame(void)
 {
+    std::lock_guard<std::mutex> lock(s_Mutex);
+
     if (s_State == State::Idle)
     {
         return;
@@ -369,8 +414,11 @@ void OnFrame(void)
     {
         if (matchInfo.gameStatus == 0 || matchInfo.gameStatus == 1)
         {
-            OpenNewFile(matchInfo);
-            s_State = State::Recording;
+            if (OpenNewFile(matchInfo))
+            {
+                s_State = State::Recording;
+            }
+            // else: stay in WaitingForMatch and retry next frame.
         }
         return;
     }
