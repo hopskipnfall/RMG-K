@@ -1,0 +1,392 @@
+/*
+ * Rosalie's Mupen GUI - https://github.com/Rosalie241/RMG
+ *  Copyright (C) 2020-2025 Rosalie Wanders <rosalie@mailbox.org>
+ *
+ *  This program is free software: you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License version 3.
+ *  You should have received a copy of the GNU General Public License
+ *  along with this program. If not, see <https://www.gnu.org/licenses/>.
+ */
+#include "Replay.hpp"
+#include "ReplayMemory.hpp"
+#include "Settings.hpp"
+#include "Directories.hpp"
+#ifdef RMGK_HAVE_P2P_TRANSPORT
+#include "kailleraclient.h"
+#endif
+
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <ctime>
+#include <filesystem>
+#include <fstream>
+#include <string>
+
+namespace
+{
+#pragma pack(push, 1)
+
+struct FileHeader
+{
+    char     magic[4];     // "RMGR"
+    uint8_t  version;      // 1
+    uint8_t  reserved[3];  // zero
+    uint32_t streamLength; // 0 while recording, patched to the real value at close
+};
+static_assert(sizeof(FileHeader) == 12, "FileHeader must be 12 bytes");
+
+enum class EventCode : uint8_t
+{
+    EventPayloads = 0x01,
+    GameStart     = 0x02,
+    PreFrame      = 0x03,
+    PostFrame     = 0x04,
+    GameEnd       = 0x05,
+};
+
+struct GameStartPortInfo
+{
+    uint8_t slotType; // 0 human, 1 CPU, 2 empty
+    uint8_t characterId;
+    uint8_t costumeId;
+    uint8_t teamColor;
+};
+static_assert(sizeof(GameStartPortInfo) == 4, "GameStartPortInfo must be 4 bytes");
+
+struct GameStartEvent
+{
+    uint8_t           stageId;
+    uint8_t           gameType;
+    uint8_t           stockCountSetting;
+    uint8_t           timeLimitMinutes;
+    uint8_t           damageRatio;
+    uint8_t           itemFrequency;
+    GameStartPortInfo ports[4];
+    char              playerNames[4][32];
+};
+static_assert(sizeof(GameStartEvent) == 150, "GameStartEvent must be 150 bytes");
+
+struct PreFrameEvent
+{
+    int32_t  frame;
+    uint8_t  port;
+    uint16_t buttons;
+    int8_t   stickX;
+    int8_t   stickY;
+};
+static_assert(sizeof(PreFrameEvent) == 9, "PreFrameEvent must be 9 bytes");
+
+struct PostFrameEvent
+{
+    int32_t  frame;
+    uint8_t  port;
+    uint8_t  characterId;
+    uint16_t actionStateId;
+    float    positionX;
+    float    positionY;
+    int32_t  facingDirection;
+    float    velocityX;
+    float    velocityY;
+    uint32_t damagePercent;
+    int8_t   stocksRemaining;
+    uint8_t  jumpsUsed;
+    uint8_t  groundedState;
+    uint8_t  hurtboxState;
+    uint16_t hitstunCounter;
+    uint32_t actionFrameCounter;
+};
+static_assert(sizeof(PostFrameEvent) == 42, "PostFrameEvent must be 42 bytes");
+
+struct GameEndEvent
+{
+    uint8_t endReason; // 0 aborted (match-was-reset or process/emulation stopped mid-match), 1 normal end
+    int8_t  placements[4]; // final stocks remaining per port, -1 if never seated
+};
+static_assert(sizeof(GameEndEvent) == 5, "GameEndEvent must be 5 bytes");
+
+#pragma pack(pop)
+
+enum class State
+{
+    Idle,            // feature disabled for this emulation session
+    WaitingForMatch, // enabled, no file open, watching for a VS match to start
+    Recording,       // file open, writing Pre/Post-Frame events every frame
+};
+
+State         s_State = State::Idle;
+std::ofstream s_File;
+int32_t       s_FrameNumber = 0;
+uint32_t      s_StreamBytesWritten = 0;
+
+template <typename T>
+void WriteEvent(EventCode code, const T& payload)
+{
+    uint8_t codeByte = static_cast<uint8_t>(code);
+    s_File.write(reinterpret_cast<const char*>(&codeByte), sizeof(codeByte));
+    s_File.write(reinterpret_cast<const char*>(&payload), sizeof(payload));
+    s_StreamBytesWritten += static_cast<uint32_t>(sizeof(codeByte) + sizeof(payload));
+}
+
+// The Event Payloads event (0x01) is always first: it declares the exact
+// payload size of every other event code this file uses, so a future
+// parser reading an unfamiliar/old-version file can skip unknown or
+// resized events instead of breaking. See handoff doc section 4.2/4.6.
+void WriteEventPayloadsEvent(void)
+{
+    struct EventSize
+    {
+        EventCode code;
+        uint16_t  size;
+    };
+    static const EventSize sizes[] = {
+        {EventCode::GameStart, static_cast<uint16_t>(sizeof(GameStartEvent))},
+        {EventCode::PreFrame,  static_cast<uint16_t>(sizeof(PreFrameEvent))},
+        {EventCode::PostFrame, static_cast<uint16_t>(sizeof(PostFrameEvent))},
+        {EventCode::GameEnd,   static_cast<uint16_t>(sizeof(GameEndEvent))},
+    };
+
+    uint8_t codeByte = static_cast<uint8_t>(EventCode::EventPayloads);
+    uint8_t count = static_cast<uint8_t>(sizeof(sizes) / sizeof(sizes[0]));
+    s_File.write(reinterpret_cast<const char*>(&codeByte), sizeof(codeByte));
+    s_File.write(reinterpret_cast<const char*>(&count), sizeof(count));
+    s_StreamBytesWritten += sizeof(codeByte) + sizeof(count);
+
+    for (const EventSize& entry : sizes)
+    {
+        uint8_t  entryCode = static_cast<uint8_t>(entry.code);
+        uint16_t entrySize = entry.size;
+        s_File.write(reinterpret_cast<const char*>(&entryCode), sizeof(entryCode));
+        s_File.write(reinterpret_cast<const char*>(&entrySize), sizeof(entrySize));
+        s_StreamBytesWritten += sizeof(entryCode) + sizeof(entrySize);
+    }
+}
+
+std::string SanitizeForFilename(const std::string& input)
+{
+    std::string result = input.substr(0, 24);
+    for (char& c : result)
+    {
+        if (c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' ||
+            c == '"' || c == '<' || c == '>' || c == '|')
+        {
+            c = '_';
+        }
+    }
+    return result;
+}
+
+// Mirrors n02_client.cpp's "YYMMDDHHMMSS-Player1-Player2.krec" convention
+// (section 3.1 of the handoff doc), simplified: no MAX_PATH budget
+// juggling, each name flatly capped at 24 chars.
+std::string BuildFileName(void)
+{
+    time_t now = time(nullptr);
+    tm* localNow = localtime(&now);
+    char datePart[16];
+    strftime(datePart, sizeof(datePart), "%y%m%d%H%M%S", localNow);
+
+    std::string filename = datePart;
+
+#ifdef RMGK_HAVE_P2P_TRANSPORT
+    for (int i = 0; i < 4; i++)
+    {
+        if (recording_player_names[i][0] != 0)
+        {
+            filename += "-";
+            filename += SanitizeForFilename(recording_player_names[i]);
+        }
+    }
+#endif
+
+    filename += ".rmgr";
+    return filename;
+}
+
+void OpenNewFile(const ReplayMemory::MatchInfo& matchInfo)
+{
+    std::filesystem::path directory = CoreGetUserDataDirectory() / "Replays";
+    std::filesystem::create_directories(directory);
+
+    std::filesystem::path path = directory / BuildFileName();
+    s_File.open(path, std::ios::binary | std::ios::trunc);
+    if (!s_File.is_open())
+    {
+        return;
+    }
+
+    FileHeader header{};
+    std::memcpy(header.magic, "RMGR", 4);
+    header.version = 1;
+    header.streamLength = 0;
+    s_File.write(reinterpret_cast<const char*>(&header), sizeof(header));
+
+    s_StreamBytesWritten = 0;
+    WriteEventPayloadsEvent();
+
+    GameStartEvent startEvent{};
+    startEvent.stageId           = matchInfo.stageId;
+    startEvent.gameType          = matchInfo.gameType;
+    startEvent.stockCountSetting = matchInfo.stockCountSetting;
+    startEvent.timeLimitMinutes  = matchInfo.timeLimitMinutes;
+    startEvent.damageRatio       = matchInfo.damageRatio;
+    startEvent.itemFrequency     = matchInfo.itemFrequency;
+
+    for (int port = 0; port < 4; port++)
+    {
+        ReplayMemory::PortMatchInfo portInfo = ReplayMemory::ReadPortMatchInfo(matchInfo.matchInfoPtr, port);
+        startEvent.ports[port].slotType    = portInfo.slotType;
+        startEvent.ports[port].characterId = portInfo.characterId;
+        startEvent.ports[port].costumeId   = portInfo.costumeId;
+        startEvent.ports[port].teamColor   = portInfo.teamColor;
+    }
+
+#ifdef RMGK_HAVE_P2P_TRANSPORT
+    std::memcpy(startEvent.playerNames, recording_player_names, sizeof(startEvent.playerNames));
+#endif
+
+    WriteEvent(EventCode::GameStart, startEvent);
+
+    s_FrameNumber = 0;
+}
+
+void FinalizeFile(uint8_t endReason, const ReplayMemory::MatchInfo& matchInfo)
+{
+    if (!s_File.is_open())
+    {
+        return;
+    }
+
+    GameEndEvent endEvent{};
+    endEvent.endReason = endReason;
+    for (int port = 0; port < 4; port++)
+    {
+        ReplayMemory::PortMatchInfo portInfo = ReplayMemory::ReadPortMatchInfo(matchInfo.matchInfoPtr, port);
+        endEvent.placements[port] = portInfo.seated ? portInfo.stocksRemaining : -1;
+    }
+    WriteEvent(EventCode::GameEnd, endEvent);
+
+    s_File.flush();
+    s_File.seekp(offsetof(FileHeader, streamLength));
+    uint32_t length = s_StreamBytesWritten;
+    s_File.write(reinterpret_cast<const char*>(&length), sizeof(length));
+    s_File.close();
+}
+
+void RecordFrame(const ReplayMemory::MatchInfo& matchInfo)
+{
+    for (int port = 0; port < 4; port++)
+    {
+        ReplayMemory::PortMatchInfo portInfo = ReplayMemory::ReadPortMatchInfo(matchInfo.matchInfoPtr, port);
+        if (!portInfo.seated)
+        {
+            continue;
+        }
+
+        ReplayMemory::PortPlayerState state = ReplayMemory::ReadPortPlayerState(matchInfo.matchInfoPtr, port);
+        if (!state.valid)
+        {
+            continue;
+        }
+
+        PreFrameEvent pre{};
+        pre.frame   = s_FrameNumber;
+        pre.port    = static_cast<uint8_t>(port);
+        pre.buttons = state.processedButtons;
+        pre.stickX  = state.stickX;
+        pre.stickY  = state.stickY;
+        WriteEvent(EventCode::PreFrame, pre);
+
+        PostFrameEvent post{};
+        post.frame           = s_FrameNumber;
+        post.port             = static_cast<uint8_t>(port);
+        post.characterId       = state.characterId;
+        post.actionStateId      = state.actionStateId;
+        post.positionX           = state.positionX;
+        post.positionY            = state.positionY;
+        post.facingDirection       = state.facingDirection;
+        post.velocityX              = state.velocityX;
+        post.velocityY               = state.velocityY;
+        post.damagePercent            = state.damagePercent;
+        post.stocksRemaining           = portInfo.stocksRemaining;
+        post.jumpsUsed                  = static_cast<uint8_t>(state.jumpsUsed);
+        post.groundedState               = state.groundedState;
+        post.hurtboxState                 = state.hurtboxState;
+        post.hitstunCounter                = state.hitstunCounter;
+        post.actionFrameCounter             = state.actionFrameCounter;
+        WriteEvent(EventCode::PostFrame, post);
+    }
+
+    s_FrameNumber++;
+}
+} // namespace
+
+namespace Replay
+{
+void OnEmulationStart(void)
+{
+    bool enabled = CoreSettingsGetBoolValue(SettingsID::GameStats_ReplayEnabled);
+    s_State = enabled ? State::WaitingForMatch : State::Idle;
+    s_FrameNumber = 0;
+    s_StreamBytesWritten = 0;
+}
+
+void OnEmulationStop(void)
+{
+    if (s_State == State::Recording)
+    {
+        ReplayMemory::MatchInfo matchInfo = ReplayMemory::ReadMatchInfo();
+        FinalizeFile(0 /* aborted: emulation stopped mid-match */, matchInfo);
+    }
+    s_State = State::Idle;
+}
+
+void OnFrame(void)
+{
+    if (s_State == State::Idle)
+    {
+        return;
+    }
+
+    if (!ReplayMemory::IsInVsMatchScreen())
+    {
+        if (s_State == State::Recording)
+        {
+            ReplayMemory::MatchInfo matchInfo = ReplayMemory::ReadMatchInfo();
+            FinalizeFile(0 /* aborted: left the VS match screen unexpectedly */, matchInfo);
+        }
+        s_State = State::WaitingForMatch;
+        return;
+    }
+
+    ReplayMemory::MatchInfo matchInfo = ReplayMemory::ReadMatchInfo();
+    if (!matchInfo.valid)
+    {
+        return;
+    }
+
+    if (s_State == State::WaitingForMatch)
+    {
+        if (matchInfo.gameStatus == 0 || matchInfo.gameStatus == 1)
+        {
+            OpenNewFile(matchInfo);
+            s_State = State::Recording;
+        }
+        return;
+    }
+
+    // s_State == State::Recording
+    if (matchInfo.gameStatus == 5)
+    {
+        uint8_t endReason = matchInfo.matchWasReset ? 0 : 1;
+        FinalizeFile(endReason, matchInfo);
+        s_State = State::WaitingForMatch;
+        return;
+    }
+
+    if (matchInfo.gameStatus == 1)
+    {
+        RecordFrame(matchInfo);
+    }
+}
+} // namespace Replay
