@@ -2268,6 +2268,25 @@
              </item>
             </layout>
            </item>
+           <item>
+            <widget class="QGroupBox" name="replaySettingsGroupBox">
+             <property name="title">
+              <string>Replay Recording</string>
+             </property>
+             <layout class="QVBoxLayout" name="replaySettingsLayout">
+              <item>
+               <widget class="QCheckBox" name="replayEnabledCheckBox">
+                <property name="text">
+                 <string>Record replay file (.rmgr)</string>
+                </property>
+                <property name="toolTip">
+                 <string>Records per-frame inputs and game state for the current match to a .rmgr file, separate from krec. Works for both online and offline matches.</string>
+                </property>
+               </widget>
+              </item>
+             </layout>
+            </widget>
+           </item>
           </layout>
          </widget>
          <widget class="QWidget" name="gameTab">
