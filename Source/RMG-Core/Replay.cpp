@@ -10,7 +10,6 @@
 #include "Replay.hpp"
 #include "ReplayMemory.hpp"
 #include "Settings.hpp"
-#include "Directories.hpp"
 #include "Callback.hpp"
 #include "Library.hpp"
 #ifdef RMGK_HAVE_P2P_TRANSPORT
@@ -230,7 +229,11 @@ bool OpenNewFile(const ReplayMemory::MatchInfo& matchInfo)
     s_FrameNumber = 0;
     s_StreamBytesWritten = 0;
 
-    std::filesystem::path directory = CoreGetUserDataDirectory() / "Replays";
+    // Bare relative path, resolved by CWD - deliberately mirrors krec's own
+    // "records" directory convention (Source/n02/n02_client.cpp) exactly,
+    // so .rmgr files land next to .krec files at the top level instead of
+    // being nested under the per-platform user-data directory.
+    std::filesystem::path directory("replays");
     std::filesystem::create_directories(directory);
 
     std::filesystem::path path = directory / BuildFileName();
@@ -369,6 +372,11 @@ CORE_EXPORT void OnEmulationStart(void)
 
     bool enabled = CoreSettingsGetBoolValue(SettingsID::GameStats_ReplayEnabled);
     s_State = enabled ? State::WaitingForMatch : State::Idle;
+    if (enabled)
+    {
+        CoreAddCallbackMessage(CoreDebugMessageType::Info,
+            "Replay: enabled, watching for a match to start");
+    }
     s_FrameNumber = 0;
     s_StreamBytesWritten = 0;
 }
