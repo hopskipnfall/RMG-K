@@ -117,14 +117,18 @@ set(SDL3_LEGACY_INCLUDE_DIRS "${SDL3_INCLUDE_DIRS}")
 list(TRANSFORM SDL3_LEGACY_INCLUDE_DIRS APPEND "/SDL3")
 list(TRANSFORM SDL3_LEGACY_INCLUDE_DIRS PREPEND "-I")
 string(REPLACE ";" " " SDL3_LEGACY_INCLUDE_FLAGS "${SDL3_LEGACY_INCLUDE_DIRS}")
-# mupen64plus-core's debugger sources also still use SDL2's semaphore API
-# (SDL_sem, SDL_SemWait, SDL_SemPost, ...), renamed in SDL3. Force-include
-# SDL3's own compatibility shim (SDL_oldnames.h), which #defines the old
-# names to their SDL3 equivalents, instead of patching the vendored source.
-# dbg_breakpoints.c also calls sprintf() without #include <stdio.h> (relied
-# on it coming in transitively via old SDL2 headers) -- force-include that
-# too rather than patch the vendored source for the same reason.
-set(SDL_CFLAGS_FOR_CORE "-DUSE_SDL3 ${SDL3_CFLAGS_FLAT} ${SDL3_LEGACY_INCLUDE_FLAGS} -include SDL3/SDL_oldnames.h -include stdio.h")
+# NOT force-including anything else here (e.g. via -include) even though
+# some debugger/*.c files need small compat fixes for SDL3/newer toolchains
+# (dbg_breakpoints.c needed <stdio.h> for sprintf(), patched directly in
+# that file instead). CFLAGS is shared by every compilation unit this
+# Makefile builds - including the new-dynarec .S assembly files, which are
+# routed through the C compiler for preprocessing (see the core Makefile's
+# %.o: %.S rule) and share this same CFLAGS. A forced #include here was
+# found injecting real header content into that assembly preprocessing
+# pass, which the assembler then choked on - so anything added to
+# SDL_CFLAGS_FOR_CORE needs to be safe for a plain .S file too (search
+# paths and -D defines are; -include is not).
+set(SDL_CFLAGS_FOR_CORE "-DUSE_SDL3 ${SDL3_CFLAGS_FLAT} ${SDL3_LEGACY_INCLUDE_FLAGS}")
 set(SDL_LDLIBS_FOR_CORE "${SDL3_LDFLAGS_FLAT}")
 
 ExternalProject_Add(mupen64plus-core
