@@ -573,6 +573,16 @@ void KailleraPlaybackDialog::setupUI()
     m_btnExport->hide();
 #endif
 
+#ifdef RMGK_GAME_STATS
+    // Independent of Export MP4 - lets replaying a .krec also produce a
+    // .rmgr for the same match, cross-platform (unlike MP4 export above).
+    m_replayRecordCheck = new QCheckBox("Also record replay (.rmgr)", this);
+    m_replayRecordCheck->setToolTip(
+        "While replaying this recording, also write a .rmgr replay file "
+        "for it, separate from the .krec/MP4 export.\nSmash Remix 2.0.1 only.");
+    m_replayRecordCheck->setVisible(false);
+#endif
+
     m_btnPBRefresh->setText(QString());
     m_btnPBRefresh->setToolTip("Refresh");
     m_btnPBRefresh->setAccessibleName("Refresh");
@@ -628,6 +638,11 @@ void KailleraPlaybackDialog::setupUI()
     bottomLayout->addWidget(m_btnPBDelete);
 #ifdef _WIN32
     bottomLayout->addWidget(m_btnExport);
+#endif
+#ifdef RMGK_GAME_STATS
+    bottomLayout->addWidget(m_replayRecordCheck);
+    connect(m_playbackTable, &QTableWidget::itemSelectionChanged,
+            this, &KailleraPlaybackDialog::updateReplayRecordCheckVisibility);
 #endif
     bottomLayout->addStretch();
     bottomLayout->addWidget(m_btnPBRefresh);
@@ -706,6 +721,43 @@ void KailleraPlaybackDialog::updatePlaybackControls()
         m_btnStop->setVisible(playbackSessionOpen);
     }
 }
+
+#ifdef RMGK_GAME_STATS
+void KailleraPlaybackDialog::updateReplayRecordCheckVisibility()
+{
+    if (m_replayRecordCheck == nullptr)
+    {
+        return;
+    }
+
+    const QString selectedPath = getSelectedRecordingPath();
+#ifdef _WIN32
+    // KailleraExport::ParseKrecFile is only pulled in on Windows (see the
+    // #ifdef _WIN32 include block at the top of this file), so this is the
+    // only platform where we can check the recording's stored game name.
+    bool show = false;
+    if (!selectedPath.isEmpty())
+    {
+        KailleraExport::KrecData krecData;
+        std::string errorMessage;
+        if (KailleraExport::ParseKrecFile(std::filesystem::path(selectedPath.toStdString()), krecData, &errorMessage))
+        {
+            show = (QString::fromStdString(krecData.header.gameName) == "SmashRemix2.0.1");
+        }
+    }
+#else
+    // No cross-platform way to peek the recording's game name here; show
+    // whenever a recording is selected and let Replay::OnEmulationStart's
+    // own GoodName check silently no-op for anything else.
+    const bool show = !selectedPath.isEmpty();
+#endif
+    m_replayRecordCheck->setVisible(show);
+    if (!show)
+    {
+        m_replayRecordCheck->setChecked(false);
+    }
+}
+#endif
 
 void KailleraPlaybackDialog::populatePlaybackList()
 {
@@ -1541,6 +1593,13 @@ void KailleraPlaybackDialog::onPlaybackPlay()
 
     // Ensure playback mode is active
     n02::activateMode(2);
+
+#ifdef RMGK_GAME_STATS
+    if (m_replayRecordCheck)
+    {
+        Replay::SetEnabledOverride(m_replayRecordCheck->isChecked());
+    }
+#endif
 
     if (n02::playbackLoad(pathBytes.constData()))
     {

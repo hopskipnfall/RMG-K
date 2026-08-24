@@ -12,6 +12,7 @@
 #include "Settings.hpp"
 #include "Callback.hpp"
 #include "Library.hpp"
+#include "RomSettings.hpp"
 #ifdef RMGK_HAVE_P2P_TRANSPORT
 #include "kailleraclient.h"
 #endif
@@ -140,6 +141,29 @@ uint32_t      s_StreamBytesWritten = 0;
 // once. Locked at the top of each of the 3 public entry points; every
 // static helper here is only ever reached through one of those.
 std::mutex s_Mutex;
+
+// Per-launch override for OnEmulationStart(), set via Replay::SetEnabledOverride().
+// Consumed (cleared) the next time OnEmulationStart() runs - see that
+// function and SetEnabledOverride's own doc comment in Replay.hpp.
+bool s_HasOverride = false;
+bool s_OverrideValue = false;
+
+// This feature's memory offsets were only ever derived/verified against
+// Smash Remix 2.0.1 (see docs/RMGR_SPEC.md); recording against any other
+// ROM would pointer-chase addresses that mean nothing there. GoodName
+// comes from mupen64plus-core's own ROM database (CoreRomSettings::GoodName,
+// via CoreGetCurrentRomSettings()) - for a ROM/hack absent from that
+// database it degrades to a filename-derived value, so this exact-match
+// check can only ever be as reliable as that database entry.
+bool IsSupportedGame(void)
+{
+    CoreRomSettings romSettings;
+    if (!CoreGetCurrentRomSettings(romSettings))
+    {
+        return false;
+    }
+    return romSettings.GoodName == "SmashRemix2.0.1";
+}
 
 template <typename T>
 void WriteEvent(EventCode code, const T& payload)
@@ -397,7 +421,30 @@ CORE_EXPORT void OnEmulationStart(void)
         s_File.clear();
     }
 
-    bool enabled = CoreSettingsGetBoolValue(SettingsID::GameStats_ReplayEnabled);
+    bool enabled;
+    if (s_HasOverride)
+    {
+        enabled = s_OverrideValue;
+        s_HasOverride = false; // consumed - see SetEnabledOverride's doc comment
+    }
+    else
+    {
+        enabled = CoreSettingsGetBoolValue(SettingsID::GameStats_ReplayEnabled);
+    }
+
+    if (enabled && !IsSupportedGame())
+    {
+        // Every offset in ReplayMemory.cpp was only ever derived/verified
+        // against Smash Remix 2.0.1 - recording against anything else would
+        // pointer-chase addresses that mean nothing there. Log this
+        // specifically rather than silently doing nothing, since "the
+        // checkbox was on but nothing happened" is otherwise indistinguishable
+        // from "never reached a VS match".
+        CoreAddCallbackMessage(CoreDebugMessageType::Info,
+            "Replay: enabled, but the loaded ROM isn't Smash Remix 2.0.1 - not recording");
+        enabled = false;
+    }
+
     s_State = enabled ? State::WaitingForMatch : State::Idle;
     if (enabled)
     {
@@ -406,6 +453,13 @@ CORE_EXPORT void OnEmulationStart(void)
     }
     s_FrameNumber = 0;
     s_StreamBytesWritten = 0;
+}
+
+CORE_EXPORT void SetEnabledOverride(bool enabled)
+{
+    std::lock_guard<std::mutex> lock(s_Mutex);
+    s_HasOverride = true;
+    s_OverrideValue = enabled;
 }
 
 CORE_EXPORT void OnEmulationStop(void)

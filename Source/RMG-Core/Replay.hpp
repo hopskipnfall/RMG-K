@@ -24,10 +24,28 @@
 namespace Replay
 {
 // Call once, right after CoreStartEmulation registers the frame callback.
-// Reads SettingsID::GameStats_ReplayEnabled and arms (or doesn't) the
-// per-match state machine driven by OnFrame(). Also defensively closes
-// any file left open from an abnormal prior session end.
+// Determines whether to arm the per-match state machine driven by
+// OnFrame(): uses SetEnabledOverride()'s value if one was set since the
+// last call (consumed exactly once - see SetEnabledOverride's own comment),
+// otherwise falls back to SettingsID::GameStats_ReplayEnabled. Also
+// defensively closes any file left open from an abnormal prior session end.
 void OnEmulationStart(void);
+
+// Per-launch override for whether replay recording is enabled, distinct
+// from (and never persisted to) the SettingsID::GameStats_ReplayEnabled
+// default - mirrors n02's n02_kaillera_recording_enabled pattern for
+// krec's own "Record game" checkboxes (Source/n02/kailleraclient.h), one
+// independent checkbox per netplay/playback dialog rather than a single
+// shared global. Call this from a dialog's own "Record replay" checkbox
+// right before triggering its launch, the same way those dialogs
+// re-assert n02_kaillera_recording_enabled right before their own launch.
+//
+// The override is consumed (cleared) the next time OnEmulationStart()
+// runs, so a launch path that never calls this (e.g. a plain offline ROM
+// launch, which has no per-launch checkbox to hang this off of) always
+// falls through to the persisted Settings default, and a stale override
+// from a previous session can never leak into an unrelated later launch.
+void SetEnabledOverride(bool enabled);
 
 // Call from CoreStopEmulation, and also from any UI-thread path that ends
 // emulation without necessarily going through CoreStopEmulation (see

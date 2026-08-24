@@ -20,6 +20,11 @@
 #include <QProcess>
 #include <QProgressDialog>
 #include <QElapsedTimer>
+#include <QCheckBox>
+
+#ifdef RMGK_GAME_STATS
+#include <RMG-Core/Replay.hpp>
+#endif
 
 class KailleraPlaybackDialog : public QDialog
 {
@@ -55,6 +60,9 @@ private:
 
     void setupUI();
     void updatePlaybackControls();
+#ifdef RMGK_GAME_STATS
+    void updateReplayRecordCheckVisibility();
+#endif
     void populatePlaybackList();
     QString getSelectedRecordingPath() const;
     QString getSelectedRecordingGameName(QString* recordingPath = nullptr, int* totalFrames = nullptr) const;
@@ -90,6 +98,13 @@ private:
     QPushButton* m_btnPBDelete = nullptr;
     QPushButton* m_btnPBRefresh = nullptr;
     QPushButton* m_btnExport = nullptr;
+#ifdef RMGK_GAME_STATS
+    // Independent .rmgr toggle for exporting a replay while replaying a
+    // .krec - separate file, separate checkbox from the .krec/MP4 machinery
+    // above. Only shown when the selected recording's stored game name is
+    // Smash Remix 2.0.1.
+    QCheckBox* m_replayRecordCheck = nullptr;
+#endif
     QPushButton* m_btnOpenFolder = nullptr;
     QLabel* m_frameLabel = nullptr;
     bool m_playbackWasActive = false;

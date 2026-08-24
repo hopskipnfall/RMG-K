@@ -2268,25 +2268,6 @@
              </item>
             </layout>
            </item>
-           <item>
-            <widget class="QGroupBox" name="replaySettingsGroupBox">
-             <property name="title">
-              <string>Replay Recording</string>
-             </property>
-             <layout class="QVBoxLayout" name="replaySettingsLayout">
-              <item>
-               <widget class="QCheckBox" name="replayEnabledCheckBox">
-                <property name="text">
-                 <string>Record replay file (.rmgr)</string>
-                </property>
-                <property name="toolTip">
-                 <string>Records per-frame inputs and game state for the current match to a .rmgr file, separate from krec. Works for both online and offline matches.</string>
-                </property>
-               </widget>
-              </item>
-             </layout>
-            </widget>
-           </item>
           </layout>
          </widget>
          <widget class="QWidget" name="gameTab">
@@ -3233,6 +3214,16 @@
                <widget class="QCheckBox" name="kailleraRecordByDefaultCheckBox">
                 <property name="text">
                  <string>Enable recording by default</string>
+                </property>
+               </widget>
+              </item>
+              <item>
+               <widget class="QCheckBox" name="kailleraReplayByDefaultCheckBox">
+                <property name="text">
+                 <string>Enable replay recording (.rmgr) by default</string>
+                </property>
+                <property name="toolTip">
+                 <string>Records per-frame inputs and game state for the current match to a .rmgr file, separate from krec. Works for both online and offline matches, Smash Remix 2.0.1 only. Each netplay room/playback dialog has its own checkbox that starts from this default and can override it for that session, the same way "Enable recording by default" works for krec.</string>
                 </property>
                </widget>
               </item>
