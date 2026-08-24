@@ -17,6 +17,7 @@
 #include "kailleraclient.h"
 #endif
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -33,11 +34,20 @@ namespace
 struct FileHeader
 {
     char     magic[4];     // "RMGR"
-    uint8_t  version;      // 1
+    uint8_t  version;      // 2 - container/framing format only, see docs/RMGR_SPEC.md section 5
     uint8_t  reserved[3];  // zero
     uint32_t streamLength; // 0 while recording, patched to the real value at close
+    // v2: which game produced this file, and which revision of this
+    // recorder's understanding of that game's memory layout wrote it -
+    // distinct axes, since a bugfix to an offset (or a newly-tracked field)
+    // for the SAME goodName needs its own version bump even though the
+    // container format itself hasn't changed. recorderSchemaVersion is its
+    // own counter per goodName, not a global one - "SmashRemix2.0.1 schema
+    // v3" and "SmashRemix2.0.2 schema v1" are unrelated numbering spaces.
+    char     goodName[64];           // NUL-padded; not necessarily NUL-terminated if it fills the field. UTF-8.
+    uint32_t recorderSchemaVersion;  // see IsSupportedGame()/kRecorderSchemaVersion below
 };
-static_assert(sizeof(FileHeader) == 12, "FileHeader must be 12 bytes");
+static_assert(sizeof(FileHeader) == 80, "FileHeader must be 80 bytes");
 
 enum class EventCode : uint8_t
 {
@@ -169,6 +179,22 @@ bool s_OverrideValue = false;
 // via CoreGetCurrentRomSettings()) - for a ROM/hack absent from that
 // database it degrades to a filename-derived value, so this exact-match
 // check can only ever be as reliable as that database entry.
+//
+// Single hardcoded game for now, not a per-GoodName profile table - that's
+// a bigger refactor for when a second GoodName actually needs supporting
+// (see docs/RMGR_SPEC.md section 3 for the reasoning).
+constexpr const char* kSupportedGoodName = "SmashRemix2.0.1";
+
+// Bump whenever this recorder's interpretation of kSupportedGoodName's
+// memory layout changes in a way that affects what gets written - not just
+// when a field is newly appended (which the per-event EventPayloads
+// declared-size mechanism, docs/RMGR_SPEC.md section 5, already handles on
+// its own), but also e.g. a bugfix to an existing field's offset that
+// silently changes recorded *values* without changing any event's byte
+// size. This is its own counter per goodName; a different goodName starts
+// its own numbering from 1, unrelated to this one.
+constexpr uint32_t kRecorderSchemaVersion = 1;
+
 bool IsSupportedGame(void)
 {
     CoreRomSettings romSettings;
@@ -176,7 +202,15 @@ bool IsSupportedGame(void)
     {
         return false;
     }
-    return romSettings.GoodName == "SmashRemix2.0.1";
+    return romSettings.GoodName == kSupportedGoodName;
+}
+
+// Copies as much of `s` as fits into `dest` (size `destSize`), NUL-padding
+// or truncating as needed - `dest` is assumed zero-initialized already, so
+// this only needs to write the bytes that actually fit.
+void WriteFixedString(char* dest, size_t destSize, const std::string& s)
+{
+    std::memcpy(dest, s.data(), std::min(s.size(), destSize));
 }
 
 template <typename T>
@@ -299,8 +333,15 @@ bool OpenNewFile(const ReplayMemory::MatchInfo& matchInfo)
 
     FileHeader header{};
     std::memcpy(header.magic, "RMGR", 4);
-    header.version = 1;
+    header.version = 2;
     header.streamLength = 0;
+    // Reaching here already implies IsSupportedGame() was true (see
+    // OnEmulationStart()), so this is just re-fetching the same value to
+    // write it out - the loaded ROM can't change mid-session.
+    CoreRomSettings romSettings;
+    CoreGetCurrentRomSettings(romSettings);
+    WriteFixedString(header.goodName, sizeof(header.goodName), romSettings.GoodName);
+    header.recorderSchemaVersion = kRecorderSchemaVersion;
     s_File.write(reinterpret_cast<const char*>(&header), sizeof(header));
 
     WriteEventPayloadsEvent();
