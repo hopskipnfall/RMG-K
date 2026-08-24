@@ -1,0 +1,453 @@
+# RMG-K Replay File Format (`.rmgr`) — Specification
+
+**Status:** v1 (format version `1`), implemented in `Source/RMG-Core/Replay.cpp` /
+`Source/RMG-Core/ReplayMemory.cpp` on the `feature/replay-file-format` branch.
+
+**Target game:** Super Smash Bros. (N64) — Smash Remix 2.0.1. Nothing about the
+container format is game-specific, but the `GameStart`/`PostFrame` field sets
+below are.
+
+This document is the authoritative description of the on-disk byte layout.
+If code and this document disagree, treat that as a bug — in either the code
+or the document — and fix the mismatch rather than trusting one side blindly.
+
+## 1. Overview
+
+A `.rmgr` file is a self-contained binary recording of one N64 match: every
+seated player's controller inputs, frame by frame, plus a snapshot of game
+state (position, damage, stocks, action state, …) read directly from
+emulated RAM. It is designed for two distinct consumers:
+
+1. **Deterministic replay** — the recorded inputs are enough to re-simulate
+   the match from scratch.
+2. **Direct analysis** — the recorded game state is enough to build stats,
+   visualizations, or search tooling *without* re-running the emulator at
+   all.
+
+The design is modeled on [Slippi's `.slp` format](https://github.com/project-slippi/slippi-wiki/blob/master/SPEC.md)
+(Super Smash Bros. Melee / Dolphin) — a self-describing binary event stream —
+but is **not** byte-compatible with it, and deliberately drops or changes
+several of Slippi's choices. See §2.
+
+## 2. Design goals and explicit non-goals
+
+- **Streamed, not buffered.** A file is written incrementally, event by
+  event, for the duration of a match — never built up in memory and flushed
+  once at the end. A whole match's worth of per-frame data held in RAM is
+  wasteful, and streaming means a crash mid-match still leaves a usable,
+  truncated file on disk rather than nothing at all.
+- **Self-describing, forward-compatible event stream, no schema compiler.**
+  Every event is a 1-byte command code followed by a payload whose size was
+  declared up front by the very first event in the file (`EventPayloads`,
+  §4.1). A parser that doesn't recognize a command code can still skip it
+  correctly and keep reading — the file can grow new event types or new
+  trailing fields on existing events without breaking old parsers, and an
+  old file's smaller payload sizes are exactly as valid to a new parser.
+- **No FlatBuffers, no UBJSON, no schema-compiler toolchain.** FlatBuffers is
+  built around finishing one complete buffer atomically; adapting it to a
+  growing append-only stream means wrapping each event in its own
+  independently-finished message, at which point most of its actual benefit
+  (shared schema, zero-copy across a whole buffer) is gone and the per-message
+  overhead (vtable, root offset) is a real cost against file size at 50-60
+  events/sec. Slippi wraps its raw event stream in a UBJSON container
+  (`{"raw": <binary>, "metadata": {...}}`) to embed a binary blob inside a
+  JSON-like document; this format skips that problem entirely by not having
+  a JSON-like document — the file *is* the binary event stream, with a small
+  fixed binary header instead of a UBJSON wrapper.
+- **Little-endian**, matching the host platforms this project targets
+  (Linux/Windows, both little-endian in practice) — not Slippi's
+  big-endian, which was a holdover from the GameCube/Wii's native PowerPC
+  byte order and has no reason to carry over here. All multi-byte
+  integer and float fields in this document are little-endian unless
+  stated otherwise.
+- **Native struct layout, no bit-packing.** Every event payload is a
+  fixed-size, `#pragma pack(push, 1)` C struct with no padding and no
+  bitfields — the byte layout tables below are exactly `sizeof()` that
+  struct, field by field, in declaration order.
+
+## 3. File structure
+
+```
++----------------+----------------------------------------+
+| File Header    | 12 bytes, fixed                         |
++----------------+----------------------------------------+
+| Event Stream   | variable length, sequence of events      |
+|                | (EventPayloads, then GameStart, then     |
+|                | interleaved PreFrame/PostFrame per real   |
+|                | frame, then GameEnd)                      |
++----------------+----------------------------------------+
+```
+
+There is no footer, no trailing metadata block, and no UBJSON/JSON wrapper
+of any kind — the event stream *is* the rest of the file, up to
+`streamLength` bytes (§3.1) after the header, or up to EOF for a file whose
+recording session never cleanly finished.
+
+### 3.1 File header (12 bytes)
+
+| Offset | Size | Type       | Field          | Notes                                                  |
+|-------:|-----:|------------|----------------|---------------------------------------------------------|
+| 0x00   | 4    | `char[4]`  | `magic`        | Always the ASCII bytes `R`, `M`, `G`, `R` (no NUL).      |
+| 0x04   | 1    | `u8`       | `version`      | Format version. `1` for everything described here.      |
+| 0x05   | 3    | `u8[3]`    | `reserved`     | Always zero. Reserved for future header fields.          |
+| 0x08   | 4    | `u32`      | `streamLength` | Byte length of the event stream that follows the header. |
+
+**`streamLength` is written as `0` when the file is opened**, and is the
+*only* field patched after the fact: once the match ends (or is otherwise
+finalized), the recorder seeks back to offset `0x08` and writes the real
+length, then closes the file. This is a direct crash-safety trick: a reader
+can tell "was this file's recording session ever cleanly finished" just by
+checking whether `streamLength` is nonzero, and a file left at `streamLength
+== 0` (the process died, or the emulator was killed, mid-match) is still a
+valid, parseable, truncated recording — a reader should fall back to reading
+events until EOF instead of trusting the header's length in that case.
+
+### 3.2 Event stream
+
+A sequence of events, back to back, no padding between them:
+
+```
++------+----------------------------+
+| 1B   | command code               |
++------+----------------------------+
+| N B  | payload (N declared by      |
+|      | the EventPayloads event)   |
++------+----------------------------+
+```
+
+The very first event in every file is always `EventPayloads` (`0x01`, §4.1).
+Every subsequent event is one of `GameStart` (`0x02`, once, immediately
+after `EventPayloads`), `PreFrameUpdate` (`0x03`), `PostFrameUpdate`
+(`0x04`), or `GameEnd` (`0x05`, once, at the very end — present only if the
+recording session finished cleanly).
+
+For each real emulated frame that the match is actively ongoing
+(`game_status == 1`, see §7.5) and has at least one seated port, the
+recorder writes one `PreFrameUpdate` immediately followed by one
+`PostFrameUpdate` for each seated port, ports visited in ascending order
+(0, 1, 2, 3) — i.e. for a 2-player match on ports 0 and 1, frame N looks
+like `Pre(port 0), Post(port 0), Pre(port 1), Post(port 1)`. Ports that are
+empty or unseated that frame have no events at all — never a zeroed/dummy
+event — so a reader must not assume every frame has all four ports present,
+and must not assume a fixed number of events per frame.
+
+## 4. Events
+
+### 4.1 Event Payloads — code `0x01`
+
+Always the first event in the file. Declares the exact payload size (not
+including the 1-byte command code) of every other event type this file
+uses. This is the entire forward-compatibility mechanism: a parser that
+doesn't recognize a command code looks it up here and skips exactly that
+many bytes, rather than guessing or breaking.
+
+| Offset | Size    | Type      | Field         | Notes                                          |
+|-------:|--------:|-----------|---------------|--------------------------------------------------|
+| 0x00   | 1       | `u8`      | `count`       | Number of `(code, size)` entries that follow.    |
+| 0x01   | 3×count | see below | `entries`     | `count` repetitions of the 3-byte entry below.   |
+
+Each entry:
+
+| Offset (rel.) | Size | Type  | Field  | Notes                                    |
+|---------------:|-----:|-------|--------|-------------------------------------------|
+| +0x00          | 1    | `u8`  | `code` | The event command code this entry describes. |
+| +0x01          | 2    | `u16` | `size` | That event's payload size, in bytes.      |
+
+v1 always declares exactly 4 entries, in this order: `GameStart` (150),
+`PreFrameUpdate` (9), `PostFrameUpdate` (42), `GameEnd` (5). A future format
+version could declare more entries (new event types) or the same entries
+with larger sizes (fields appended to an existing event) — see §5.
+
+### 4.2 Game Start — code `0x02`
+
+Written exactly once, immediately after `EventPayloads`. Everything static
+for the whole match — nothing here changes frame to frame. **Player display
+names are sourced from netplay room metadata (RMG-K's own slot-indexed name
+table, populated by every netplay path), never from Smash Remix's in-game
+name tags** — for an offline match, or a port with no assigned name, the
+corresponding `playerNames` entry is all zero bytes.
+
+Payload size: **150 bytes.**
+
+| Offset | Size | Type      | Field                | Notes                                                    |
+|-------:|-----:|-----------|-----------------------|------------------------------------------------------------|
+| 0x00   | 1    | `u8`      | `stageId`             | See §7.2.                                                  |
+| 0x01   | 1    | `u8`      | `gameType`             | `1` time, `2` stock, `3` both (Remix always forces stock). |
+| 0x02   | 1    | `u8`      | `stockCountSetting`    | 0-based (i.e. `2` means "3 stocks").                       |
+| 0x03   | 1    | `u8`      | `timeLimitMinutes`     | `100` = infinite.                                          |
+| 0x04   | 1    | `u8`      | `damageRatio`          | `50` = 50%, `200` = 200%.                                  |
+| 0x05   | 1    | `u8`      | `itemFrequency`        | `0` none .. `5` high.                                      |
+| 0x06   | 16   | struct[4] | `ports`                | 4× the 4-byte `PortSettings` struct below, port 0-3 in order. |
+| 0x16   | 128  | char[4][32]| `playerNames`         | 4× a 32-byte, NUL-padded (not necessarily NUL-terminated if exactly 32 chars) name string, port 0-3 in order. |
+
+`PortSettings` (4 bytes, repeated 4× inline above — **not** a separately
+declared event, just a fixed sub-layout within `GameStart`):
+
+| Offset (rel.) | Size | Type | Field         | Notes                              |
+|---------------:|-----:|------|---------------|--------------------------------------|
+| +0x00          | 1    | `u8` | `slotType`     | `0` human, `1` CPU, `2` empty.       |
+| +0x01          | 1    | `u8` | `characterId`  | See §7.1. Meaningless if `slotType == 2`. |
+| +0x02          | 1    | `u8` | `costumeId`    |                                        |
+| +0x03          | 1    | `u8` | `teamColor`    |                                        |
+
+### 4.3 Pre-Frame Update — code `0x03`
+
+Input-side data, captured **before** the game processes that frame's inputs.
+One event per seated port per frame (§3.2). Uses the game's already-processed
+button/stick values (`playerStruct+0x1BC/+0x1C2/+0x1C3` — see
+`Source/RMG-Core/ReplayMemory.cpp`), which is the one input representation
+available uniformly for **both** human and CPU-controlled ports; the raw
+physical-controller struct (`+0x1B0`) is human-ports-only and is not
+recorded.
+
+Payload size: **9 bytes.**
+
+| Offset | Size | Type   | Field     | Notes                                                        |
+|-------:|-----:|--------|-----------|-----------------------------------------------------------------|
+| 0x00   | 4    | `i32`  | `frame`   | Frame counter, `0` at the first frame this match's recording enters the "ongoing" game state (`game_status == 1`). Monotonically increasing, one recorded frame per real emulated frame. |
+| 0x04   | 1    | `u8`   | `port`    | `0`-`3`.                                                        |
+| 0x05   | 2    | `u16`  | `buttons` | Processed button bitmask. See §7.4.                             |
+| 0x07   | 1    | `i8`   | `stickX`  | Processed stick X, signed.                                      |
+| 0x08   | 1    | `i8`   | `stickY`  | Processed stick Y, signed.                                      |
+
+### 4.4 Post-Frame Update — code `0x04`
+
+State-side data, captured **after** that frame's physics/collision
+resolution — the resulting state. One event per seated port per frame,
+always immediately following that port's `PreFrameUpdate` in the stream.
+
+Payload size: **42 bytes.**
+
+| Offset | Size | Type   | Field                | Notes                                                            |
+|-------:|-----:|--------|------------------------|---------------------------------------------------------------------|
+| 0x00   | 4    | `i32`  | `frame`                | Same frame counter as the paired `PreFrameUpdate`.                   |
+| 0x04   | 1    | `u8`   | `port`                 | `0`-`3`.                                                              |
+| 0x05   | 1    | `u8`   | `characterId`           | See §7.1.                                                             |
+| 0x06   | 2    | `u16`  | `actionStateId`         | See §7.3.                                                             |
+| 0x08   | 4    | `f32`  | `positionX`             | IEEE-754 single precision.                                            |
+| 0x0C   | 4    | `f32`  | `positionY`             |                                                                        |
+| 0x10   | 4    | `i32`  | `facingDirection`       | `1` = facing right, `-1` = facing left. (Integer in this game, not a float like Slippi's Melee-derived field.) |
+| 0x14   | 4    | `f32`  | `velocityX`             |                                                                        |
+| 0x18   | 4    | `f32`  | `velocityY`             |                                                                        |
+| 0x1C   | 4    | `u32`  | `damagePercent`         | Whole-number percent, as the game itself stores it (not a float).     |
+| 0x20   | 1    | `i8`   | `stocksRemaining`       | 0-based; negative once eliminated.                                    |
+| 0x21   | 1    | `u8`   | `jumpsUsed`             |                                                                        |
+| 0x22   | 1    | `u8`   | `groundedState`         | `0` grounded, `1` airborne.                                           |
+| 0x23   | 1    | `u8`   | `hurtboxState`          | `0x03` = intangible/invincible; see `ReplayMemory.cpp` for the full set observed. |
+| 0x24   | 2    | `u16`  | `hitstunCounter`        | Non-zero while in hitstun.                                            |
+| 0x26   | 4    | `u32`  | `actionFrameCounter`    | Frame counter of the current action state (resets when the action state changes). |
+
+### 4.5 Game End — code `0x05`
+
+Written exactly once, at the very end of a cleanly-finished recording
+session, immediately before the header's `streamLength` is patched. **A
+truncated file (crash, force-quit) has no `GameEnd` event at all** — its
+absence, together with `streamLength == 0`, is how a reader distinguishes
+an incomplete recording from a genuinely short match.
+
+Payload size: **5 bytes.**
+
+| Offset | Size | Type    | Field          | Notes                                                                 |
+|-------:|-----:|---------|-----------------|--------------------------------------------------------------------------|
+| 0x00   | 1    | `u8`    | `endReason`     | `0` aborted (match reset, or the emulator/process stopped mid-match — these two causes are not currently distinguished), `1` normal end. |
+| 0x01   | 4    | `i8[4]` | `placements`    | Final stocks remaining, per port 0-3. `-1` for any port that was never seated. |
+
+## 5. Versioning and forward compatibility
+
+Two independent mechanisms, matching §4.6 of the original design rationale:
+
+- **Field additions to an existing event:** always append new fields to the
+  *end* of that event's payload, never insert in the middle. An old parser
+  — which learned the event's size from that file's own `EventPayloads`
+  event, which will correctly declare the *old*, smaller size for an old
+  file — simply never reads the new trailing bytes. A new parser reading an
+  old file sees the old, smaller declared size in that file's own
+  `EventPayloads` event and correctly knows not to read fields that were
+  never written.
+- **New event types:** an old parser encountering a command code it doesn't
+  recognize looks up its declared size in `EventPayloads` and skips exactly
+  that many bytes, then continues from the next event.
+
+`FileHeader.version` (currently `1`) is reserved for a breaking change to
+the *header* or the overall framing itself — not for anything the two
+mechanisms above already cover.
+
+## 6. Byte order and encoding
+
+Everything in this file — the header and every event payload — is
+**little-endian**. There is no manual byte-swapping anywhere in the
+reference implementation: values are read directly from emulated memory via
+`DebugMemRead8/16/32` (which already normalize to host byte order) and
+written to disk as raw native-layout structs on little-endian host
+platforms.
+
+Floats are IEEE-754 single precision (32-bit), stored as the exact bit
+pattern the game itself holds in memory — reinterpret the 4 bytes as a
+`float`/`f32`, don't scale or convert.
+
+Strings (`playerNames` in `GameStart`) are fixed-width byte arrays,
+NUL-padded, **not necessarily NUL-terminated** if the name fills the full
+field width — always read up to the declared field width and trim trailing
+NULs, never scan for a terminator past the field boundary.
+
+## 7. Reference tables
+
+### 7.1 Character IDs
+
+Valid range `0x00`-`0x60`.
+
+**Vanilla (`0x00`-`0x1C`):** `0x00` Mario · `0x01` Fox · `0x02` Donkey Kong ·
+`0x03` Samus · `0x04` Luigi · `0x05` Link · `0x06` Yoshi ·
+`0x07` Captain Falcon · `0x08` Kirby · `0x09` Pikachu · `0x0A` Jigglypuff ·
+`0x0B` Ness · `0x0C` Master Hand · `0x0D` Metal Mario ·
+`0x0E`-`0x19` Polygon {Mario, Fox, DK, Samus, Luigi, Link, Yoshi, Falcon,
+Kirby, Pikachu, Jigglypuff, Ness} in that order · `0x1A` Giant DK ·
+`0x1B` Random · `0x1C` unused.
+
+**Remix fighters (`0x1D`-`0x4C`):** `0x1D` Falco · `0x1E` Ganondorf ·
+`0x1F` Young Link · `0x20` Dr. Mario · `0x21` Wario · `0x22` Dark Samus ·
+`0x23` Link (EU) · `0x24` Samus (JP) · `0x25` Ness (JP) · `0x26` Lucas ·
+`0x27` Link (JP) · `0x28` Falcon (JP) · `0x29` Fox (JP) · `0x2A` Mario (JP) ·
+`0x2B` Luigi (JP) · `0x2C` DK (JP) · `0x2D` Pikachu (EU) ·
+`0x2E` Jigglypuff (JP) · `0x2F` Jigglypuff (EU) · `0x30` Kirby (JP) ·
+`0x31` Yoshi (JP) · `0x32` Pikachu (JP) · `0x33` Samus (EU) · `0x34` Bowser ·
+`0x35` Giga Bowser · `0x36` Piano · `0x37` Wolf · `0x38` Conker ·
+`0x39` Mewtwo · `0x3A` Marth · `0x3B` Sonic · `0x3C` Sandbag ·
+`0x3D` Super Sonic · `0x3E` Sheik · `0x3F` Marina · `0x40` King Dedede ·
+`0x41` Goemon · `0x42` Peppy · `0x43` Slippy · `0x44` Banjo ·
+`0x45` Metal Luigi · `0x46` Ebisumaru · `0x47` Dragon King · `0x48` Crash ·
+`0x49` Peach · `0x4A` Roy · `0x4B` Dr. Luigi · `0x4C` Lanky Kong.
+
+**Remix polygons (`0x4D`-`0x60`):** `0x4D` Wario · `0x4E` Lucas ·
+`0x4F` Bowser · `0x50` Wolf · `0x51` Dr. Mario · `0x52` Sonic ·
+`0x53` Sheik · `0x54` Marina · `0x55` Falco · `0x56` Ganondorf ·
+`0x57` Dark Samus · `0x58` Marth · `0x59` Mewtwo · `0x5A` Dedede ·
+`0x5B` Young Link · `0x5C` Goemon · `0x5D` Conker · `0x5E` Banjo ·
+`0x5F` Peach · `0x60` Crash.
+
+### 7.2 Stage IDs
+
+**Vanilla:** `0x00` Peach's Castle · `0x01` Sector Z · `0x02` Congo Jungle ·
+`0x03` Planet Zebes · `0x04` Hyrule Castle · `0x05` Yoshi's Island ·
+`0x06` Dream Land · `0x07` Saffron City · `0x08` Mushroom Kingdom ·
+`0x09`-`0x0A` Dream Land Beta 1-2 · `0x0B` How to Play ·
+`0x0C` Mini Yoshi's Island · `0x0D` Meta Crystal · `0x0E` Duel Zone ·
+`0x0F` Race to the Finish · `0x10` Final Destination.
+
+Remix adds a very large number of additional stages (`0x29` onward, into the
+`0xD0`+ range) not enumerated here — see the *Known limitations* note in §8.
+
+### 7.3 Action state IDs
+
+`0x000`-`0x0DB` are shared across every character; `>= 0x0DC` is
+character-specific (special moves — see §8).
+
+```
+0x000 DeadD(KO bottom)   0x001 DeadS(KO side)     0x002 DeadU(KO top)
+0x003 ScreenKO           0x004 ScreenKOWait       0x005 Entry(spawn)
+0x007 Revive1            0x008 Revive2            0x009 ReviveWait
+0x00A Idle                0x00B-0x00D Walk1-3      0x00F Dash
+0x010 Run                 0x011 RunBrake           0x012 Turn
+0x013 TurnRun             0x014 JumpSquat          0x015 ShieldJumpSquat
+0x016 JumpF               0x017 JumpB              0x018 JumpAerialF
+0x019 JumpAerialB         0x01A Fall               0x01B FallAerial
+0x01C Crouch              0x01D CrouchIdle         0x01E CrouchEnd
+0x01F LandingLight        0x020 LandingHeavy       0x021 Pass(platform drop)
+0x022 ShieldDrop          0x023 Teeter             0x024 TeeterStart
+0x025-0x027 DamageHigh1-3 0x028-0x02A DamageMid1-3 0x02B-0x02D DamageLow1-3
+0x02E-0x030 DamageAir1-3  0x031-0x032 DamageElec1-2
+0x033 DamageFlyHigh       0x034 DamageFlyMid       0x035 DamageFlyLow
+0x036 DamageFlyTop        0x037 DamageFlyRoll      0x038 WallBounce
+0x039 Tumble              0x03A FallSpecial        0x03B LandingSpecial
+0x03C Tornado             0x03D Barrel             0x03E-0x041 Pipe
+0x042 CeilingBonk         0x043-0x048 Knocked down/getup
+0x049-0x04A TechF/TechB   0x04B-0x04E Getup roll fwd/back
+0x04F DownAttackD         0x050 DownAttackU        0x051 Tech
+0x052 Clang               0x053 ClangRecoil        0x054 CliffCatch
+0x055 CliffWait           0x056 CliffQuick         0x057-0x058 CliffClimbQuick1-2
+0x059 CliffSlow           0x05A-0x05B CliffClimbSlow1-2
+0x05C-0x05F CliffAttack Quick/Slow    0x060-0x063 CliffEscape Quick/Slow
+0x064-0x07D Item pickup/throw actions 0x07E-0x097 Item-specific attacks
+0x098 ShieldOn            0x099 Shield             0x09A ShieldOff
+0x09B ShieldStun          0x09C RollF              0x09D RollB
+0x09E ShieldBreak         0x09F ShieldBreakFall    0x0A0-0x0A3 Stun land/start
+0x0A4 Stun                0x0A5 Sleep              0x0A6 Grab
+0x0A7 GrabPull            0x0A8 GrabWait           0x0A9 ThrowF
+0x0AA ThrowB              0x0AB-0x0B3 Captured/inhaled/egg-laid
+0x0B5-0x0BC Being thrown  0x0BD Taunt              0x0BE Jab1
+0x0BF Jab2                0x0C0 DashAttack         0x0C1-0x0C5 FTilt(High->Low)
+0x0C7 UTilt                0x0C9 DTilt              0x0CA-0x0CE FSmash(High->Low)
+0x0CF USmash               0x0D0 DSmash             0x0D1 Nair
+0x0D2 Fair                 0x0D3 Bair               0x0D4 Uair
+0x0D5 Dair                 0x0D6-0x0DA Aerial landing lag (N/F/B/U/D)
+0x0DB LandingAirX(Z-cancel)
+```
+
+Derived predicates a consumer may find useful: dead/being-KO'd =
+`actionStateId <= 0x004`; respawning = `actionStateId == 0x005` or
+`0x007`-`0x009`; in hitstun = `actionStateId` in `0x025`-`0x039` (or check
+`hitstunCounter` directly, §4.4); shielding = `actionStateId` in
+`0x098`-`0x09B`; grabbed = `actionStateId` in `0x0AB`-`0x0BC`; attacking =
+`actionStateId >= 0x0BE`. Airborne state should come from `groundedState`
+(§4.4), not be inferred from `actionStateId` alone.
+
+### 7.4 Controller button bits (`PreFrameUpdate.buttons`)
+
+```
+0x8000 A       0x0400 D-Down   0x0020 L
+0x4000 B       0x0200 D-Left   0x0010 R
+0x2000 Z       0x0100 D-Right  0x0008 C-Up
+0x1000 Start   0x0004 C-Down   0x0002 C-Left
+0x0800 D-Up                    0x0001 C-Right
+```
+
+### 7.5 `game_status` (internal, not directly exposed as an event field)
+
+Governs the recorder's own state machine (not written to the file directly,
+but explains the `frame` counter's start point and `GameEnd.endReason`):
+`0` pre-match countdown, `1` ongoing (this is the only state that produces
+`PreFrameUpdate`/`PostFrameUpdate` events, and `frame == 0` is the first
+frame this state is observed), `2` paused, `5` ended.
+
+## 8. Known limitations / not yet implemented
+
+These are deliberate v1 scope cuts, not oversights — later format versions
+can add any of them as new event types or appended fields per §5, without
+breaking existing files or parsers:
+
+- **No item tracking.** No `ItemUpdate`-equivalent event exists; N64 Smash
+  item/projectile memory offsets have not been mapped.
+- **No RNG/desync-detection event.** No `FrameStart`-equivalent event (RNG
+  seed, internal scene frame counter); no known Smash Remix RNG seed address
+  has been identified.
+- **No aggregate damage-dealt/taken breakdown, no shield-damage, no
+  incoming-damage-this-hit field**, even though the emulator exposes them —
+  deferred as not essential for a first version.
+- **`GameEnd.endReason` cannot currently distinguish time-out from
+  stock-out** — both collapse to `1` ("normal end"); only "aborted vs. not"
+  is currently derivable from available memory.
+- **Character-specific action states (`>= 0x0DC`) have no shared table** —
+  meaning is entirely per-character and would need to be derived
+  empirically per character if finer-grained special-move detection is
+  wanted.
+- **Remix-specific stage IDs (`0x29`+) are not enumerated** in §7.2 — would
+  need re-deriving from the mod's assembly source.
+- **No ROM-identity check.** The recorder does not verify the loaded ROM is
+  actually Smash Remix before recording; enabling the feature on a
+  different game will produce a `.rmgr` file with garbage bytes (it does not
+  crash — the pointer-validity checks in `ReplayMemory.cpp` cause it to stay
+  in "waiting for a match" indefinitely rather than write nonsense, in the
+  overwhelming majority of cases, but this is not a guarantee).
+
+## 9. Reference implementation
+
+- **Writer:** `Source/RMG-Core/Replay.cpp` / `Source/RMG-Core/Replay.hpp`
+  (C++, streamed, single writer instance per emulation session).
+- **Memory reader:** `Source/RMG-Core/ReplayMemory.cpp` /
+  `Source/RMG-Core/ReplayMemory.hpp` (the N64 RAM pointer-chase that feeds
+  the writer above; not part of the file format itself, but the source of
+  truth for every field's semantics).
+- **TypeScript reader/writer + tests:** [`rmgr-ts/`](../rmgr-ts/) at the
+  repository root — a standalone package (no dependency on the C++ build)
+  intended to be extracted into its own repository. See
+  [`rmgr-ts/README.md`](../rmgr-ts/README.md) for its API.
