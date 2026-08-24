@@ -126,16 +126,6 @@ string(REPLACE ";" " " SDL3_LEGACY_INCLUDE_FLAGS "${SDL3_LEGACY_INCLUDE_DIRS}")
 # too rather than patch the vendored source for the same reason.
 set(SDL_CFLAGS_FOR_CORE "-DUSE_SDL3 ${SDL3_CFLAGS_FLAT} ${SDL3_LEGACY_INCLUDE_FLAGS} -include SDL3/SDL_oldnames.h -include stdio.h")
 set(SDL_LDLIBS_FOR_CORE "${SDL3_LDFLAGS_FLAT}")
-# TEMP DIAGNOSTIC (to be removed): dbg_debugger.c fails to find SDL.h on
-# Linux CI despite this block - print what's actually being computed there
-# to find out why, rather than guessing blind without a Linux machine.
-message(STATUS "[diag] SDL3_CFLAGS (raw)=${SDL3_CFLAGS}")
-message(STATUS "[diag] SDL3_INCLUDE_DIRS (raw)=${SDL3_INCLUDE_DIRS}")
-message(STATUS "[diag] SDL3_LEGACY_INCLUDE_FLAGS=${SDL3_LEGACY_INCLUDE_FLAGS}")
-message(STATUS "[diag] SDL_CFLAGS_FOR_CORE=${SDL_CFLAGS_FOR_CORE}")
-message(STATUS "[diag] SDL_LDLIBS_FOR_CORE=${SDL_LDLIBS_FOR_CORE}")
-message(STATUS "[diag] MAKE_CMD=${MAKE_CMD}")
-message(STATUS "[diag] CMAKE_GENERATOR=${CMAKE_GENERATOR}")
 
 ExternalProject_Add(mupen64plus-core
     SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/mupen64plus-core/
