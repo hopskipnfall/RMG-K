@@ -19,13 +19,22 @@ namespace ReplayMemory
 {
 struct PortMatchInfo
 {
-    uint8_t slotType;   // 0 human, 1 CPU, 2 empty (raw value read from memory)
-    bool    seated;     // slotType != 2
-    bool    isCpu;      // slotType == 1
-    uint8_t characterId;
-    uint8_t costumeId;
-    uint8_t teamColor;
-    int8_t  stocksRemaining;
+    uint8_t  slotType;   // 0 human, 1 CPU, 2 empty (raw value read from memory)
+    bool     seated;     // slotType != 2
+    bool     isCpu;      // slotType == 1
+    uint8_t  characterId;
+    uint8_t  costumeId;
+    uint8_t  teamColor;
+    int8_t   stocksRemaining;
+    // Native engine combo tracking, not mod-added - tracked with the combo
+    // meter display toggle off too. Belongs to the victim (this port), not
+    // the attacker: how many hits *this port* has taken in its current
+    // unbroken chain. 0 = no active chain, 1 = a single hit (not yet a
+    // "combo" by convention), 2+ = an actual combo. Both zero the instant
+    // the chain breaks. See docs/RMGR_SPEC.md section 7.5 / smashremix
+    // docs/ram-map.md section 13.
+    uint32_t comboHitCount;
+    uint32_t comboDamage;
 };
 
 struct PortPlayerState

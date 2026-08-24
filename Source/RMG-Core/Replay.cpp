@@ -109,8 +109,22 @@ struct PostFrameEvent
     uint8_t  hurtboxState;
     uint16_t hitstunCounter;
     uint32_t actionFrameCounter;
+    // v1 field-append (docs/RMGR_SPEC.md section 5): everything above this
+    // line is the original 42-byte v1 layout, untouched.
+    //
+    // Native engine combo tracking, not mod-added - tracked with the combo
+    // meter display toggle off too, and Smash Remix additionally keeps the
+    // chain alive across grabs/wall-bounces/tech-chases where vanilla would
+    // reset it (see smashremix docs/ram-map.md section 13). Belongs to the
+    // victim, not the attacker: how many hits THIS port has taken in its
+    // current unbroken chain. 0 = no active chain, 1 = a single hit (not
+    // yet a "combo" by convention), 2+ = an actual combo. Both zero the
+    // instant the chain breaks - so a reader can count "neutral hits taken
+    // this stock" by counting comboHitCount's 0->nonzero transitions.
+    uint32_t comboHitCount;
+    uint32_t comboDamage;
 };
-static_assert(sizeof(PostFrameEvent) == 42, "PostFrameEvent must be 42 bytes");
+static_assert(sizeof(PostFrameEvent) == 50, "PostFrameEvent must be 50 bytes");
 
 struct GameEndEvent
 {
@@ -397,6 +411,8 @@ void RecordFrame(const ReplayMemory::MatchInfo& matchInfo)
         post.hurtboxState                 = state.hurtboxState;
         post.hitstunCounter                = state.hitstunCounter;
         post.actionFrameCounter             = state.actionFrameCounter;
+        post.comboHitCount                   = portInfo.comboHitCount;
+        post.comboDamage                      = portInfo.comboDamage;
         WriteEvent(EventCode::PostFrame, post);
     }
 

@@ -240,7 +240,7 @@ State-side data, captured **after** that frame's physics/collision
 resolution — the resulting state. One event per seated port per frame,
 always immediately following that port's `PreFrameUpdate` in the stream.
 
-Payload size: **42 bytes.**
+Payload size: **50 bytes.**
 
 | Offset | Size | Type   | Field                | Notes                                                            |
 |-------:|-----:|--------|------------------------|---------------------------------------------------------------------|
@@ -260,6 +260,8 @@ Payload size: **42 bytes.**
 | 0x23   | 1    | `u8`   | `hurtboxState`          | `0x03` = intangible/invincible; see `ReplayMemory.cpp` for the full set observed. |
 | 0x24   | 2    | `u16`  | `hitstunCounter`        | Non-zero while in hitstun.                                            |
 | 0x26   | 4    | `u32`  | `actionFrameCounter`    | Frame counter of the current action state (resets when the action state changes). |
+| 0x2A   | 4    | `u32`  | `comboHitCount`         | v1 field-append (§5). Native engine combo counter, not mod-added - tracked even with the in-game combo meter display off. Belongs to the *victim* (this port), not the attacker: hits taken in the current unbroken chain. `0` = no active chain, `1` = a single hit (not yet a "combo" by convention), `2+` = an actual combo. Zeroes the instant the chain breaks - Smash Remix extends what counts as "unbroken" to survive grabs/wall-bounces/tech-chases, which vanilla would reset. Source: smashremix `docs/ram-map.md` §13. |
+| 0x2E   | 4    | `u32`  | `comboDamage`           | v1 field-append (§5). Running damage dealt within the same chain as `comboHitCount`; zeroes at the same instant. |
 
 ### 4.5 Game End — code `0x05`
 

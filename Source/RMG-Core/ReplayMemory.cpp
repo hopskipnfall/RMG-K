@@ -36,6 +36,8 @@ constexpr uint32_t PORT_CHARACTER_ID     = 0x03;
 constexpr uint32_t PORT_COSTUME_ID       = 0x06;
 constexpr uint32_t PORT_TEAM_COLOR       = 0x07;
 constexpr uint32_t PORT_STOCKS_REMAINING = 0x0B;
+constexpr uint32_t PORT_COMBO_DAMAGE     = 0x50;
+constexpr uint32_t PORT_COMBO_HIT_COUNT  = 0x54;
 constexpr uint32_t PORT_PLAYER_OBJECT    = 0x58;
 
 constexpr uint32_t PLAYER_OBJECT_TO_STRUCT = 0x84;
@@ -122,6 +124,8 @@ PortMatchInfo ReadPortMatchInfo(uint32_t matchInfoPtr, int port)
     info.costumeId             = m64p::Core.DebugMemRead8(base + PORT_COSTUME_ID);
     info.teamColor              = m64p::Core.DebugMemRead8(base + PORT_TEAM_COLOR);
     info.stocksRemaining         = static_cast<int8_t>(m64p::Core.DebugMemRead8(base + PORT_STOCKS_REMAINING));
+    info.comboDamage              = m64p::Core.DebugMemRead32(base + PORT_COMBO_DAMAGE);
+    info.comboHitCount             = m64p::Core.DebugMemRead32(base + PORT_COMBO_HIT_COUNT);
     return info;
 }
 
