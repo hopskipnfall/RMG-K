@@ -34,7 +34,7 @@ namespace
 struct FileHeader
 {
     char     magic[4];     // "RMGR"
-    uint8_t  version;      // 2 - container/framing format only, see docs/RMGR_SPEC.md section 5
+    uint8_t  version;      // 3 - container/framing format only, see docs/RMGR_SPEC.md section 5
     uint8_t  reserved[3];  // zero
     uint32_t streamLength; // 0 while recording, patched to the real value at close
     // v2: which game produced this file, and which revision of this
@@ -46,8 +46,13 @@ struct FileHeader
     // v3" and "SmashRemix2.0.2 schema v1" are unrelated numbering spaces.
     char     goodName[64];           // NUL-padded; not necessarily NUL-terminated if it fills the field. UTF-8.
     uint32_t recorderSchemaVersion;  // see IsSupportedGame()/kRecorderSchemaVersion below
+    // v3: wall-clock time this recording started, independent of the
+    // filename (which is derived from local time - see BuildFileName() -
+    // and can't be trusted to round-trip through arbitrary filesystems/
+    // renames the way this field can).
+    uint64_t recordedAtEpochSeconds; // seconds since the Unix epoch (UTC), i.e. what time(nullptr) returns
 };
-static_assert(sizeof(FileHeader) == 80, "FileHeader must be 80 bytes");
+static_assert(sizeof(FileHeader) == 88, "FileHeader must be 88 bytes");
 
 enum class EventCode : uint8_t
 {
@@ -270,12 +275,16 @@ std::string SanitizeForFilename(const std::string& input)
     return result;
 }
 
-// Mirrors n02_client.cpp's "YYMMDDHHMMSS-Player1-Player2.krec" convention
-// (section 3.1 of the handoff doc), simplified: no MAX_PATH budget
-// juggling, each name flatly capped at 24 chars.
-std::string BuildFileName(void)
+// Loosely mirrors n02_client.cpp's "<date>-Player1-Player2.krec" convention
+// (section 3.1 of the handoff doc) - player-name suffix and 24-char cap the
+// same, but YYYYMMDD-HHMMSS (4-digit year, dashed) rather than krec's
+// compact YYMMDDHHMMSS, for a name that reads as a timestamp at a glance.
+// `now` is passed in (rather than this function calling time(nullptr)
+// itself) so the caller can write the exact same instant into the file's
+// own recordedAtEpochSeconds header field - the filename and the header
+// should never disagree about when the recording started.
+std::string BuildFileName(time_t now)
 {
-    time_t now = time(nullptr);
     tm localNow{};
 #ifdef _WIN32
     localtime_s(&localNow, &now);
@@ -283,7 +292,7 @@ std::string BuildFileName(void)
     localtime_r(&now, &localNow);
 #endif
     char datePart[16];
-    strftime(datePart, sizeof(datePart), "%y%m%d%H%M%S", &localNow);
+    strftime(datePart, sizeof(datePart), "%Y%m%d-%H%M%S", &localNow);
 
     std::string filename = datePart;
 
@@ -319,7 +328,8 @@ bool OpenNewFile(const ReplayMemory::MatchInfo& matchInfo)
     std::filesystem::path directory("replays");
     std::filesystem::create_directories(directory);
 
-    std::filesystem::path path = directory / BuildFileName();
+    time_t now = time(nullptr);
+    std::filesystem::path path = directory / BuildFileName(now);
     s_File.open(path, std::ios::binary | std::ios::trunc);
     if (!s_File.is_open())
     {
@@ -333,7 +343,7 @@ bool OpenNewFile(const ReplayMemory::MatchInfo& matchInfo)
 
     FileHeader header{};
     std::memcpy(header.magic, "RMGR", 4);
-    header.version = 2;
+    header.version = 3;
     header.streamLength = 0;
     // Reaching here already implies IsSupportedGame() was true (see
     // OnEmulationStart()), so this is just re-fetching the same value to
@@ -342,6 +352,7 @@ bool OpenNewFile(const ReplayMemory::MatchInfo& matchInfo)
     CoreGetCurrentRomSettings(romSettings);
     WriteFixedString(header.goodName, sizeof(header.goodName), romSettings.GoodName);
     header.recorderSchemaVersion = kRecorderSchemaVersion;
+    header.recordedAtEpochSeconds = static_cast<uint64_t>(now);
     s_File.write(reinterpret_cast<const char*>(&header), sizeof(header));
 
     WriteEventPayloadsEvent();

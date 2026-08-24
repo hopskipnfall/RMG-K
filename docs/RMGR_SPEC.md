@@ -1,6 +1,6 @@
 # RMG-K Replay File Format (`.rmgr`) — Specification
 
-**Status:** format version `2`, implemented in `Source/RMG-Core/Replay.cpp` /
+**Status:** format version `3`, implemented in `Source/RMG-Core/Replay.cpp` /
 `Source/RMG-Core/ReplayMemory.cpp` on the `feature/replay-file-format` branch.
 
 **Target game:** Super Smash Bros. (N64) — Smash Remix 2.0.1. The container
@@ -73,7 +73,7 @@ several of Slippi's choices. See §2.
 
 ```
 +----------------+----------------------------------------+
-| File Header    | 80 bytes, fixed                         |
+| File Header    | 88 bytes, fixed                         |
 +----------------+----------------------------------------+
 | Event Stream   | variable length, sequence of events      |
 |                | (EventPayloads, then GameStart, then     |
@@ -87,16 +87,17 @@ of any kind — the event stream *is* the rest of the file, up to
 `streamLength` bytes (§3.1) after the header, or up to EOF for a file whose
 recording session never cleanly finished.
 
-### 3.1 File header (80 bytes)
+### 3.1 File header (88 bytes)
 
 | Offset | Size | Type       | Field                  | Notes                                                  |
 |-------:|-----:|------------|------------------------|---------------------------------------------------------|
 | 0x00   | 4    | `char[4]`  | `magic`                | Always the ASCII bytes `R`, `M`, `G`, `R` (no NUL).      |
-| 0x04   | 1    | `u8`       | `version`               | Format version. `2` for everything described here.      |
+| 0x04   | 1    | `u8`       | `version`               | Format version. `3` for everything described here.      |
 | 0x05   | 3    | `u8[3]`    | `reserved`              | Always zero. Reserved for future header fields.          |
 | 0x08   | 4    | `u32`      | `streamLength`          | Byte length of the event stream that follows the header. |
 | 0x0C   | 64   | `char[64]` | `goodName`              | The recorded ROM's `GoodName` (mupen64plus-core's ROM database identity string), UTF-8, NUL-padded — not necessarily NUL-terminated if it fills the field. Truncated if longer than 64 bytes. |
 | 0x4C   | 4    | `u32`      | `recorderSchemaVersion` | This recorder's revision of its own understanding of `goodName`'s memory layout — see §3.3. |
+| 0x50   | 8    | `u64`      | `recordedAtEpochSeconds`| Wall-clock time the recording started, seconds since the Unix epoch (UTC) — what `time(nullptr)` returns. Independent of the filename's timestamp (§3.4), though the recorder writes the same instant to both. |
 
 **`streamLength` is written as `0` when the file is opened**, and is the
 *only* field patched after the fact: once the match ends (or is otherwise
@@ -107,34 +108,6 @@ checking whether `streamLength` is nonzero, and a file left at `streamLength
 == 0` (the process died, or the emulator was killed, mid-match) is still a
 valid, parseable, truncated recording — a reader should fall back to reading
 events until EOF instead of trusting the header's length in that case.
-
-### 3.3 `goodName` and `recorderSchemaVersion` — two independent axes
-
-These two fields exist to answer two different questions, and conflating
-them is the mistake to avoid:
-
-- **`goodName`** identifies *which ROM build* produced the file — a unique
-  identity, not a family. `SmashRemix2.0.1` and a hypothetical
-  `SmashRemix2.0.2` are different `goodName`s even though they're the "same"
-  mod, because their memory layouts can differ.
-- **`recorderSchemaVersion`** identifies *which revision of this recorder's
-  interpretation* of that specific `goodName`'s memory layout produced the
-  file. It's bumped whenever that interpretation changes in a way that
-  affects recorded output — which includes but isn't limited to adding a new
-  field. A fix to an *existing* field's offset (silently changing recorded
-  *values* without changing any event's declared byte size) needs a bump
-  too, since the per-event `EventPayloads` declared-size mechanism (§5) has
-  no way to signal that on its own.
-
-`recorderSchemaVersion` is its own counter **per `goodName`**, not global:
-`SmashRemix2.0.1` schema `3` and `SmashRemix2.0.2` schema `1` are unrelated
-numbering spaces, each starting fresh at `1` for that `goodName`'s first
-supported revision.
-
-A reader that only knows how to interpret one specific `(goodName,
-recorderSchemaVersion)` pair should check both explicitly before trusting
-any event payload's semantics, rather than assuming every file it can parse
-was produced by the same game and recorder revision it was built against.
 
 ### 3.2 Event stream
 
@@ -164,6 +137,46 @@ like `Pre(port 0), Post(port 0), Pre(port 1), Post(port 1)`. Ports that are
 empty or unseated that frame have no events at all — never a zeroed/dummy
 event — so a reader must not assume every frame has all four ports present,
 and must not assume a fixed number of events per frame.
+
+### 3.3 `goodName` and `recorderSchemaVersion` — two independent axes
+
+These two fields exist to answer two different questions, and conflating
+them is the mistake to avoid:
+
+- **`goodName`** identifies *which ROM build* produced the file — a unique
+  identity, not a family. `SmashRemix2.0.1` and a hypothetical
+  `SmashRemix2.0.2` are different `goodName`s even though they're the "same"
+  mod, because their memory layouts can differ.
+- **`recorderSchemaVersion`** identifies *which revision of this recorder's
+  interpretation* of that specific `goodName`'s memory layout produced the
+  file. It's bumped whenever that interpretation changes in a way that
+  affects recorded output — which includes but isn't limited to adding a new
+  field. A fix to an *existing* field's offset (silently changing recorded
+  *values* without changing any event's declared byte size) needs a bump
+  too, since the per-event `EventPayloads` declared-size mechanism (§5) has
+  no way to signal that on its own.
+
+`recorderSchemaVersion` is its own counter **per `goodName`**, not global:
+`SmashRemix2.0.1` schema `3` and `SmashRemix2.0.2` schema `1` are unrelated
+numbering spaces, each starting fresh at `1` for that `goodName`'s first
+supported revision.
+
+A reader that only knows how to interpret one specific `(goodName,
+recorderSchemaVersion)` pair should check both explicitly before trusting
+any event payload's semantics, rather than assuming every file it can parse
+was produced by the same game and recorder revision it was built against.
+
+### 3.4 Filename convention
+
+Not part of the on-disk format itself (a reader must not depend on it — the
+header's own `recordedAtEpochSeconds` is the source of truth for when a
+recording started, precisely because filenames get renamed/copied/re-shared
+and can't be trusted), but the recorder names files
+`YYYYMMDD-HHMMSS[-Player1][-Player2]...rmgr` — 4-digit year, 24-hour clock,
+local time, one hyphen-joined segment per seated player's name (each capped
+at 24 characters, filesystem-unsafe characters replaced with `_`). The
+timestamp reflects the same instant written to `recordedAtEpochSeconds`,
+just rendered as local wall-clock time instead of a UTC epoch value.
 
 ## 4. Events
 
@@ -328,19 +341,20 @@ Two independent mechanisms, matching §4.6 of the original design rationale:
   recognize looks up its declared size in `EventPayloads` and skips exactly
   that many bytes, then continues from the next event.
 
-`FileHeader.version` (currently `2`) is reserved for a breaking change to
+`FileHeader.version` (currently `3`) is reserved for a breaking change to
 the *header* or the overall framing itself — not for anything the two
 mechanisms above already cover, and not for tracking which game/ROM
 produced a file or how that recorder's understanding of it has evolved
 either — that's `goodName`/`recorderSchemaVersion` (§3.3), a deliberately
 separate axis from the container format itself.
 
-**Compatibility note:** `version` jumped `1` → `2` to add `goodName` and
-`recorderSchemaVersion` to the header. This was a breaking change to files
-already recorded under `version 1` (they lack those fields entirely, at a
-different header size) — accepted deliberately, since no `version 1` file
-had any external consumer yet. A `version 1` file is not expected to parse
-under this spec.
+**Compatibility note:** `version` jumped `1` → `2` (adding `goodName` and
+`recorderSchemaVersion`) → `3` (adding `recordedAtEpochSeconds`), each a
+breaking change to files already recorded under the prior version (they
+lack those fields entirely, at a different header size) — accepted
+deliberately both times, since no file predating this spec's current form
+has any external consumer yet. A `version 1` or `version 2` file is not
+expected to parse under this spec.
 
 ## 6. Byte order and encoding
 
