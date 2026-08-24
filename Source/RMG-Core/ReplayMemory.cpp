@@ -20,9 +20,11 @@ constexpr uint32_t ADDR_MATCH_INFO_PTR   = 0x800A50E8;
 
 constexpr uint32_t MI_GAME_MODE          = 0x00;
 constexpr uint32_t MI_STAGE_ID           = 0x01;
+constexpr uint32_t MI_TEAMS_ENABLED      = 0x02;
 constexpr uint32_t MI_GAME_TYPE          = 0x03;
 constexpr uint32_t MI_TIME_LIMIT         = 0x06;
 constexpr uint32_t MI_STOCK_COUNT        = 0x07;
+constexpr uint32_t MI_HANDICAP_MODE      = 0x08;
 constexpr uint32_t MI_DAMAGE_RATIO       = 0x0B;
 constexpr uint32_t MI_GAME_STATUS        = 0x11;
 constexpr uint32_t MI_ITEM_FREQUENCY     = 0x1C;
@@ -52,6 +54,9 @@ constexpr uint32_t PS_STICK_X              = 0x1C2;
 constexpr uint32_t PS_STICK_Y              = 0x1C3;
 constexpr uint32_t PS_HURTBOX_STATE        = 0x5BB;
 constexpr uint32_t PS_HITSTUN_COUNTER      = 0xB1A;
+constexpr uint32_t PS_TEAM                 = 0x0C;
+constexpr uint32_t PS_HANDICAP             = 0x12;
+constexpr uint32_t PS_CPU_LEVEL            = 0x13;
 
 // KSEG0, 8MB expansion-pak RDRAM window. A value outside this range means a
 // pointer chase hit garbage - treat as "not currently available", not a crash.
@@ -98,6 +103,8 @@ MatchInfo ReadMatchInfo(void)
     info.itemFrequency       = m64p::Core.DebugMemRead8(matchInfoPtr + MI_ITEM_FREQUENCY);
     info.gameStatus          = m64p::Core.DebugMemRead8(matchInfoPtr + MI_GAME_STATUS);
     info.matchWasReset       = m64p::Core.DebugMemRead8(ADDR_MATCH_RESET_FLAG) != 0;
+    info.teamsEnabled        = m64p::Core.DebugMemRead8(matchInfoPtr + MI_TEAMS_ENABLED) != 0;
+    info.handicapMode        = m64p::Core.DebugMemRead8(matchInfoPtr + MI_HANDICAP_MODE);
     return info;
 }
 
@@ -153,6 +160,9 @@ PortPlayerState ReadPortPlayerState(uint32_t matchInfoPtr, int port)
     state.hurtboxState                   = m64p::Core.DebugMemRead8(playerStruct + PS_HURTBOX_STATE);
     state.hitstunCounter                  = m64p::Core.DebugMemRead16(playerStruct + PS_HITSTUN_COUNTER);
     state.damagePercent                    = m64p::Core.DebugMemRead32(playerStruct + PS_DAMAGE_PERCENT);
+    state.team                              = m64p::Core.DebugMemRead8(playerStruct + PS_TEAM);
+    state.handicap                           = m64p::Core.DebugMemRead8(playerStruct + PS_HANDICAP);
+    state.cpuLevel                            = m64p::Core.DebugMemRead8(playerStruct + PS_CPU_LEVEL);
 
     uint32_t positionPtr = m64p::Core.DebugMemRead32(playerStruct + PS_POSITION_PTR);
     if (IsValidRdramPointer(positionPtr))

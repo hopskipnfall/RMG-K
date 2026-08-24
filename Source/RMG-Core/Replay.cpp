@@ -66,8 +66,19 @@ struct GameStartEvent
     uint8_t           itemFrequency;
     GameStartPortInfo ports[4];
     char              playerNames[4][32];
+    // v1 field-append (docs/RMGR_SPEC.md section 5): everything above this
+    // line is the original 150-byte v1 layout, untouched. New fields are
+    // appended here, never inserted earlier, so an old parser reading a
+    // new file still sees the original layout intact at its original
+    // offsets and just skips these trailing bytes via the size EventPayloads
+    // declares for this event.
+    uint8_t           teamsEnabled;    // 0 off, 1 on
+    uint8_t           handicapMode;    // 0 off, 1 on, 2 auto
+    uint8_t           portTeam[4];     // team number per port, index = port
+    uint8_t           portHandicap[4]; // per-port handicap value (meaningful when handicapMode != 0)
+    uint8_t           portCpuLevel[4]; // CPU difficulty per port (meaningless for human ports)
 };
-static_assert(sizeof(GameStartEvent) == 150, "GameStartEvent must be 150 bytes");
+static_assert(sizeof(GameStartEvent) == 164, "GameStartEvent must be 164 bytes");
 
 struct PreFrameEvent
 {
@@ -263,6 +274,8 @@ bool OpenNewFile(const ReplayMemory::MatchInfo& matchInfo)
     startEvent.timeLimitMinutes  = matchInfo.timeLimitMinutes;
     startEvent.damageRatio       = matchInfo.damageRatio;
     startEvent.itemFrequency     = matchInfo.itemFrequency;
+    startEvent.teamsEnabled      = matchInfo.teamsEnabled ? 1 : 0;
+    startEvent.handicapMode      = matchInfo.handicapMode;
 
     for (int port = 0; port < 4; port++)
     {
@@ -271,6 +284,20 @@ bool OpenNewFile(const ReplayMemory::MatchInfo& matchInfo)
         startEvent.ports[port].characterId = portInfo.characterId;
         startEvent.ports[port].costumeId   = portInfo.costumeId;
         startEvent.ports[port].teamColor   = portInfo.teamColor;
+
+        // team/handicap/cpuLevel need the player-object/player-struct chase,
+        // which can be unpopulated if the file opened during the pre-match
+        // countdown (game_status == 0) before characters have spawned.
+        // Left at their zero-initialized default in that case - same
+        // tolerant "not currently available" handling as everywhere else
+        // in this file, not a crash.
+        ReplayMemory::PortPlayerState playerState = ReplayMemory::ReadPortPlayerState(matchInfo.matchInfoPtr, port);
+        if (playerState.valid)
+        {
+            startEvent.portTeam[port]     = playerState.team;
+            startEvent.portHandicap[port] = playerState.handicap;
+            startEvent.portCpuLevel[port] = playerState.cpuLevel;
+        }
     }
 
 #ifdef RMGK_HAVE_P2P_TRANSPORT

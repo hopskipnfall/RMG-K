@@ -48,6 +48,9 @@ struct PortPlayerState
     uint8_t  hurtboxState;
     uint16_t hitstunCounter;
     uint32_t damagePercent;
+    uint8_t  team;      // team number this port is assigned to
+    uint8_t  handicap;  // this port's handicap value (meaningful when MatchInfo::handicapMode != 0)
+    uint8_t  cpuLevel;  // CPU difficulty; meaningless for human ports
 };
 
 struct MatchInfo
@@ -63,6 +66,8 @@ struct MatchInfo
     uint8_t  itemFrequency;
     uint8_t  gameStatus;       // 0 pre-match countdown, 1 ongoing, 2 paused, 5 ended
     bool     matchWasReset;
+    bool     teamsEnabled;
+    uint8_t  handicapMode;     // 0 off, 1 on, 2 auto
 };
 
 // current_screen == 0x16 ("in a VS match")

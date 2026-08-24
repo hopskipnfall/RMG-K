@@ -153,10 +153,14 @@ Each entry:
 | +0x00          | 1    | `u8`  | `code` | The event command code this entry describes. |
 | +0x01          | 2    | `u16` | `size` | That event's payload size, in bytes.      |
 
-v1 always declares exactly 4 entries, in this order: `GameStart` (150),
-`PreFrameUpdate` (9), `PostFrameUpdate` (42), `GameEnd` (5). A future format
+v1 always declares exactly 4 entries, in this order: `GameStart`,
+`PreFrameUpdate`, `PostFrameUpdate`, `GameEnd` — currently sized 164, 9, 42,
+and 5 bytes respectively (`GameStart` grew from its original 150 bytes via
+the field-append mechanism in §5; see §4.2's note on that). A future format
 version could declare more entries (new event types) or the same entries
-with larger sizes (fields appended to an existing event) — see §5.
+with even larger sizes (more fields appended to an existing event) — see
+§5. **A parser must always read an event's size from that file's own
+`EventPayloads` event, never hardcode it** — this is exactly why.
 
 ### 4.2 Game Start — code `0x02`
 
@@ -167,7 +171,7 @@ table, populated by every netplay path), never from Smash Remix's in-game
 name tags** — for an offline match, or a port with no assigned name, the
 corresponding `playerNames` entry is all zero bytes.
 
-Payload size: **150 bytes.**
+Payload size: **164 bytes.**
 
 | Offset | Size | Type      | Field                | Notes                                                    |
 |-------:|-----:|-----------|-----------------------|------------------------------------------------------------|
@@ -179,9 +183,29 @@ Payload size: **150 bytes.**
 | 0x05   | 1    | `u8`      | `itemFrequency`        | `0` none .. `5` high.                                      |
 | 0x06   | 16   | struct[4] | `ports`                | 4× the 4-byte `PortSettings` struct below, port 0-3 in order. |
 | 0x16   | 128  | char[4][32]| `playerNames`         | 4× a 32-byte, NUL-padded (not necessarily NUL-terminated if exactly 32 chars) name string, port 0-3 in order. |
+| 0x96   | 1    | `u8`      | `teamsEnabled`         | `0` off, `1` on. **Appended field** — see the note below the table. |
+| 0x97   | 1    | `u8`      | `handicapMode`         | `0` off, `1` on, `2` auto.                                 |
+| 0x98   | 4    | `u8[4]`   | `portTeam`             | Team number per port, index = port 0-3.                    |
+| 0x9C   | 4    | `u8[4]`   | `portHandicap`         | Per-port handicap value, meaningful only when `handicapMode != 0`. |
+| 0xA0   | 4    | `u8[4]`   | `portCpuLevel`         | CPU difficulty per port; meaningless for a `human` port.    |
 
-`PortSettings` (4 bytes, repeated 4× inline above — **not** a separately
-declared event, just a fixed sub-layout within `GameStart`):
+**`teamsEnabled` through `portCpuLevel` (offsets `0x96`-`0xA3`) were appended
+after the original v1 fields** (`stageId` through `playerNames`, offsets
+`0x00`-`0x95`, unchanged since the format's first version) — per §5's
+field-addition rule, this is why they sit after `playerNames` rather than
+next to the other match-wide settings at the top of the struct. The four
+`port*` arrays require the same player-object/player-struct pointer chase
+as Post-Frame Update (§4.4); if a ReadPortMatchInfo/ReadPortPlayerState open
+finds a port's characters not yet spawned (e.g. `GameStart` was written
+during the pre-match countdown, before `game_status` reaches `1`), that
+port's `portTeam`/`portHandicap`/`portCpuLevel` entries are left at `0`
+rather than the real value — a reader can't distinguish "genuinely 0" from
+"not available yet" for these three fields alone.
+
+`PortSettings` (4 bytes, repeated 4× inline above at offset `0x06` — **not**
+a separately declared event, just a fixed sub-layout within `GameStart`,
+and distinct from the appended `portTeam`/`portHandicap`/`portCpuLevel`
+arrays above):
 
 | Offset (rel.) | Size | Type | Field         | Notes                              |
 |---------------:|-----:|------|---------------|--------------------------------------|
