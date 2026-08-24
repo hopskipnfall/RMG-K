@@ -12,6 +12,7 @@
 #include "Settings.hpp"
 #include "Directories.hpp"
 #include "Callback.hpp"
+#include "Library.hpp"
 #ifdef RMGK_HAVE_P2P_TRANSPORT
 #include "kailleraclient.h"
 #endif
@@ -351,7 +352,7 @@ void RecordFrame(const ReplayMemory::MatchInfo& matchInfo)
 
 namespace Replay
 {
-void OnEmulationStart(void)
+CORE_EXPORT void OnEmulationStart(void)
 {
     std::lock_guard<std::mutex> lock(s_Mutex);
 
@@ -372,7 +373,7 @@ void OnEmulationStart(void)
     s_StreamBytesWritten = 0;
 }
 
-void OnEmulationStop(void)
+CORE_EXPORT void OnEmulationStop(void)
 {
     std::lock_guard<std::mutex> lock(s_Mutex);
 
@@ -384,7 +385,7 @@ void OnEmulationStop(void)
     s_State = State::Idle;
 }
 
-void OnFrame(void)
+CORE_EXPORT void OnFrame(void)
 {
     std::lock_guard<std::mutex> lock(s_Mutex);
 

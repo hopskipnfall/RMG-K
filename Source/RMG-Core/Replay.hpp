@@ -14,10 +14,13 @@
 // from Source/n02's .krec format - does not read, write, or otherwise
 // touch anything under Source/n02/.
 //
-// Thread safety: OnFrame() is called from the emulation thread while
-// OnEmulationStart()/OnEmulationStop() are called from the UI thread. All
-// three are internally synchronized (a mutex is held for the duration of
-// each call), so callers don't need any of their own locking.
+// Thread safety: these three functions can be called from more than one
+// thread (OnFrame() from the emulation thread; OnEmulationStart()/
+// OnEmulationStop() from whichever thread starts/stops emulation, which is
+// usually the UI thread but not always - e.g. CoreStopEmulation() can also
+// run from the emulation thread on some Kaillera playback paths). All three
+// are internally synchronized (a mutex is held for the duration of each
+// call), so callers don't need any of their own locking.
 namespace Replay
 {
 // Call once, right after CoreStartEmulation registers the frame callback.
