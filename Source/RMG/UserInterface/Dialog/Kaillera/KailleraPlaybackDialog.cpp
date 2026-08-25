@@ -1953,12 +1953,54 @@ void KailleraPlaybackDialog::onPlaybackExportReplay()
     }
 
     // No settings to prompt for (unlike MP4 export) - just derive a
-    // destination next to the recording and go. The export process does
-    // its own collision-avoidance (see FindCollisionFreePath() in
-    // ReplayFileExport.cpp) if this exact name is already taken.
-    const QFileInfo recordingFileInfo(recordingPath);
+    // destination and go. Exported files land in the same "replays"
+    // directory (and use the same "<timestamp>-Player1-Player2.rmgr"
+    // naming) as a live-recorded .rmgr - see Replay.cpp's OpenNewFile()/
+    // BuildFileName() - rather than next to the source .krec, so every
+    // .rmgr this app ever writes lives in one place with one consistent
+    // scheme. The export process does its own collision-avoidance (see
+    // FindCollisionFreePath() in ReplayFileExport.cpp) if this exact name
+    // is already taken.
+    //
+    // The timestamp and player names both come from the .krec's own
+    // header (not "now"/recording_player_names) so the filename reflects
+    // when the match was actually played, and re-exporting the same
+    // recording later reproduces the same base name.
+    KailleraExport::KrecData krecData;
+    std::string parseErrorMessage;
+    KailleraExport::ParseKrecFile(std::filesystem::path(recordingPath.toStdString()), krecData, &parseErrorMessage);
+
+    time_t recordedTime = static_cast<time_t>(krecData.header.timestamp);
+    tm localRecordedTime{};
+#ifdef _WIN32
+    localtime_s(&localRecordedTime, &recordedTime);
+#else
+    localtime_r(&recordedTime, &localRecordedTime);
+#endif
+    char datePart[16];
+    strftime(datePart, sizeof(datePart), "%Y%m%d-%H%M%S", &localRecordedTime);
+
+    QString outputBaseName = QString::fromLatin1(datePart);
+    for (const std::string& name : krecData.header.playerNames)
+    {
+        if (name.empty())
+        {
+            continue;
+        }
+        QString sanitized = QString::fromStdString(name).left(24);
+        for (QChar& c : sanitized)
+        {
+            if (c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' ||
+                c == '"' || c == '<' || c == '>' || c == '|')
+            {
+                c = '_';
+            }
+        }
+        outputBaseName += "-" + sanitized;
+    }
+
     const QString outputPath = QDir::toNativeSeparators(
-        recordingFileInfo.absoluteDir().filePath(recordingFileInfo.completeBaseName() + ".rmgr"));
+        QDir(QStringLiteral("replays")).filePath(outputBaseName + ".rmgr"));
 
     startReplayFileExportProcess(recordingPath, romPath, outputPath, totalFrames);
 }
