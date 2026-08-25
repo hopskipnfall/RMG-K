@@ -1966,17 +1966,21 @@ void KailleraPlaybackDialog::onPlaybackExportReplay()
     // header (not "now"/recording_player_names) so the filename reflects
     // when the match was actually played, and re-exporting the same
     // recording later reproduces the same base name.
+    //
+    // KailleraExport::KrecData/ParseKrecFile are only declared under the
+    // #ifdef _WIN32 include block at the top of this file - this whole
+    // function is unreachable on other platforms already (its button and
+    // connect() are both #if defined(RMGK_GAME_STATS) && defined(_WIN32)),
+    // but it still needs to type-check on a GAME_STATS build for any
+    // platform, so the real logic is gated the same way.
+#ifdef _WIN32
     KailleraExport::KrecData krecData;
     std::string parseErrorMessage;
     KailleraExport::ParseKrecFile(std::filesystem::path(recordingPath.toStdString()), krecData, &parseErrorMessage);
 
     time_t recordedTime = static_cast<time_t>(krecData.header.timestamp);
     tm localRecordedTime{};
-#ifdef _WIN32
     localtime_s(&localRecordedTime, &recordedTime);
-#else
-    localtime_r(&recordedTime, &localRecordedTime);
-#endif
     char datePart[16];
     strftime(datePart, sizeof(datePart), "%Y%m%d-%H%M%S", &localRecordedTime);
 
@@ -2003,6 +2007,7 @@ void KailleraPlaybackDialog::onPlaybackExportReplay()
         QDir(QStringLiteral("replays")).filePath(outputBaseName + ".rmgr"));
 
     startReplayFileExportProcess(recordingPath, romPath, outputPath, totalFrames);
+#endif
 }
 #endif
 
