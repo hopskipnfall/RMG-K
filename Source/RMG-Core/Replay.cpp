@@ -18,6 +18,7 @@
 #endif
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -182,6 +183,12 @@ bool s_OverrideValue = false;
 // and SetOutputPathOverride's own doc comment in Replay.hpp.
 bool        s_HasOutputPathOverride = false;
 std::string s_OutputPathOverride;
+
+// Per-launch playerNames override, set via Replay::SetPlayerNamesOverride().
+// Consumed (cleared) the next time OpenNewFile() runs - see that function
+// and SetPlayerNamesOverride's own doc comment in Replay.hpp.
+bool                       s_HasPlayerNamesOverride = false;
+std::array<std::string, 4> s_PlayerNamesOverride;
 
 // This feature's memory offsets were only ever derived/verified against
 // Smash Remix 2.0.1 (see docs/RMGR_SPEC.md); recording against any other
@@ -407,7 +414,18 @@ bool OpenNewFile(const ReplayMemory::MatchInfo& matchInfo)
     }
 
 #ifdef RMGK_HAVE_P2P_TRANSPORT
-    std::memcpy(startEvent.playerNames, recording_player_names, sizeof(startEvent.playerNames));
+    if (s_HasPlayerNamesOverride)
+    {
+        for (int port = 0; port < 4; port++)
+        {
+            WriteFixedString(startEvent.playerNames[port], sizeof(startEvent.playerNames[port]), s_PlayerNamesOverride[port]);
+        }
+        s_HasPlayerNamesOverride = false; // consumed - see SetPlayerNamesOverride's doc comment
+    }
+    else
+    {
+        std::memcpy(startEvent.playerNames, recording_player_names, sizeof(startEvent.playerNames));
+    }
 #endif
 
     WriteEvent(EventCode::GameStart, startEvent);
@@ -551,6 +569,13 @@ CORE_EXPORT void SetOutputPathOverride(const std::string& path)
     std::lock_guard<std::mutex> lock(s_Mutex);
     s_HasOutputPathOverride = true;
     s_OutputPathOverride = path;
+}
+
+CORE_EXPORT void SetPlayerNamesOverride(const std::array<std::string, 4>& names)
+{
+    std::lock_guard<std::mutex> lock(s_Mutex);
+    s_HasPlayerNamesOverride = true;
+    s_PlayerNamesOverride = names;
 }
 
 CORE_EXPORT void OnEmulationStop(void)

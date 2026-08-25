@@ -574,19 +574,11 @@ void KailleraPlaybackDialog::setupUI()
 #endif
 
 #ifdef RMGK_GAME_STATS
-    // Independent of Export MP4 - lets replaying a .krec also produce a
-    // .rmgr for the same match, cross-platform (unlike MP4 export above).
-    m_replayRecordCheck = new QCheckBox("Also record replay (.rmgr)", this);
-    m_replayRecordCheck->setToolTip(
-        "While replaying this recording, also write a .rmgr replay file "
-        "for it, separate from the .krec/MP4 export.\nSmash Remix 2.0.1 only.");
-    m_replayRecordCheck->setVisible(false);
-
     // Headless/fast .rmgr-only export - same idea as Export MP4 (a second
     // launch of this exe with hidden CLI flags, see ReplayFileExport.cpp),
     // but no video/audio, so no settings prompt: just picks a destination
     // next to the recording and goes.
-    m_btnExportReplay = new QPushButton("Export Replay", this);
+    m_btnExportReplay = new QPushButton("Export Replays", this);
     m_btnExportReplay->setToolTip(
         "Headlessly replay this recording at high speed to produce a .rmgr "
         "file, without opening a visible emulator window.\nSmash Remix 2.0.1 only.");
@@ -628,7 +620,7 @@ void KailleraPlaybackDialog::setupUI()
         configurePlaybackButton(m_btnExport, "KailleraPrimaryButton");
 #endif
 #if defined(RMGK_GAME_STATS) && defined(_WIN32)
-        configurePlaybackButton(m_btnExportReplay, "KailleraSecondaryButton");
+        configurePlaybackButton(m_btnExportReplay, "KailleraPrimaryButton");
 #endif
         configurePlaybackButton(m_btnOpenFolder, "KailleraSecondaryButton");
     }
@@ -660,11 +652,8 @@ void KailleraPlaybackDialog::setupUI()
 #endif
 #if defined(RMGK_GAME_STATS) && defined(_WIN32)
     bottomLayout->addWidget(m_btnExportReplay);
-#endif
-#ifdef RMGK_GAME_STATS
-    bottomLayout->addWidget(m_replayRecordCheck);
     connect(m_playbackTable, &QTableWidget::itemSelectionChanged,
-            this, &KailleraPlaybackDialog::updateReplayRecordCheckVisibility);
+            this, &KailleraPlaybackDialog::updateExportReplayVisibility);
 #endif
     bottomLayout->addStretch();
     bottomLayout->addWidget(m_btnPBRefresh);
@@ -745,18 +734,20 @@ void KailleraPlaybackDialog::updatePlaybackControls()
 }
 
 #ifdef RMGK_GAME_STATS
-void KailleraPlaybackDialog::updateReplayRecordCheckVisibility()
+void KailleraPlaybackDialog::updateExportReplayVisibility()
 {
-    if (m_replayRecordCheck == nullptr)
+    if (m_btnExportReplay == nullptr)
     {
         return;
     }
 
-    const QString selectedPath = getSelectedRecordingPath();
 #ifdef _WIN32
     // KailleraExport::ParseKrecFile is only pulled in on Windows (see the
     // #ifdef _WIN32 include block at the top of this file), so this is the
-    // only platform where we can check the recording's stored game name.
+    // only platform where we can check the recording's stored game name -
+    // and the only platform where m_btnExportReplay is ever shown at all
+    // (see its construction above).
+    const QString selectedPath = getSelectedRecordingPath();
     bool show = false;
     if (!selectedPath.isEmpty())
     {
@@ -767,21 +758,8 @@ void KailleraPlaybackDialog::updateReplayRecordCheckVisibility()
             show = (QString::fromStdString(krecData.header.gameName) == "SmashRemix2.0.1");
         }
     }
-    if (m_btnExportReplay != nullptr)
-    {
-        m_btnExportReplay->setVisible(show);
-    }
-#else
-    // No cross-platform way to peek the recording's game name here; show
-    // whenever a recording is selected and let Replay::OnEmulationStart's
-    // own GoodName check silently no-op for anything else.
-    const bool show = !selectedPath.isEmpty();
+    m_btnExportReplay->setVisible(show);
 #endif
-    m_replayRecordCheck->setVisible(show);
-    if (!show)
-    {
-        m_replayRecordCheck->setChecked(false);
-    }
 }
 #endif
 
@@ -1411,7 +1389,7 @@ QString KailleraPlaybackDialog::downloadManagedFfmpeg()
 QString KailleraPlaybackDialog::exportDialogTitle() const
 {
 #ifdef RMGK_GAME_STATS
-    return m_exportIsReplayFile ? "Export Replay" : "Export MP4";
+    return m_exportIsReplayFile ? "Export Replays" : "Export MP4";
 #else
     return "Export MP4";
 #endif
@@ -1661,7 +1639,7 @@ void KailleraPlaybackDialog::startReplayFileExportProcess(const QString& recordi
             &KailleraPlaybackDialog::onExportProcessFinished);
 
     m_exportProgressDialog = new QProgressDialog("Exporting recording to .rmgr...", "Cancel", 0, 0, this);
-    m_exportProgressDialog->setWindowTitle("Export Replay");
+    m_exportProgressDialog->setWindowTitle("Export Replays");
     m_exportProgressDialog->setWindowModality(Qt::WindowModal);
     m_exportProgressDialog->setMinimumDuration(0);
     m_exportProgressDialog->setAutoClose(false);
@@ -1714,7 +1692,7 @@ void KailleraPlaybackDialog::startReplayFileExportProcess(const QString& recordi
     {
         const QString message = m_exportProcess->errorString();
         resetExportUi();
-        QMessageBox::warning(this, "Export Replay", "Failed to start export process.\n\n" + message);
+        QMessageBox::warning(this, "Export Replays", "Failed to start export process.\n\n" + message);
         return;
     }
 
@@ -1739,13 +1717,6 @@ void KailleraPlaybackDialog::onPlaybackPlay()
 
     // Ensure playback mode is active
     n02::activateMode(2);
-
-#ifdef RMGK_GAME_STATS
-    if (m_replayRecordCheck)
-    {
-        Replay::SetEnabledOverride(m_replayRecordCheck->isChecked());
-    }
-#endif
 
     if (n02::playbackLoad(pathBytes.constData()))
     {
@@ -1944,7 +1915,7 @@ void KailleraPlaybackDialog::onPlaybackExportReplay()
     if (CoreIsEmulationRunning() || n02::isPlaybackActive())
     {
         QMessageBox::information(this,
-                                 "Export Replay",
+                                 "Export Replays",
                                  "Stop playback before exporting a recording.");
         return;
     }
@@ -1954,20 +1925,20 @@ void KailleraPlaybackDialog::onPlaybackExportReplay()
     const QString gameName = getSelectedRecordingGameName(&recordingPath, &totalFrames);
     if (recordingPath.isEmpty())
     {
-        QMessageBox::information(this, "Export Replay", "Select a recording to export first.");
+        QMessageBox::information(this, "Export Replays", "Select a recording to export first.");
         return;
     }
 
     if (gameName.isEmpty())
     {
-        QMessageBox::warning(this, "Export Replay", "Failed to read the selected recording.");
+        QMessageBox::warning(this, "Export Replays", "Failed to read the selected recording.");
         return;
     }
 
     auto* mainWindow = qobject_cast<UserInterface::MainWindow*>(parentWidget());
     if (mainWindow == nullptr)
     {
-        QMessageBox::warning(this, "Export Replay", "Unable to resolve the current ROM directory.");
+        QMessageBox::warning(this, "Export Replays", "Unable to resolve the current ROM directory.");
         return;
     }
 
@@ -1975,7 +1946,7 @@ void KailleraPlaybackDialog::onPlaybackExportReplay()
     if (romPath.isEmpty())
     {
         QMessageBox::warning(this,
-                             "Export Replay",
+                             "Export Replays",
                              "Could not find a ROM for:\n" + gameName +
                              "\n\nMake sure the ROM is in the selected ROM directory and the ROM list is refreshed.");
         return;

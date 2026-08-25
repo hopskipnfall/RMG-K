@@ -10,6 +10,7 @@
 #ifndef REPLAY_HPP
 #define REPLAY_HPP
 
+#include <array>
 #include <string>
 
 // New, independent per-match ".rmgr" replay recorder. Entirely separate
@@ -63,6 +64,25 @@ void SetEnabledOverride(bool enabled);
 // default naming, and a stale override can never leak into an unrelated
 // later launch.
 void SetOutputPathOverride(const std::string& path);
+
+// Per-launch override for the GameStart event's playerNames field,
+// indexed by port. For headless/offline export tooling that has no live
+// Kaillera/rollback session to read n02's recording_player_names global
+// from (that global is only ever populated by the in-app netplay/lobby
+// UI code) - the .krec being replayed already has its own player names
+// stored in its header, and the caller passes those through here.
+//
+// Each name is truncated to the field's storage width the same way every
+// other fixed-width string in this format is (see WriteFixedString) - no
+// other escaping is needed since this is a fixed-size binary field, not a
+// delimited one.
+//
+// Consumed (cleared) the same way and for the same reason as
+// SetOutputPathOverride(): the next OpenNewFile() call uses it exactly
+// once, so a launch path that never calls this always falls through to
+// recording_player_names, and a stale override can never leak into an
+// unrelated later launch.
+void SetPlayerNamesOverride(const std::array<std::string, 4>& names);
 
 // Call from CoreStopEmulation, and also from any UI-thread path that ends
 // emulation without necessarily going through CoreStopEmulation (see

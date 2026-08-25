@@ -32,6 +32,11 @@ void ReplaySetOutputPathOverride(const std::string& path)
     Replay::SetOutputPathOverride(path);
 }
 
+void ReplaySetPlayerNamesOverride(const std::array<std::string, 4>& names)
+{
+    Replay::SetPlayerNamesOverride(names);
+}
+
 void ReplayOnEmulationStart()
 {
     Replay::OnEmulationStart();
@@ -61,6 +66,7 @@ bool IsReplayCoreApiHooked()
 
 void ReplaySetEnabledOverride(bool) {}
 void ReplaySetOutputPathOverride(const std::string&) {}
+void ReplaySetPlayerNamesOverride(const std::array<std::string, 4>&) {}
 void ReplayOnEmulationStart() {}
 void ReplayOnFrame() {}
 void ReplayOnEmulationStop() {}

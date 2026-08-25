@@ -170,8 +170,12 @@ static void applyExportSpeed()
     }
     // No encoder backpressure to react to here (unlike MP4 export's
     // adaptive governor) - .rmgr recording only reads emulated memory once
-    // per frame, so a single high fixed speed is enough.
-    int value = 2000;
+    // per frame, so a single high fixed speed is enough. 1000 is the
+    // core's own hard ceiling (see main_speedset() in mupen64plus-core's
+    // main.c) - anything above that is silently rejected and leaves the
+    // speed factor unchanged, which is why this used to sit at 2000 and
+    // quietly run at 1x the whole time.
+    int value = 1000;
     s_Emulator->coreDoCommand(M64CMD_CORE_STATE_SET, M64CORE_SPEED_FACTOR, &value);
     s_SpeedApplied = true;
     fprintf(stderr, "Using replay export speed target: %d%%\n", value);
@@ -362,6 +366,13 @@ static bool runReplayFileExport(ReplayFileExportOptions& options, std::string* e
 
     ReplaySetEnabledOverride(true);
     ReplaySetOutputPathOverride(options.outputPath.string());
+    // Live recording sources player names from n02's recording_player_names
+    // global, which only the in-app netplay/lobby UI ever populates - this
+    // headless process never touches that code, so without this the
+    // GameStart event's playerNames would be silently written as all zero
+    // bytes. The krec being replayed already has its own player names, so
+    // pass those through instead.
+    ReplaySetPlayerNamesOverride(krecData.header.playerNames);
     ReplayOnEmulationStart();
 
     const m64p_error executeResult = emulator.execute();
