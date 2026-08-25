@@ -179,10 +179,17 @@ timestamp reflects the same instant written to `recordedAtEpochSeconds`,
 just rendered as local wall-clock time instead of a UTC epoch value.
 
 If that name is already taken (e.g. two matches recorded within the same
-second, or a multi-game `.krec` producing more than one `.rmgr` per export -
-see `Replay::SetOutputPathOverride()`), the recorder appends `-2`, `-3`, ...
-before the extension until it finds a free name, rather than overwriting an
-existing file.
+second), the recorder appends `-2`, `-3`, ... before the extension until it
+finds a free name, rather than overwriting an existing file.
+
+Headless export of an existing `.krec` (see `Replay::SetOutputPathOverride()`)
+uses a different, caller-chosen base name instead - by convention
+`<krec name>.rmgr`, the same stem as the source `.krec` it was exported from,
+so the two plainly correspond by name. Each match within that `.krec` gets
+its own explicitly-numbered file from that base: `<krec name>-1.rmgr`,
+`<krec name>-2.rmgr`, ... (not just `<krec name>.rmgr` for the first match).
+The same collision-avoidance above still applies on top, e.g. if the same
+`.krec` is exported a second time.
 
 ## 4. Events
 

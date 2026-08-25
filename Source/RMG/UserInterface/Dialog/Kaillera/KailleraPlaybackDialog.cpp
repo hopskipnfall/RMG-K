@@ -1953,61 +1953,17 @@ void KailleraPlaybackDialog::onPlaybackExportReplay()
     }
 
     // No settings to prompt for (unlike MP4 export) - just derive a
-    // destination and go. Exported files land in the same "replays"
-    // directory (and use the same "<timestamp>-Player1-Player2.rmgr"
-    // naming) as a live-recorded .rmgr - see Replay.cpp's OpenNewFile()/
-    // BuildFileName() - rather than next to the source .krec, so every
-    // .rmgr this app ever writes lives in one place with one consistent
-    // scheme. The export process does its own collision-avoidance (see
-    // FindCollisionFreePath() in ReplayFileExport.cpp) if this exact name
-    // is already taken.
-    //
-    // The timestamp and player names both come from the .krec's own
-    // header (not "now"/recording_player_names) so the filename reflects
-    // when the match was actually played, and re-exporting the same
-    // recording later reproduces the same base name.
-    //
-    // KailleraExport::KrecData/ParseKrecFile are only declared under the
-    // #ifdef _WIN32 include block at the top of this file - this whole
-    // function is unreachable on other platforms already (its button and
-    // connect() are both #if defined(RMGK_GAME_STATS) && defined(_WIN32)),
-    // but it still needs to type-check on a GAME_STATS build for any
-    // platform, so the real logic is gated the same way.
-#ifdef _WIN32
-    KailleraExport::KrecData krecData;
-    std::string parseErrorMessage;
-    KailleraExport::ParseKrecFile(std::filesystem::path(recordingPath.toStdString()), krecData, &parseErrorMessage);
-
-    time_t recordedTime = static_cast<time_t>(krecData.header.timestamp);
-    tm localRecordedTime{};
-    localtime_s(&localRecordedTime, &recordedTime);
-    char datePart[16];
-    strftime(datePart, sizeof(datePart), "%Y%m%d-%H%M%S", &localRecordedTime);
-
-    QString outputBaseName = QString::fromLatin1(datePart);
-    for (const std::string& name : krecData.header.playerNames)
-    {
-        if (name.empty())
-        {
-            continue;
-        }
-        QString sanitized = QString::fromStdString(name).left(24);
-        for (QChar& c : sanitized)
-        {
-            if (c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' ||
-                c == '"' || c == '<' || c == '>' || c == '|')
-            {
-                c = '_';
-            }
-        }
-        outputBaseName += "-" + sanitized;
-    }
-
+    // destination and go. Named "<krec name>.rmgr" in the "replays"
+    // directory - Replay.cpp's OpenNewFile() numbers each match within
+    // this export as "<krec name>-1.rmgr", "-2.rmgr", ... (see
+    // SetOutputPathOverride's doc comment), so the exported filenames
+    // plainly correspond back to their source .krec by name, and a
+    // multi-game .krec still gets one distinct file per match.
+    const QFileInfo recordingFileInfo(recordingPath);
     const QString outputPath = QDir::toNativeSeparators(
-        QDir(QStringLiteral("replays")).filePath(outputBaseName + ".rmgr"));
+        QDir(QStringLiteral("replays")).filePath(recordingFileInfo.completeBaseName() + ".rmgr"));
 
     startReplayFileExportProcess(recordingPath, romPath, outputPath, totalFrames);
-#endif
 }
 #endif
 

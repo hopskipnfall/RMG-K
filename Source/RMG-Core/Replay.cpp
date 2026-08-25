@@ -184,6 +184,9 @@ bool s_OverrideValue = false;
 // doc comment in Replay.hpp.
 bool        s_HasOutputPathOverride = false;
 std::string s_OutputPathOverride;
+// Which numbered match this session is on for the override path (see
+// OpenNewFile()) - reset to 0 whenever a new override is set.
+int s_OverrideMatchNumber = 0;
 
 // Per-session playerNames override, set via Replay::SetPlayerNamesOverride().
 // Applies to every OpenNewFile() call for the rest of this session; cleared
@@ -375,10 +378,18 @@ bool OpenNewFile(const ReplayMemory::MatchInfo& matchInfo)
     if (s_HasOutputPathOverride)
     {
         // Not consumed here - see SetOutputPathOverride's doc comment. Every
-        // OpenNewFile() call during this same session reuses the same base
-        // path; FindCollisionFreePath() is what actually keeps each match's
-        // file distinct.
-        path = FindCollisionFreePath(s_OutputPathOverride);
+        // match this session gets its own explicitly-numbered file -
+        // "<override>-1.ext", "<override>-2.ext", ... - not just
+        // "<override>.ext" for the first, so a multi-game .krec's export
+        // still reads as "<krec name>-<game number>.rmgr" and plainly
+        // corresponds back to its source .krec by name.
+        // FindCollisionFreePath() is still a safety net in case this same
+        // krec was already exported before (so "-1" is already taken).
+        s_OverrideMatchNumber++;
+        const std::filesystem::path base(s_OutputPathOverride);
+        const std::filesystem::path numberedPath = base.parent_path() /
+            (base.stem().string() + "-" + std::to_string(s_OverrideMatchNumber) + base.extension().string());
+        path = FindCollisionFreePath(numberedPath);
         std::filesystem::create_directories(path.parent_path());
     }
     else
@@ -395,6 +406,10 @@ bool OpenNewFile(const ReplayMemory::MatchInfo& matchInfo)
     s_File.open(path, std::ios::binary | std::ios::trunc);
     if (!s_File.is_open())
     {
+        if (s_HasOutputPathOverride)
+        {
+            s_OverrideMatchNumber--; // undo - see the increment above, this attempt never happened
+        }
         CoreAddCallbackMessage(CoreDebugMessageType::Warning,
             "Replay: failed to open " + path.string() + " for recording");
         return false;
@@ -610,6 +625,7 @@ CORE_EXPORT void SetOutputPathOverride(const std::string& path)
     std::lock_guard<std::mutex> lock(s_Mutex);
     s_HasOutputPathOverride = true;
     s_OutputPathOverride = path;
+    s_OverrideMatchNumber = 0;
 }
 
 CORE_EXPORT void SetPlayerNamesOverride(const std::array<std::string, 4>& names)
@@ -637,6 +653,7 @@ CORE_EXPORT void OnEmulationStop(void)
     // with no override call of its own) would silently inherit them.
     s_HasOutputPathOverride = false;
     s_OutputPathOverride.clear();
+    s_OverrideMatchNumber = 0;
     s_HasPlayerNamesOverride = false;
     s_PlayerNamesOverride = {};
 }

@@ -54,17 +54,16 @@ void SetEnabledOverride(bool enabled);
 // default "replays/<timestamp>[-players].rmgr" naming (see BuildFileName()
 // in Replay.cpp) entirely. For headless/offline export tooling that needs
 // a predictable, caller-controlled destination rather than the
-// live-recording convention.
-//
-// Applies to every file OpenNewFile() opens for the rest of this session
-// (from the next OnEmulationStart() through its matching OnEmulationStop()),
-// not just the first - a single headless export of a multi-game .krec
-// produces one .rmgr per match, and each one needs a distinct name. Every
-// one of them is automatically collision-avoided against this exact base
-// path (see FindCollisionFreePath() in Replay.cpp: "<path>", "<path>-2",
-// "<path>-3", ... against whatever already exists on disk), so the caller
-// does not need to do its own collision handling - just pass the same
-// desired base path every time.
+// live-recording convention - pass e.g. "replays/<krec name>.rmgr" (the
+// same stem as the source .krec, so the export plainly corresponds back
+// to it) and each match gets its own explicitly-numbered file from that
+// base: "<krec name>-1.rmgr", "<krec name>-2.rmgr", ... (not just
+// "<krec name>.rmgr" for the first) - a single headless export of a
+// multi-game .krec produces one .rmgr per match. FindCollisionFreePath()
+// in Replay.cpp is still applied on top as a safety net (in case this
+// exact numbered name is already taken, e.g. the same .krec was already
+// exported once before), so the caller does not need its own collision
+// handling - just pass the same desired base path every time.
 //
 // Cleared at OnEmulationStop(), so a launch path that never calls this
 // always falls through to the default naming, and a stale override can
