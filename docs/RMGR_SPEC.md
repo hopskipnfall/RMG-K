@@ -178,6 +178,12 @@ at 24 characters, filesystem-unsafe characters replaced with `_`). The
 timestamp reflects the same instant written to `recordedAtEpochSeconds`,
 just rendered as local wall-clock time instead of a UTC epoch value.
 
+If that name is already taken (e.g. two matches recorded within the same
+second, or a multi-game `.krec` producing more than one `.rmgr` per export -
+see `Replay::SetOutputPathOverride()`), the recorder appends `-2`, `-3`, ...
+before the extension until it finds a free name, rather than overwriting an
+existing file.
+
 ## 4. Events
 
 ### 4.1 Event Payloads — code `0x01`

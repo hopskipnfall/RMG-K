@@ -178,15 +178,17 @@ std::mutex s_Mutex;
 bool s_HasOverride = false;
 bool s_OverrideValue = false;
 
-// Per-launch output path override, set via Replay::SetOutputPathOverride().
-// Consumed (cleared) the next time OpenNewFile() runs - see that function
-// and SetOutputPathOverride's own doc comment in Replay.hpp.
+// Per-session output path override, set via Replay::SetOutputPathOverride().
+// Applies to every OpenNewFile() call for the rest of this session; cleared
+// at OnEmulationStop() - see that function and SetOutputPathOverride's own
+// doc comment in Replay.hpp.
 bool        s_HasOutputPathOverride = false;
 std::string s_OutputPathOverride;
 
-// Per-launch playerNames override, set via Replay::SetPlayerNamesOverride().
-// Consumed (cleared) the next time OpenNewFile() runs - see that function
-// and SetPlayerNamesOverride's own doc comment in Replay.hpp.
+// Per-session playerNames override, set via Replay::SetPlayerNamesOverride().
+// Applies to every OpenNewFile() call for the rest of this session; cleared
+// at OnEmulationStop() - see that function and SetPlayerNamesOverride's own
+// doc comment in Replay.hpp.
 bool                       s_HasPlayerNamesOverride = false;
 std::array<std::string, 4> s_PlayerNamesOverride;
 
@@ -324,6 +326,40 @@ std::string BuildFileName(time_t now)
     return filename;
 }
 
+// If `desiredPath` already exists on disk, tries "<stem>-2<ext>",
+// "<stem>-3<ext>", ... until a free one is found. One emulation session
+// (one OnEmulationStart()..OnEmulationStop() span) can open more than one
+// file here - a single headless export of a multi-game .krec produces one
+// .rmgr per match, all sharing the same base name (see
+// SetOutputPathOverride's doc comment) - so without this, match 2 would
+// silently overwrite match 1's file.
+std::filesystem::path FindCollisionFreePath(const std::filesystem::path& desiredPath)
+{
+    std::error_code errorCode;
+    if (!std::filesystem::exists(desiredPath, errorCode))
+    {
+        return desiredPath;
+    }
+
+    const std::filesystem::path directory = desiredPath.parent_path();
+    const std::filesystem::path extension = desiredPath.extension();
+    const std::string stem = desiredPath.stem().string();
+
+    for (int suffix = 2; suffix < 10000; suffix++)
+    {
+        std::filesystem::path candidate = directory / (stem + "-" + std::to_string(suffix) + extension.string());
+        if (!std::filesystem::exists(candidate, errorCode))
+        {
+            return candidate;
+        }
+    }
+
+    // Pathological case (10000 collisions) - fall through to the original
+    // path rather than loop forever; the caller's own file open just
+    // overwrites it same as before this function existed.
+    return desiredPath;
+}
+
 // Returns true if the file was opened and the header/GameStart event were
 // written successfully; false if the caller should not transition into the
 // Recording state (e.g. open() failed).
@@ -338,8 +374,11 @@ bool OpenNewFile(const ReplayMemory::MatchInfo& matchInfo)
     std::filesystem::path path;
     if (s_HasOutputPathOverride)
     {
-        path = s_OutputPathOverride;
-        s_HasOutputPathOverride = false; // consumed - see SetOutputPathOverride's doc comment
+        // Not consumed here - see SetOutputPathOverride's doc comment. Every
+        // OpenNewFile() call during this same session reuses the same base
+        // path; FindCollisionFreePath() is what actually keeps each match's
+        // file distinct.
+        path = FindCollisionFreePath(s_OutputPathOverride);
         std::filesystem::create_directories(path.parent_path());
     }
     else
@@ -350,7 +389,7 @@ bool OpenNewFile(const ReplayMemory::MatchInfo& matchInfo)
         // instead of being nested under the per-platform user-data directory.
         std::filesystem::path directory("replays");
         std::filesystem::create_directories(directory);
-        path = directory / BuildFileName(now);
+        path = FindCollisionFreePath(directory / BuildFileName(now));
     }
 
     s_File.open(path, std::ios::binary | std::ios::trunc);
@@ -414,13 +453,15 @@ bool OpenNewFile(const ReplayMemory::MatchInfo& matchInfo)
     }
 
 #ifdef RMGK_HAVE_P2P_TRANSPORT
+    // Not consumed here (unlike the old per-file behavior) - see
+    // SetPlayerNamesOverride's doc comment. Every match recorded during
+    // this session uses the same names.
     if (s_HasPlayerNamesOverride)
     {
         for (int port = 0; port < 4; port++)
         {
             WriteFixedString(startEvent.playerNames[port], sizeof(startEvent.playerNames[port]), s_PlayerNamesOverride[port]);
         }
-        s_HasPlayerNamesOverride = false; // consumed - see SetPlayerNamesOverride's doc comment
     }
     else
     {
@@ -588,6 +629,16 @@ CORE_EXPORT void OnEmulationStop(void)
         FinalizeFile(0 /* aborted: emulation stopped mid-match */, matchInfo);
     }
     s_State = State::Idle;
+
+    // Both overrides apply for the whole session that just ended - every
+    // OpenNewFile() call in between reused them (see SetOutputPathOverride/
+    // SetPlayerNamesOverride's own doc comments) - so clear them now,
+    // otherwise a later, unrelated session (e.g. a plain offline ROM launch
+    // with no override call of its own) would silently inherit them.
+    s_HasOutputPathOverride = false;
+    s_OutputPathOverride.clear();
+    s_HasPlayerNamesOverride = false;
+    s_PlayerNamesOverride = {};
 }
 
 CORE_EXPORT void OnFrame(void)

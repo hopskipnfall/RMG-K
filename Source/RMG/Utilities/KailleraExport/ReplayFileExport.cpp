@@ -170,12 +170,12 @@ static void applyExportSpeed()
     }
     // No encoder backpressure to react to here (unlike MP4 export's
     // adaptive governor) - .rmgr recording only reads emulated memory once
-    // per frame, so a single high fixed speed is enough. 1000 is the
+    // per frame, so a single high fixed speed is enough. 2000 is the
     // core's own hard ceiling (see main_speedset() in mupen64plus-core's
-    // main.c) - anything above that is silently rejected and leaves the
-    // speed factor unchanged, which is why this used to sit at 2000 and
-    // quietly run at 1x the whole time.
-    int value = 1000;
+    // main.c, raised from its original 1000 specifically for this) -
+    // anything above that is silently rejected and leaves the speed
+    // factor unchanged.
+    int value = 2000;
     s_Emulator->coreDoCommand(M64CMD_CORE_STATE_SET, M64CORE_SPEED_FACTOR, &value);
     s_SpeedApplied = true;
     fprintf(stderr, "Using replay export speed target: %d%%\n", value);

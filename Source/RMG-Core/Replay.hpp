@@ -50,22 +50,28 @@ void OnEmulationStart(void);
 // from a previous session can never leak into an unrelated later launch.
 void SetEnabledOverride(bool enabled);
 
-// Per-launch override for the exact output file path, bypassing the
+// Per-session override for the output file's base path, bypassing the
 // default "replays/<timestamp>[-players].rmgr" naming (see BuildFileName()
-// in Replay.cpp) entirely - the given path is used verbatim, including its
-// directory, with no further modification. For headless/offline export
-// tooling that needs a predictable, caller-controlled destination (and its
-// own collision handling - this override does not itself check for an
-// existing file at that path) rather than the live-recording convention.
+// in Replay.cpp) entirely. For headless/offline export tooling that needs
+// a predictable, caller-controlled destination rather than the
+// live-recording convention.
 //
-// Consumed (cleared) the same way and for the same reason as
-// SetEnabledOverride(): the next OpenNewFile() call uses it exactly once,
-// so a launch path that never calls this always falls through to the
-// default naming, and a stale override can never leak into an unrelated
-// later launch.
+// Applies to every file OpenNewFile() opens for the rest of this session
+// (from the next OnEmulationStart() through its matching OnEmulationStop()),
+// not just the first - a single headless export of a multi-game .krec
+// produces one .rmgr per match, and each one needs a distinct name. Every
+// one of them is automatically collision-avoided against this exact base
+// path (see FindCollisionFreePath() in Replay.cpp: "<path>", "<path>-2",
+// "<path>-3", ... against whatever already exists on disk), so the caller
+// does not need to do its own collision handling - just pass the same
+// desired base path every time.
+//
+// Cleared at OnEmulationStop(), so a launch path that never calls this
+// always falls through to the default naming, and a stale override can
+// never leak into an unrelated later session.
 void SetOutputPathOverride(const std::string& path);
 
-// Per-launch override for the GameStart event's playerNames field,
+// Per-session override for the GameStart event's playerNames field,
 // indexed by port. For headless/offline export tooling that has no live
 // Kaillera/rollback session to read n02's recording_player_names global
 // from (that global is only ever populated by the in-app netplay/lobby
@@ -77,11 +83,12 @@ void SetOutputPathOverride(const std::string& path);
 // other escaping is needed since this is a fixed-size binary field, not a
 // delimited one.
 //
-// Consumed (cleared) the same way and for the same reason as
-// SetOutputPathOverride(): the next OpenNewFile() call uses it exactly
-// once, so a launch path that never calls this always falls through to
-// recording_player_names, and a stale override can never leak into an
-// unrelated later launch.
+// Applies to every match recorded for the rest of this session, the same
+// way and for the same reason as SetOutputPathOverride() - a multi-game
+// .krec's later matches are the same two players as its first. Cleared at
+// OnEmulationStop(): a launch path that never calls this always falls
+// through to recording_player_names, and a stale override can never leak
+// into an unrelated later session.
 void SetPlayerNamesOverride(const std::array<std::string, 4>& names);
 
 // Call from CoreStopEmulation, and also from any UI-thread path that ends
