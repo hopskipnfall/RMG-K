@@ -177,6 +177,12 @@ std::mutex s_Mutex;
 bool s_HasOverride = false;
 bool s_OverrideValue = false;
 
+// Per-launch output path override, set via Replay::SetOutputPathOverride().
+// Consumed (cleared) the next time OpenNewFile() runs - see that function
+// and SetOutputPathOverride's own doc comment in Replay.hpp.
+bool        s_HasOutputPathOverride = false;
+std::string s_OutputPathOverride;
+
 // This feature's memory offsets were only ever derived/verified against
 // Smash Remix 2.0.1 (see docs/RMGR_SPEC.md); recording against any other
 // ROM would pointer-chase addresses that mean nothing there. GoodName
@@ -321,15 +327,25 @@ bool OpenNewFile(const ReplayMemory::MatchInfo& matchInfo)
     s_FrameNumber = 0;
     s_StreamBytesWritten = 0;
 
-    // Bare relative path, resolved by CWD - deliberately mirrors krec's own
-    // "records" directory convention (Source/n02/n02_client.cpp) exactly,
-    // so .rmgr files land next to .krec files at the top level instead of
-    // being nested under the per-platform user-data directory.
-    std::filesystem::path directory("replays");
-    std::filesystem::create_directories(directory);
-
     time_t now = time(nullptr);
-    std::filesystem::path path = directory / BuildFileName(now);
+    std::filesystem::path path;
+    if (s_HasOutputPathOverride)
+    {
+        path = s_OutputPathOverride;
+        s_HasOutputPathOverride = false; // consumed - see SetOutputPathOverride's doc comment
+        std::filesystem::create_directories(path.parent_path());
+    }
+    else
+    {
+        // Bare relative path, resolved by CWD - deliberately mirrors krec's
+        // own "records" directory convention (Source/n02/n02_client.cpp)
+        // exactly, so .rmgr files land next to .krec files at the top level
+        // instead of being nested under the per-platform user-data directory.
+        std::filesystem::path directory("replays");
+        std::filesystem::create_directories(directory);
+        path = directory / BuildFileName(now);
+    }
+
     s_File.open(path, std::ios::binary | std::ios::trunc);
     if (!s_File.is_open())
     {
@@ -528,6 +544,13 @@ CORE_EXPORT void SetEnabledOverride(bool enabled)
     std::lock_guard<std::mutex> lock(s_Mutex);
     s_HasOverride = true;
     s_OverrideValue = enabled;
+}
+
+CORE_EXPORT void SetOutputPathOverride(const std::string& path)
+{
+    std::lock_guard<std::mutex> lock(s_Mutex);
+    s_HasOutputPathOverride = true;
+    s_OutputPathOverride = path;
 }
 
 CORE_EXPORT void OnEmulationStop(void)

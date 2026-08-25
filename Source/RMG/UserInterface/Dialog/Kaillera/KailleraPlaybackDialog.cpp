@@ -581,6 +581,19 @@ void KailleraPlaybackDialog::setupUI()
         "While replaying this recording, also write a .rmgr replay file "
         "for it, separate from the .krec/MP4 export.\nSmash Remix 2.0.1 only.");
     m_replayRecordCheck->setVisible(false);
+
+    // Headless/fast .rmgr-only export - same idea as Export MP4 (a second
+    // launch of this exe with hidden CLI flags, see ReplayFileExport.cpp),
+    // but no video/audio, so no settings prompt: just picks a destination
+    // next to the recording and goes.
+    m_btnExportReplay = new QPushButton("Export Replay", this);
+    m_btnExportReplay->setToolTip(
+        "Headlessly replay this recording at high speed to produce a .rmgr "
+        "file, without opening a visible emulator window.\nSmash Remix 2.0.1 only.");
+    m_btnExportReplay->setVisible(false);
+#ifndef _WIN32
+    m_btnExportReplay->hide();
+#endif
 #endif
 
     m_btnPBRefresh->setText(QString());
@@ -598,6 +611,9 @@ void KailleraPlaybackDialog::setupUI()
 #ifdef _WIN32
     connect(m_btnExport, &QPushButton::clicked, this, &KailleraPlaybackDialog::onPlaybackExport);
 #endif
+#if defined(RMGK_GAME_STATS) && defined(_WIN32)
+    connect(m_btnExportReplay, &QPushButton::clicked, this, &KailleraPlaybackDialog::onPlaybackExportReplay);
+#endif
     connect(m_btnOpenFolder, &QPushButton::clicked, this, &KailleraPlaybackDialog::onPlaybackOpenFolder);
 
     if (modern)
@@ -610,6 +626,9 @@ void KailleraPlaybackDialog::setupUI()
         configurePlaybackButton(m_btnPBRefresh, "KailleraHeaderIconButton");
 #ifdef _WIN32
         configurePlaybackButton(m_btnExport, "KailleraPrimaryButton");
+#endif
+#if defined(RMGK_GAME_STATS) && defined(_WIN32)
+        configurePlaybackButton(m_btnExportReplay, "KailleraSecondaryButton");
 #endif
         configurePlaybackButton(m_btnOpenFolder, "KailleraSecondaryButton");
     }
@@ -638,6 +657,9 @@ void KailleraPlaybackDialog::setupUI()
     bottomLayout->addWidget(m_btnPBDelete);
 #ifdef _WIN32
     bottomLayout->addWidget(m_btnExport);
+#endif
+#if defined(RMGK_GAME_STATS) && defined(_WIN32)
+    bottomLayout->addWidget(m_btnExportReplay);
 #endif
 #ifdef RMGK_GAME_STATS
     bottomLayout->addWidget(m_replayRecordCheck);
@@ -744,6 +766,10 @@ void KailleraPlaybackDialog::updateReplayRecordCheckVisibility()
         {
             show = (QString::fromStdString(krecData.header.gameName) == "SmashRemix2.0.1");
         }
+    }
+    if (m_btnExportReplay != nullptr)
+    {
+        m_btnExportReplay->setVisible(show);
     }
 #else
     // No cross-platform way to peek the recording's game name here; show
@@ -1382,10 +1408,19 @@ QString KailleraPlaybackDialog::downloadManagedFfmpeg()
     return ffmpegPath;
 }
 
+QString KailleraPlaybackDialog::exportDialogTitle() const
+{
+#ifdef RMGK_GAME_STATS
+    return m_exportIsReplayFile ? "Export Replay" : "Export MP4";
+#else
+    return "Export MP4";
+#endif
+}
+
 void KailleraPlaybackDialog::showExportFinishedDialog(const QString& outputPath)
 {
     QDialog dialog(this);
-    dialog.setWindowTitle("Export MP4");
+    dialog.setWindowTitle(exportDialogTitle());
     dialog.setModal(true);
     dialog.setMinimumWidth(520);
     if (useModernPlaybackUi())
@@ -1438,6 +1473,12 @@ void KailleraPlaybackDialog::resetExportUi()
     {
         m_btnExport->setEnabled(true);
     }
+#ifdef RMGK_GAME_STATS
+    if (m_btnExportReplay != nullptr)
+    {
+        m_btnExportReplay->setEnabled(true);
+    }
+#endif
 
     m_exportPendingOutput.clear();
     m_exportStatusLine.clear();
@@ -1477,6 +1518,9 @@ void KailleraPlaybackDialog::startExportProcess(const QString& recordingPath,
     }
 
     m_exportCanceled = false;
+#ifdef RMGK_GAME_STATS
+    m_exportIsReplayFile = false;
+#endif
     m_exportLog.clear();
     m_exportPendingOutput.clear();
     m_exportStatusLine = "Starting export...";
@@ -1576,6 +1620,108 @@ void KailleraPlaybackDialog::startExportProcess(const QString& recordingPath,
     updateExportProgressDialog();
     m_exportProgressDialog->show();
 }
+
+#ifdef RMGK_GAME_STATS
+void KailleraPlaybackDialog::startReplayFileExportProcess(const QString& recordingPath,
+                                                           const QString& romPath,
+                                                           const QString& outputPath,
+                                                           int totalFrames)
+{
+    if (m_exportProcess != nullptr)
+    {
+        return;
+    }
+
+    m_exportCanceled = false;
+    m_exportIsReplayFile = true;
+    m_exportLog.clear();
+    m_exportPendingOutput.clear();
+    m_exportStatusLine = "Starting export...";
+    m_exportVideoEncoder.clear();
+    m_exportTargetSpeed.clear();
+    m_exportCapturedFrames = 0;
+    m_exportTotalFrames = std::max(0, totalFrames);
+    m_exportCaptureCompleteElapsedMs = -1;
+    m_exportOutputPath = outputPath;
+    m_exportElapsedTimer.start();
+
+    m_exportProcess = new QProcess(this);
+    m_exportProcess->setProcessChannelMode(QProcess::MergedChannels);
+    m_exportProcess->setProgram(QCoreApplication::applicationFilePath());
+    m_exportProcess->setArguments({
+        "--export-krec", recordingPath,
+        "--export-rom", romPath,
+        "--export-rmgr-output", outputPath,
+    });
+
+    connect(m_exportProcess, &QProcess::readyRead, this, &KailleraPlaybackDialog::onExportProcessOutput);
+    connect(m_exportProcess,
+            qOverload<int, QProcess::ExitStatus>(&QProcess::finished),
+            this,
+            &KailleraPlaybackDialog::onExportProcessFinished);
+
+    m_exportProgressDialog = new QProgressDialog("Exporting recording to .rmgr...", "Cancel", 0, 0, this);
+    m_exportProgressDialog->setWindowTitle("Export Replay");
+    m_exportProgressDialog->setWindowModality(Qt::WindowModal);
+    m_exportProgressDialog->setMinimumDuration(0);
+    m_exportProgressDialog->setAutoClose(false);
+    m_exportProgressDialog->setAutoReset(false);
+    m_exportProgressDialog->setMinimumWidth(520);
+    m_exportProgressDialog->setMaximumWidth(700);
+    if (useModernPlaybackUi())
+    {
+        m_exportProgressDialog->setObjectName("KailleraPlaybackExportDialog");
+
+        auto* progressLabel = new QLabel(m_exportProgressDialog);
+        progressLabel->setObjectName("KailleraPlaybackProgressLabel");
+        progressLabel->setWordWrap(true);
+        m_exportProgressDialog->setLabel(progressLabel);
+
+        auto* progressBar = new QProgressBar(m_exportProgressDialog);
+        progressBar->setObjectName("KailleraPlaybackExportBar");
+        progressBar->setTextVisible(true);
+        m_exportProgressDialog->setBar(progressBar);
+
+        auto* cancelButton = new QPushButton("Cancel", m_exportProgressDialog);
+        configurePlaybackButton(cancelButton, "KailleraSecondaryButton");
+        m_exportProgressDialog->setCancelButton(cancelButton);
+        m_exportProgressDialog->setStyleSheet(buildPlaybackStyleSheet());
+    }
+    if (m_exportTotalFrames > 0)
+    {
+        m_exportProgressDialog->setRange(0, m_exportTotalFrames);
+        m_exportProgressDialog->setValue(0);
+    }
+    else
+    {
+        m_exportProgressDialog->setRange(0, 0);
+    }
+    connect(m_exportProgressDialog, &QProgressDialog::canceled, this, [this]() {
+        m_exportCanceled = true;
+        if (m_exportProcess != nullptr)
+        {
+            m_exportProcess->kill();
+        }
+    });
+
+    if (m_btnExportReplay != nullptr)
+    {
+        m_btnExportReplay->setEnabled(false);
+    }
+
+    m_exportProcess->start();
+    if (!m_exportProcess->waitForStarted())
+    {
+        const QString message = m_exportProcess->errorString();
+        resetExportUi();
+        QMessageBox::warning(this, "Export Replay", "Failed to start export process.\n\n" + message);
+        return;
+    }
+
+    updateExportProgressDialog();
+    m_exportProgressDialog->show();
+}
+#endif
 
 void KailleraPlaybackDialog::onPlaybackPlay()
 {
@@ -1787,6 +1933,66 @@ void KailleraPlaybackDialog::onPlaybackExport()
                        totalFrames);
 }
 
+#ifdef RMGK_GAME_STATS
+void KailleraPlaybackDialog::onPlaybackExportReplay()
+{
+    if (m_exportProcess != nullptr)
+    {
+        return;
+    }
+
+    if (CoreIsEmulationRunning() || n02::isPlaybackActive())
+    {
+        QMessageBox::information(this,
+                                 "Export Replay",
+                                 "Stop playback before exporting a recording.");
+        return;
+    }
+
+    QString recordingPath;
+    int totalFrames = 0;
+    const QString gameName = getSelectedRecordingGameName(&recordingPath, &totalFrames);
+    if (recordingPath.isEmpty())
+    {
+        QMessageBox::information(this, "Export Replay", "Select a recording to export first.");
+        return;
+    }
+
+    if (gameName.isEmpty())
+    {
+        QMessageBox::warning(this, "Export Replay", "Failed to read the selected recording.");
+        return;
+    }
+
+    auto* mainWindow = qobject_cast<UserInterface::MainWindow*>(parentWidget());
+    if (mainWindow == nullptr)
+    {
+        QMessageBox::warning(this, "Export Replay", "Unable to resolve the current ROM directory.");
+        return;
+    }
+
+    const QString romPath = mainWindow->ResolveKailleraRomByName(gameName);
+    if (romPath.isEmpty())
+    {
+        QMessageBox::warning(this,
+                             "Export Replay",
+                             "Could not find a ROM for:\n" + gameName +
+                             "\n\nMake sure the ROM is in the selected ROM directory and the ROM list is refreshed.");
+        return;
+    }
+
+    // No settings to prompt for (unlike MP4 export) - just derive a
+    // destination next to the recording and go. The export process does
+    // its own collision-avoidance (see FindCollisionFreePath() in
+    // ReplayFileExport.cpp) if this exact name is already taken.
+    const QFileInfo recordingFileInfo(recordingPath);
+    const QString outputPath = QDir::toNativeSeparators(
+        recordingFileInfo.absoluteDir().filePath(recordingFileInfo.completeBaseName() + ".rmgr"));
+
+    startReplayFileExportProcess(recordingPath, romPath, outputPath, totalFrames);
+}
+#endif
+
 void KailleraPlaybackDialog::onExportProcessOutput()
 {
     if (m_exportProcess == nullptr)
@@ -1810,9 +2016,11 @@ void KailleraPlaybackDialog::onExportProcessFinished(int exitCode, QProcess::Exi
 
     resetExportUi();
 
+    const QString dialogTitle = exportDialogTitle();
+
     if (canceled)
     {
-        QMessageBox::information(this, "Export MP4", "Export canceled.");
+        QMessageBox::information(this, dialogTitle, "Export canceled.");
         return;
     }
 
@@ -1828,7 +2036,7 @@ void KailleraPlaybackDialog::onExportProcessFinished(int exitCode, QProcess::Exi
         message += "\n\n" + logSummary;
     }
 
-    QMessageBox::warning(this, "Export MP4", message);
+    QMessageBox::warning(this, dialogTitle, message);
 }
 
 void KailleraPlaybackDialog::processExportOutputText(const QString& text, bool finalizePartialLine)
@@ -1903,6 +2111,19 @@ void KailleraPlaybackDialog::processExportOutputLine(const QString& rawLine)
 
     if (line.startsWith("Replay export finished: "))
     {
+#ifdef RMGK_GAME_STATS
+        if (m_exportIsReplayFile)
+        {
+            // Unlike MP4 export (whose destination is fixed by the save
+            // dialog beforehand), the export process may have picked a
+            // different path than requested here to avoid overwriting an
+            // existing file (see FindCollisionFreePath() in
+            // ReplayFileExport.cpp) - read back what it actually used.
+            m_exportOutputPath = line.mid(QString("Replay export finished: ").size());
+            m_exportStatusLine = "Finalizing replay...";
+            return;
+        }
+#endif
         m_exportStatusLine = "Finalizing MP4...";
         return;
     }
@@ -1972,7 +2193,11 @@ double KailleraPlaybackDialog::exportProgressFraction() const
 QString KailleraPlaybackDialog::buildExportProgressSummary() const
 {
     QStringList lines;
+#ifdef RMGK_GAME_STATS
+    lines << (m_exportIsReplayFile ? "Exporting recording to .rmgr..." : "Exporting recording to MP4...") << "";
+#else
     lines << "Exporting recording to MP4..." << "";
+#endif
 
     const double elapsedSeconds = m_exportElapsedTimer.isValid()
         ? static_cast<double>(m_exportElapsedTimer.elapsed()) / 1000.0
@@ -2050,7 +2275,11 @@ QString KailleraPlaybackDialog::buildExportProgressSummary() const
     QString statusLine = m_exportStatusLine;
     if (isExportFinalizing() && (statusLine.isEmpty() || statusLine == "Capturing frames..."))
     {
+#ifdef RMGK_GAME_STATS
+        statusLine = m_exportIsReplayFile ? "Finalizing replay..." : "Finalizing MP4...";
+#else
         statusLine = "Finalizing MP4...";
+#endif
     }
 
     if (!statusLine.isEmpty())

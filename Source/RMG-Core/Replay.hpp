@@ -10,6 +10,8 @@
 #ifndef REPLAY_HPP
 #define REPLAY_HPP
 
+#include <string>
+
 // New, independent per-match ".rmgr" replay recorder. Entirely separate
 // from Source/n02's .krec format - does not read, write, or otherwise
 // touch anything under Source/n02/.
@@ -46,6 +48,21 @@ void OnEmulationStart(void);
 // falls through to the persisted Settings default, and a stale override
 // from a previous session can never leak into an unrelated later launch.
 void SetEnabledOverride(bool enabled);
+
+// Per-launch override for the exact output file path, bypassing the
+// default "replays/<timestamp>[-players].rmgr" naming (see BuildFileName()
+// in Replay.cpp) entirely - the given path is used verbatim, including its
+// directory, with no further modification. For headless/offline export
+// tooling that needs a predictable, caller-controlled destination (and its
+// own collision handling - this override does not itself check for an
+// existing file at that path) rather than the live-recording convention.
+//
+// Consumed (cleared) the same way and for the same reason as
+// SetEnabledOverride(): the next OpenNewFile() call uses it exactly once,
+// so a launch path that never calls this always falls through to the
+// default naming, and a stale override can never leak into an unrelated
+// later launch.
+void SetOutputPathOverride(const std::string& path);
 
 // Call from CoreStopEmulation, and also from any UI-thread path that ends
 // emulation without necessarily going through CoreStopEmulation (see
