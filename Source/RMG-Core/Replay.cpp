@@ -62,10 +62,13 @@ enum class EventCode : uint8_t
     PreFrame      = 0x03,
     PostFrame     = 0x04,
     GameEnd       = 0x05,
-    // v2 (docs/RMGR_SPEC.md section 5, new event type - not a header version
-    // bump): one per live entry on the shared item/hazard/projectile list,
-    // per frame. See ItemUpdateEvent below.
-    ItemUpdate    = 0x06,
+    // v2/v3 (docs/RMGR_SPEC.md section 5, new event types - not a header
+    // version bump): one per live Item/Weapon GObj, per frame. See
+    // ItemUpdateEvent below.
+    ItemUpdate        = 0x06,
+    // v3: emitted only on frames where at least one tracked stage hazard is
+    // active. See StageHazardUpdateEvent below.
+    StageHazardUpdate = 0x07,
 };
 
 struct GameStartPortInfo
@@ -153,24 +156,39 @@ struct GameEndEvent
 };
 static_assert(sizeof(GameEndEvent) == 5, "GameEndEvent must be 5 bytes");
 
-// v2 new event type (docs/RMGR_SPEC.md section 5): one per live entry on
-// the shared item/hazard/projectile object list (ReplayMemory::ItemObject),
-// per frame - zero or more of these follow each frame's Pre/Post-Frame
-// pairs. Covers *everything* on that list (spawned items and stage hazards
-// too, not just character-special-move projectiles) since they can't
-// currently be told apart by typeId alone - see
+// v2 new event type (docs/RMGR_SPEC.md section 5): one per live Item or
+// Weapon GObj (ReplayMemory::ItemObject), per frame - zero or more of these
+// follow each frame's Pre/Post-Frame pairs. "Weapon" is a free-flying
+// character special-move projectile (boomerang, fireball, ...); "Item"
+// covers thrown/spawned items and hazard objects, including some
+// fighter-held things like Link's pulled bomb. See
 // ReplayMemory::ItemObject's own doc comment and
-// smashremix docs/ram-map.md section 14.3.
+// smashremix docs/ram-map.md section 10.4.
 struct ItemUpdateEvent
 {
     int32_t  frame;         // same numbering as Pre/PostFrame
     uint32_t objectAddress; // the object's own RDRAM address - not a semantic spawn ID, see ReplayMemory::ItemObject
-    uint32_t typeId;        // raw value read from the object; 0x00-0x1F vanilla, 0x20+ Remix-added (see docs/RMGR_SPEC.md section 7.6)
+    uint8_t  linkId;        // 4 = Item, 5 = Weapon - which enum `kind` below means (docs/RMGR_SPEC.md section 7.6)
+    int32_t  kind;          // ITKind (linkId == 4) or WPKind (linkId == 5)
     float    positionX;
     float    positionY;
-    float    positionZ; // inferred by pattern, not independently confirmed - see ram-map.md section 14.2
+    float    positionZ; // confirmed exactly via the decomp - see docs/RMGR_SPEC.md section 4.6
 };
-static_assert(sizeof(ItemUpdateEvent) == 24, "ItemUpdateEvent must be 24 bytes");
+static_assert(sizeof(ItemUpdateEvent) == 25, "ItemUpdateEvent must be 25 bytes");
+
+// v3: currently just Whispy Woods' wind on Dream Land - only emitted on a
+// frame where at least one bit is set (never a placeholder event with
+// hazardFlags == 0), same sparse-event convention as ItemUpdate. More
+// hazards can set more bits later via the field-append mechanism (section
+// 5) without needing a new event type.
+struct StageHazardUpdateEvent
+{
+    int32_t frame;
+    uint8_t hazardFlags; // bit 0 = Whispy Woods currently blowing (Dream Land only)
+};
+static_assert(sizeof(StageHazardUpdateEvent) == 5, "StageHazardUpdateEvent must be 5 bytes");
+
+constexpr uint8_t kHazardFlagWhispyBlowing = 0x01;
 
 #pragma pack(pop)
 
@@ -251,7 +269,12 @@ constexpr const char* kSupportedGoodName = "SmashRemix2.0.1";
 // v1 -> v2: added the ItemUpdate event (docs/RMGR_SPEC.md section 5/4.6) -
 // a wholly new capability rather than a field append, but still exactly the
 // kind of "recorded output changed" this counter exists to track.
-constexpr uint32_t kRecorderSchemaVersion = 2;
+// v2 -> v3: ItemUpdate's type field was wrong in v2 - +0x0C on the raw GObj
+// is a packed byte (link_id), not a 32-bit type ID; the real type needs a
+// further pointer chase through ITStruct/WPStruct. v2 files' ItemUpdate
+// data should be treated as garbage, not just "coarser." Also added
+// StageHazardUpdate (Whispy Woods' wind on Dream Land).
+constexpr uint32_t kRecorderSchemaVersion = 3;
 
 bool IsSupportedGame(void)
 {
@@ -296,11 +319,12 @@ void WriteEventPayloadsEvent(void)
         {EventCode::PreFrame,   static_cast<uint16_t>(sizeof(PreFrameEvent))},
         {EventCode::PostFrame,  static_cast<uint16_t>(sizeof(PostFrameEvent))},
         {EventCode::GameEnd,    static_cast<uint16_t>(sizeof(GameEndEvent))},
-        // v2 addition (docs/RMGR_SPEC.md section 5) - an old parser that
+        // v2/v3 additions (docs/RMGR_SPEC.md section 5) - an old parser that
         // reads `count` dynamically and skips codes it doesn't recognize
         // (exactly what this declared-size mechanism exists for) still
-        // parses a file with this 5th entry correctly.
-        {EventCode::ItemUpdate, static_cast<uint16_t>(sizeof(ItemUpdateEvent))},
+        // parses a file with these extra entries correctly.
+        {EventCode::ItemUpdate,        static_cast<uint16_t>(sizeof(ItemUpdateEvent))},
+        {EventCode::StageHazardUpdate, static_cast<uint16_t>(sizeof(StageHazardUpdateEvent))},
     };
 
     uint8_t codeByte = static_cast<uint8_t>(EventCode::EventPayloads);
@@ -613,21 +637,38 @@ void RecordFrame(const ReplayMemory::MatchInfo& matchInfo)
         WriteEvent(EventCode::PostFrame, post);
     }
 
-    // One ItemUpdate per currently-live entry on the shared item/hazard/
-    // projectile list (see docs/RMGR_SPEC.md section 4.6) - after every
-    // seated port's Pre/Post-Frame pair, same as the per-port events above.
-    // Zero events written when the list is empty this frame - never a
-    // zeroed/placeholder event, same convention as an unseated port.
+    // One ItemUpdate per currently-live Item/Weapon GObj (see
+    // docs/RMGR_SPEC.md section 4.6) - after every seated port's Pre/Post-
+    // Frame pair, same as the per-port events above. Zero events written
+    // when the list is empty this frame - never a zeroed/placeholder event,
+    // same convention as an unseated port.
     for (const ReplayMemory::ItemObject& item : ReplayMemory::ReadItemObjects())
     {
         ItemUpdateEvent itemEvent{};
         itemEvent.frame         = s_FrameNumber;
         itemEvent.objectAddress = item.objectAddress;
-        itemEvent.typeId        = item.typeId;
+        itemEvent.linkId        = item.linkId;
+        itemEvent.kind          = item.kind;
         itemEvent.positionX     = item.positionX;
         itemEvent.positionY     = item.positionY;
         itemEvent.positionZ     = item.positionZ;
         WriteEvent(EventCode::ItemUpdate, itemEvent);
+    }
+
+    // StageHazardUpdate - only written when at least one tracked hazard is
+    // active, same sparse convention as ItemUpdate above.
+    const ReplayMemory::StageHazards hazards = ReplayMemory::ReadStageHazards(matchInfo.stageId);
+    uint8_t hazardFlags = 0;
+    if (hazards.whispyBlowing)
+    {
+        hazardFlags |= kHazardFlagWhispyBlowing;
+    }
+    if (hazardFlags != 0)
+    {
+        StageHazardUpdateEvent hazardEvent{};
+        hazardEvent.frame       = s_FrameNumber;
+        hazardEvent.hazardFlags = hazardFlags;
+        WriteEvent(EventCode::StageHazardUpdate, hazardEvent);
     }
 
     s_FrameNumber++;

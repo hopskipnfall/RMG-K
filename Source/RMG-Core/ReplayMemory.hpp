@@ -63,24 +63,37 @@ struct PortPlayerState
     uint8_t  cpuLevel;  // CPU difficulty; meaningless for human ports
 };
 
-// One live entry on the shared item/hazard/projectile object list (see
-// ReadItemObjects() below). Covers *everything* on that list, not just
-// character-special-move projectiles - spawned items and stage hazard
-// objects (thrown bananas, Poké Balls, Waddle Dees, ...) share the same
-// list and currently can't be told apart from projectiles by ID alone (see
-// smashremix docs/ram-map.md section 14.3 - the ID->name lookup table for
-// this game doesn't exist yet). `objectAddress` is that object's own RDRAM
-// address, the closest thing to a stable per-object identity available -
-// it's stable for as long as the object is alive, but isn't a semantic
-// "spawn ID" the engine itself assigns, so it's exposed as-is rather than
-// dressed up as one.
+// One live entry on the shared item/weapon object list (see
+// ReadItemObjects() below) - a GObj whose link_id is Item (4) or Weapon (5).
+// "Weapon" is the engine's own term for a free-flying character
+// special-move projectile (boomerang, fireball, charge shot, ...); "Item"
+// covers thrown/spawned items and hazard objects (bananas, Poké Balls,
+// Waddle Dees, and some fighter-held things like Link's pulled bomb). See
+// smashremix docs/ram-map.md section 10.4. `objectAddress` is that GObj's
+// own RDRAM address, the closest thing to a stable per-object identity
+// available - stable for as long as the object is alive, but not a
+// semantic "spawn ID" the engine itself assigns.
 struct ItemObject
 {
     uint32_t objectAddress;
-    uint32_t typeId;
+    // GObjLinkID: 4 = Item (kind is an ITKind value), 5 = Weapon (kind is a
+    // WPKind value) - which enum `kind` means depends on this.
+    uint8_t  linkId;
+    // ITKind (linkId == 4) or WPKind (linkId == 5) - see docs/RMGR_SPEC.md
+    // section 7.6 for both enums.
+    int32_t  kind;
     float    positionX;
     float    positionY;
-    float    positionZ; // inferred by pattern, not independently confirmed - see ram-map.md section 14.2
+    float    positionZ; // confirmed exactly via the decomp - see ram-map.md section 10.4.1
+};
+
+// Live stage-hazard state. Currently just Whispy Woods' wind on Dream Land
+// - see ReadStageHazards() below. More hazards (Zebes' acid, Duel Zone's
+// platforms, ...) can be added here later the same way, per smashremix
+// docs/ram-map.md section 10.5.
+struct StageHazards
+{
+    bool whispyBlowing; // Dream Land only; always false on any other stage
 };
 
 struct MatchInfo
@@ -116,14 +129,25 @@ PortMatchInfo ReadPortMatchInfo(uint32_t matchInfoPtr, int port);
 // currently seated in a live match.
 PortPlayerState ReadPortPlayerState(uint32_t matchInfoPtr, int port);
 
-// Walks the shared item/hazard/projectile linked list (head pointer at a
-// fixed global address, independent of MatchInfo) and returns every live
-// entry found - see smashremix docs/ram-map.md sections 10.4 and 14. Empty
-// if the list is empty or the head pointer is invalid. The walk is capped
-// at a fixed number of iterations (ITEM_LIST_MAX_OBJECTS in the .cpp) so a
-// corrupt or unexpectedly-cyclic list can never hang recording - it doesn't
+// Walks the shared GObj linked list (head pointer at a fixed global
+// address, independent of MatchInfo) and returns every live Item/Weapon
+// entry found - see smashremix docs/ram-map.md section 10.4. Fighters and
+// any other GObj kind on this list (if they ever appear - the ram-map says
+// fighters specifically never do) are silently skipped, since ITStruct/
+// WPStruct is only meaningful to chase for linkId 4/5. Empty if the list is
+// empty or the head pointer is invalid. The walk is capped at a fixed
+// number of iterations (ITEM_LIST_MAX_OBJECTS in the .cpp) so a corrupt or
+// unexpectedly-cyclic list can never hang recording - it doesn't
 // specifically detect/dedupe a cycle, just guarantees termination.
 std::vector<ItemObject> ReadItemObjects(void);
+
+// Reads live stage-hazard state for the given stage. `stageId` comes from
+// MatchInfo::stageId - the live per-frame hazard fields live in a
+// stage-common union whose byte layout is different per stage (smashremix
+// docs/ram-map.md section 10.3's caveat), so the caller's stageId must be
+// checked before any hazard-specific offset is trusted; this function does
+// that internally and returns all-false for a stage it doesn't know yet.
+StageHazards ReadStageHazards(uint8_t stageId);
 } // namespace ReplayMemory
 
 #endif // REPLAY_MEMORY_HPP

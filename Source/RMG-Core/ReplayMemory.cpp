@@ -60,22 +60,39 @@ constexpr uint32_t PS_TEAM                 = 0x0C;
 constexpr uint32_t PS_HANDICAP             = 0x12;
 constexpr uint32_t PS_CPU_LEVEL            = 0x13;
 
-// Shared item/hazard/projectile object list - independent of MatchInfo, a
-// fixed global head pointer. See smashremix docs/ram-map.md sections 10.4
-// and 14.
+// Shared GObj (universal engine object) linked list - independent of
+// MatchInfo, a fixed global head pointer. See smashremix docs/ram-map.md
+// section 10.4 - confirmed against the real SSB64 decompilation
+// (VetriTheRetri/ssb-decomp-re) after an earlier version of that doc
+// misdocumented GOBJ_LINK_ID as a 32-bit "item ID" (it's actually 4 packed
+// single bytes; only the first, link_id, matters here).
 constexpr uint32_t ADDR_ITEM_LIST_HEAD = 0x80046700;
-constexpr uint32_t ITEM_NEXT           = 0x04;
-constexpr uint32_t ITEM_TYPE_ID        = 0x0C;
-constexpr uint32_t ITEM_TOPJOINT_PTR   = 0x74;
-constexpr uint32_t TOPJOINT_POSITION_X = 0x1C;
-constexpr uint32_t TOPJOINT_POSITION_Y = 0x20;
-constexpr uint32_t TOPJOINT_POSITION_Z = 0x24; // inferred by pattern, not independently confirmed
+constexpr uint32_t GOBJ_NEXT           = 0x04;
+constexpr uint32_t GOBJ_LINK_ID        = 0x0C; // u8: 3 = Fighter, 4 = Item, 5 = Weapon
+constexpr uint32_t GOBJ_OBJ_PTR        = 0x74; // -> DObj (position/scale)
+constexpr uint32_t GOBJ_USER_DATA_PTR  = 0x84; // -> ITStruct* (Item) or WPStruct* (Weapon)
+constexpr uint8_t  GOBJ_LINK_ID_ITEM   = 4;
+constexpr uint8_t  GOBJ_LINK_ID_WEAPON = 5;
+// Both ITStruct and WPStruct happen to place `kind` at the same sub-offset
+// (a coincidence of parallel struct design per the ram-map, not a rule).
+constexpr uint32_t IT_OR_WP_STRUCT_KIND = 0x0C; // s32: ITKind or WPKind, per GOBJ_LINK_ID
+constexpr uint32_t DOBJ_POSITION_X      = 0x1C;
+constexpr uint32_t DOBJ_POSITION_Y      = 0x20;
+constexpr uint32_t DOBJ_POSITION_Z      = 0x24;
 
 // Slippi caps its own per-frame item event count at 15 (see
 // rmgk-replay-file-agent-prompt.md section 4.4); reused here as a sane
 // per-frame budget, mainly to bound a corrupt/cyclic list to a fixed number
 // of reads rather than looping until something crashes.
 constexpr int ITEM_LIST_MAX_OBJECTS = 32;
+
+// Stage hazards. See smashremix docs/ram-map.md section 10.3 - Dream
+// Land's live hazard state (Whispy's wind) lives in a fixed global that is
+// a *union* shared by every "common ground" stage; these exact offsets are
+// only valid when the current stage is actually Dream Land.
+constexpr uint8_t  STAGE_ID_DREAM_LAND       = 0x06;
+constexpr uint32_t ADDR_PUPUPU_WHISPY_STATUS = 0x80131416; // gGRCommonStruct (0x801313F0) + 0x26, Dream Land's union view
+constexpr uint8_t  WHISPY_STATUS_BLOW        = 4;          // grPupupuWhispyWindStatus::Blow
 
 // KSEG0, 8MB expansion-pak RDRAM window. A value outside this range means a
 // pointer chase hit garbage - treat as "not currently available", not a crash.
@@ -202,22 +219,48 @@ std::vector<ItemObject> ReadItemObjects(void)
     uint32_t current = m64p::Core.DebugMemRead32(ADDR_ITEM_LIST_HEAD);
     for (int i = 0; i < ITEM_LIST_MAX_OBJECTS && IsValidRdramPointer(current); i++)
     {
-        ItemObject object{};
-        object.objectAddress = current;
-        object.typeId        = m64p::Core.DebugMemRead32(current + ITEM_TYPE_ID);
+        const uint32_t next = m64p::Core.DebugMemRead32(current + GOBJ_NEXT);
 
-        uint32_t topJoint = m64p::Core.DebugMemRead32(current + ITEM_TOPJOINT_PTR);
-        if (IsValidRdramPointer(topJoint))
+        const uint8_t linkId = m64p::Core.DebugMemRead8(current + GOBJ_LINK_ID);
+        if (linkId == GOBJ_LINK_ID_ITEM || linkId == GOBJ_LINK_ID_WEAPON)
         {
-            object.positionX = ReadFloat(topJoint + TOPJOINT_POSITION_X);
-            object.positionY = ReadFloat(topJoint + TOPJOINT_POSITION_Y);
-            object.positionZ = ReadFloat(topJoint + TOPJOINT_POSITION_Z);
-        }
-        objects.push_back(object);
+            ItemObject object{};
+            object.objectAddress = current;
+            object.linkId        = linkId;
 
-        current = m64p::Core.DebugMemRead32(current + ITEM_NEXT);
+            const uint32_t userData = m64p::Core.DebugMemRead32(current + GOBJ_USER_DATA_PTR);
+            if (IsValidRdramPointer(userData))
+            {
+                object.kind = static_cast<int32_t>(m64p::Core.DebugMemRead32(userData + IT_OR_WP_STRUCT_KIND));
+            }
+
+            const uint32_t dObj = m64p::Core.DebugMemRead32(current + GOBJ_OBJ_PTR);
+            if (IsValidRdramPointer(dObj))
+            {
+                object.positionX = ReadFloat(dObj + DOBJ_POSITION_X);
+                object.positionY = ReadFloat(dObj + DOBJ_POSITION_Y);
+                object.positionZ = ReadFloat(dObj + DOBJ_POSITION_Z);
+            }
+            objects.push_back(object);
+        }
+        // else: Fighter (3) or some other GObj kind - not an item/weapon,
+        // and user_data isn't guaranteed to be an ITStruct*/WPStruct* for
+        // those, so there's nothing meaningful to chase further.
+
+        current = next;
     }
 
     return objects;
+}
+
+StageHazards ReadStageHazards(uint8_t stageId)
+{
+    StageHazards hazards{};
+    if (stageId == STAGE_ID_DREAM_LAND)
+    {
+        hazards.whispyBlowing =
+            m64p::Core.DebugMemRead8(ADDR_PUPUPU_WHISPY_STATUS) == WHISPY_STATUS_BLOW;
+    }
+    return hazards;
 }
 } // namespace ReplayMemory

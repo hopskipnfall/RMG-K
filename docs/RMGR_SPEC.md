@@ -125,9 +125,9 @@ A sequence of events, back to back, no padding between them:
 The very first event in every file is always `EventPayloads` (`0x01`, §4.1).
 Every subsequent event is one of `GameStart` (`0x02`, once, immediately
 after `EventPayloads`), `PreFrameUpdate` (`0x03`), `PostFrameUpdate`
-(`0x04`), `ItemUpdate` (`0x06`, schema v2+, see §4.6), or `GameEnd` (`0x05`,
-once, at the very end — present only if the recording session finished
-cleanly).
+(`0x04`), `ItemUpdate` (`0x06`, schema v2+, see §4.6), `StageHazardUpdate`
+(`0x07`, schema v3+, see §4.7), or `GameEnd` (`0x05`, once, at the very end
+— present only if the recording session finished cleanly).
 
 For each real emulated frame that the match is actively ongoing
 (`game_status == 1`, see §7.5) and has at least one seated port, the
@@ -140,10 +140,12 @@ event — so a reader must not assume every frame has all four ports present,
 and must not assume a fixed number of events per frame.
 
 That same frame N is then followed by zero or more `ItemUpdate` events, one
-per object currently live on the shared item/hazard/projectile list (§4.6)
-— zero if that list is empty this frame, again never a zeroed/dummy event.
-A reader correlates `ItemUpdate` events to a frame via their own `frame`
-field, the same way it correlates a `PreFrameUpdate`/`PostFrameUpdate` pair.
+per Item/Weapon object currently live on the shared `GObj` list (§4.6) —
+zero if none are live this frame, again never a zeroed/dummy event. After
+those, zero or one `StageHazardUpdate` event (§4.7) — written only if at
+least one tracked hazard is currently active. A reader correlates both
+event types to a frame via their own `frame` field, the same way it
+correlates a `PreFrameUpdate`/`PostFrameUpdate` pair.
 
 ### 3.3 `goodName` and `recorderSchemaVersion` — two independent axes
 
@@ -238,15 +240,15 @@ v1 always declares exactly 4 entries, in this order: `GameStart`,
 and 5 bytes respectively (`GameStart` grew from its original 150 bytes and
 `PostFrameUpdate` from its original 42 bytes via the field-append mechanism
 in §5; see §4.2/§4.4's notes on that). Recorder schema v2 (§3.3) declares a
-5th entry, `ItemUpdate` (§4.6), sized 24 bytes — a new event type, not a
-field append, per §5's second mechanism. A future format version could
-declare still more entries or the same entries with even larger sizes —
-see §5. **A parser must always read an event's size from that file's own
-`EventPayloads` event, never hardcode it, and must always read `count`
-itself rather than assuming a fixed number of entries** — this is exactly
-why: an old parser reading a v2 file that correctly implements both of
-those still parses it correctly, skipping the `ItemUpdate` entries it
-doesn't recognize.
+5th entry, `ItemUpdate` (§4.6); schema v3 declares a 6th, `StageHazardUpdate`
+(§4.7) — both new event types, not field appends, per §5's second
+mechanism. A future format version could declare still more entries or the
+same entries with even larger sizes — see §5. **A parser must always read
+an event's size from that file's own `EventPayloads` event, never hardcode
+it, and must always read `count` itself rather than assuming a fixed number
+of entries** — this is exactly why: an old parser reading a newer-schema
+file that correctly implements both of those still parses it correctly,
+skipping entries it doesn't recognize.
 
 ### 4.2 Game Start — code `0x02`
 
@@ -366,37 +368,75 @@ Payload size: **5 bytes.**
 
 ### 4.6 Item Update — code `0x06`
 
-**New in recorder schema v2** (§3.3) for `SmashRemix2.0.1` — a v1 file (schema
-`1`) never contains this event, and its `EventPayloads` event correctly
-declares only 4 entries, not 5. Added as a new event type per §5's second
-mechanism, **not a header `version` bump** — an old parser that reads
-`EventPayloads`'s `count` field dynamically and skips codes it doesn't
-recognize parses a schema-v2 file with no changes required.
+**New in recorder schema v2** for `SmashRemix2.0.1` (§3.3); **the type field's
+meaning changed in schema v3** — a schema-v2 file's `ItemUpdate.kind` field
+does not exist (it was `typeId`, and that field's *value* was wrong — see
+below); a schema-v1 file has no `ItemUpdate` event at all. Both are new
+event types per §5's second mechanism, **not header `version` bumps** — an
+old parser that reads `EventPayloads`'s `count` field dynamically and skips
+codes it doesn't recognize parses a newer-schema file with no changes
+required.
 
-Zero or more per frame — one per object currently live on the shared
-item/hazard/projectile linked list (`ReplayMemory::ReadItemObjects()`),
-following that frame's `PreFrameUpdate`/`PostFrameUpdate` pairs. This is a
-single shared list, not a projectiles-only one: spawned items and stage
-hazard objects (thrown bananas, Poké Balls, Waddle Dees, …) live on it too,
-and cannot currently be told apart from a character's special-move
-projectile by `typeId` alone — see the note on `typeId` below and
-`ReplayMemory::ItemObject`'s own doc comment.
+**Schema v2's `typeId` field was a bug, not just a gap — discard any data
+captured under schema v2.** It read the object's `+0x0C` offset as one
+32-bit value, following a Remix ASM comment that called it "projectile ID."
+Cross-checked against a real SSB64 decompilation
+([VetriTheRetri/ssb-decomp-re](https://github.com/VetriTheRetri/ssb-decomp-re)),
+`+0x0C` is actually four packed single bytes (`link_id`, `dl_link_id`,
+`frame_draw_last`, `obj_kind`) — reading it as a `u32` produces a large,
+constantly-changing value (the `frame_draw_last` byte alone guarantees
+that), never a stable type. See smashremix `docs/ram-map.md` §10.4 for the
+full story.
 
-Payload size: **24 bytes.**
+Zero or more per frame — one per object currently live on the shared `GObj`
+(the engine's universal object base) linked list rooted at a fixed global
+address (`ReplayMemory::ReadItemObjects()`), following that frame's
+`PreFrameUpdate`/`PostFrameUpdate` pairs. Every `GObj` on this list has a
+`link_id` byte identifying its kind — `4` = **Item** (thrown/spawned items,
+stage hazard objects, and some fighter-held things like Link's pulled
+bomb), `5` = **Weapon** (a free-flying character special-move projectile:
+boomerang, fireball, charge shot, …). This recorder only emits `ItemUpdate`
+for `link_id` `4` or `5`; fighters and any other `GObj` kind that might
+appear on this list are skipped, since the further pointer chase below only
+makes sense for Items/Weapons.
+
+Payload size: **25 bytes.**
 
 | Offset | Size | Type    | Field           | Notes                                                                 |
 |-------:|-----:|---------|------------------|--------------------------------------------------------------------------|
 | 0x00   | 4    | `i32`   | `frame`          | Same frame counter as that frame's `PreFrameUpdate`/`PostFrameUpdate`.    |
-| 0x04   | 4    | `u32`   | `objectAddress`  | The object's own RDRAM address. **Not a semantic spawn ID** the engine assigns — just the closest available stable per-object identity, valid for as long as that object is alive. Two `ItemUpdate` events across different frames with the same `objectAddress` are very likely (not guaranteed) the same live object; the address can be reused once an object is freed. |
-| 0x08   | 4    | `u32`   | `typeId`         | Raw value read from the object. `0x00`-`0x1F` is the vanilla item/projectile ID range, `0x20`+ is Remix-added — see §7.6. **There is currently no name lookup table for these IDs** (see §7.6/§8) — a reader gets a raw number, not "boomerang" or "bomb". |
-| 0x0C   | 4    | `f32`   | `positionX`      | IEEE-754 single precision.                                                |
-| 0x10   | 4    | `f32`   | `positionY`      |                                                                            |
-| 0x14   | 4    | `f32`   | `positionZ`      | Read using the same object→topjoint indirection as X/Y, but **not independently confirmed** to be correct for this specific field — see smashremix `docs/ram-map.md` §14.2. Recorded anyway since the cost is negligible and it's very likely right, but treat with more skepticism than X/Y until confirmed. |
+| 0x04   | 4    | `u32`   | `objectAddress`  | The `GObj`'s own RDRAM address. **Not a semantic spawn ID** the engine assigns — just the closest available stable per-object identity, valid for as long as that object is alive. Two `ItemUpdate` events across different frames with the same `objectAddress` are very likely (not guaranteed) the same live object; the address can be reused once an object is freed. |
+| 0x08   | 1    | `u8`    | `linkId`         | `4` = Item, `5` = Weapon — which enum `kind` below means. See §7.6.       |
+| 0x09   | 4    | `i32`   | `kind`           | `ITKind` (`linkId == 4`) or `WPKind` (`linkId == 5`) — the real, named per-instance type, one further pointer hop past `linkId`: `GObj+0x84` → `ITStruct*`/`WPStruct*` → `+0x0C`. Full enums in §7.6. |
+| 0x0D   | 4    | `f32`   | `positionX`      | IEEE-754 single precision. World-space, via `GObj+0x74` → `DObj*` → `+0x1C`. |
+| 0x11   | 4    | `f32`   | `positionY`      | `DObj+0x20`.                                                              |
+| 0x15   | 4    | `f32`   | `positionZ`      | `DObj+0x24`. Position (X/Y/Z alike) is now **confirmed exactly** against the decomp — no longer "inferred by pattern" as earlier drafts of this doc said. |
 
 Deliberately not captured (not yet mapped in memory — see §8): velocity,
-damage/knockback dealt, size, owner/attacker port, and any per-object
-timer/expiration. A future schema version can append any of these as
-trailing fields (§5) once mapped, without breaking this version's readers.
+damage/knockback dealt, size (though for Samus's Charge Shot specifically,
+`kind`'s `WPStruct` exposes a discrete 0-7 `charge_size` level — not
+captured as its own field, since it's meaningful only for that one `kind`),
+owner/attacker port, and any per-object timer/expiration. A future schema
+version can append any of these as trailing fields (§5) once mapped,
+without breaking this version's readers.
+
+### 4.7 Stage Hazard Update — code `0x07`
+
+**New in recorder schema v3.** Zero or one per frame, following that
+frame's `ItemUpdate` events — written only when at least one tracked hazard
+is currently active, same sparse convention as `ItemUpdate` (never a
+zeroed/placeholder event for "nothing active"). Currently tracks exactly
+one hazard: Whispy Woods' wind on Dream Land. More hazards (Zebes' rising
+acid, Duel Zone's disappearing platforms, …) can claim more bits in
+`hazardFlags` later via the field-append mechanism (§5), without needing a
+new event type or breaking existing readers.
+
+Payload size: **5 bytes.**
+
+| Offset | Size | Type  | Field         | Notes                                                                 |
+|-------:|-----:|-------|----------------|--------------------------------------------------------------------------|
+| 0x00   | 4    | `i32` | `frame`        | Same frame counter as that frame's `PreFrameUpdate`/`PostFrameUpdate`.    |
+| 0x04   | 1    | `u8`  | `hazardFlags`  | Bitmask, currently only bit `0x01` defined: Whispy Woods currently blowing (Dream Land only — the underlying memory this reads from is a per-stage union, so this flag is only ever set to `1` when `GameStart.stageId` is Dream Land; see smashremix `docs/ram-map.md` §10.3). |
 
 ## 5. Versioning and forward compatibility
 
@@ -430,11 +470,18 @@ has any external consumer yet. A `version 1` or `version 2` file is not
 expected to parse under this spec.
 
 **Recorder schema history, for `SmashRemix2.0.1`** (§3.3's separate,
-non-breaking axis): schema `1` is the original event set described above;
-schema `2` adds the `ItemUpdate` event (§4.6) — additive only, per the two
-mechanisms above, so a schema-`1`-aware parser correctly reads a schema-`2`
-file's `GameStart`/`PreFrameUpdate`/`PostFrameUpdate`/`GameEnd` events and
-simply never sees the `ItemUpdate` ones.
+non-breaking axis): schema `1` is the original event set described above.
+Schema `2` added the `ItemUpdate` event (§4.6) — additive only, so a
+schema-`1`-aware parser correctly reads a schema-`2` file's other events and
+simply never sees `ItemUpdate`. **Schema `2`'s `ItemUpdate.typeId` field was
+wrong, not just incomplete** (§4.6) — reading `+0x0C` on the raw object as a
+32-bit value, when it's actually a packed byte. Schema `3` replaced it with
+correctly-derived `linkId`/`kind` fields (a different `ItemUpdate` payload
+size — 25 bytes, not 24 — so a parser that reads the size from
+`EventPayloads` as this spec requires handles the difference correctly) and
+added the `StageHazardUpdate` event (§4.7). **Any data captured under
+schema `2` should be discarded and re-recorded, not migrated** — its
+`typeId` values were never meaningful.
 
 ## 6. Byte order and encoding
 
@@ -573,23 +620,81 @@ but explains the `frame` counter's start point and `GameEnd.endReason`):
 `PreFrameUpdate`/`PostFrameUpdate` events, and `frame == 0` is the first
 frame this state is observed), `2` paused, `5` ended.
 
-### 7.6 Item/projectile type IDs (`ItemUpdate.typeId`, schema v2+)
+### 7.6 `ItemUpdate.linkId` and `.kind` (schema v3+)
 
-`0x00`-`0x1F`: vanilla item/projectile ID space (`VANILLA_LAST_ID = 0x1F` in
-the mod's own source, `src/Projectile.asm`). `0x20`+: Remix-added items and
-projectiles, numbered continuing from that boundary.
+`linkId` (`ItemUpdate` offset `0x08`) is `4` (Item) or `5` (Weapon) — this
+recorder never emits any other value (§4.6). It selects which of the two
+enums below `kind` is a value from.
 
-**No name table exists for either range in this spec.** The vanilla range
-in particular is not named anywhere in Smash Remix's own source (it only
-ever references its *own* new IDs symbolically) — confirming which numeric
-ID is a boomerang vs. a thrown Poké Ball vs. Ness's PK Thunder ball requires
-either spawning each move and reading its live `typeId` off a recorded
-match, or locating a real SSB64 decompilation project's named enum (comment
-references to decompiled function names like `wpLinkBoomerangCheckOwnerCatch`
-suggest one exists — see smashremix `docs/ram-map.md` §14.3 for the current
-state of this gap). Until that mapping exists, a consumer of `ItemUpdate`
-gets a bare number and must build its own lookup empirically if it needs
-per-move identification rather than "some object was here."
+**`WPKind`** (`linkId == 5` — free-flying character special-move
+projectiles), confirmed against the real SSB64 decompilation
+([VetriTheRetri/ssb-decomp-re](https://github.com/VetriTheRetri/ssb-decomp-re)):
+
+| Value | Name | | Value | Name |
+|---:|---|---|---:|---|
+| `0x00` | Fireball | | `0x10` | BulletNormal |
+| `0x01` | Blaster | | `0x11` | BulletHard |
+| `0x02` | ChargeShot | | `0x12` | ArwingLaser2D |
+| `0x03` | SamusBomb | | `0x13` | ArwingLaser3D |
+| `0x04` | Cutter | | `0x14` | LGunAmmo |
+| `0x05` | EggThrow | | `0x15` | FFlowerFlame |
+| `0x06` | YoshiStar | | `0x16` | StarRodStar |
+| `0x07` | Boomerang | | `0x17`-`0x1F` | Pokémon/monster weapons (not individually enumerated here) |
+| `0x08` | SpinAttack | | | |
+| `0x09` | ThunderJoltAir | | | |
+| `0x0A` | ThunderJoltGround | | | |
+| `0x0B` | ThunderHead | | | |
+| `0x0C` | ThunderTrail | | | |
+| `0x0D` | PKFire | | | |
+| `0x0E` | PKThunderHead | | | |
+| `0x0F` | PKThunderTrail | | | |
+
+`0x1F` is `nWPKindMonsterEnd` — Remix's own mod-added weapon IDs
+(`src/Projectile.asm`, e.g. Banjo's egg, Sonic's spring) continue numbering
+from there, per smashremix `docs/ram-map.md` §14.
+
+**`ITKind`** (`linkId == 4` — thrown/spawned items, stage hazard objects,
+and some fighter-held things like Link's pulled bomb). Two values are
+confirmed directly against the decomp (`Bomb = 0x15`, matching Link's bomb;
+`PKFirePillar = 0x14`, matching Ness's PK Fire pillar); the rest of this
+table is `Hazards.standard`/`stage`/`pokemon` from Smash Remix's own
+`src/Hazards.asm`, which the decomp cross-check confirms uses the *same*
+numbering (only the offset this spec originally read it from — §4.6 — was
+wrong, not this enum):
+
+| Value | Name | | Value | Name | | Value | Name |
+|---:|---|---|---:|---|---|---:|---|
+| `0x00` | Crate | | `0x0F` | Bob-omb | | `0x1E` | Venusaur |
+| `0x01` | Barrel | | `0x10` | Bumper | | `0x1F` | Porygon |
+| `0x02` | Capsule | | `0x11` | GreenShell | | `0x20` | Onix |
+| `0x03` | Egg | | `0x12` | RedShell | | `0x21` | Snorlax |
+| `0x04` | MaximTomato | | `0x13` | Pokéball | | `0x22` | Goldeen |
+| `0x05` | Heart | | `0x14` | PKFirePillar | | `0x23` | Meowth |
+| `0x06` | Star | | `0x15` | Bomb | | `0x24` | Charizard |
+| `0x07` | BeamSword | | `0x16` | PowBlock | | `0x25` | Beedrill |
+| `0x08` | HomeRunBat | | `0x17` | Bumper (stage) | | `0x26` | Blastoise |
+| `0x09` | Fan | | `0x18` | PiranhaPlant | | `0x27` | Chansey |
+| `0x0A` | StarRod | | `0x19` | Target | | `0x28` | Starmie |
+| `0x0B` | RayGun | | `0x1A` | RTTFBomb | | `0x29` | Hitmonlee |
+| `0x0C` | FireFlower | | `0x1B` | Chansey (stage) | | `0x2A` | Koffing |
+| `0x0D` | Hammer | | `0x1C` | Electrode | | `0x2B` | Clefairy |
+| `0x0E` | MotionSensorBomb | | `0x1D` | Charmander | | `0x2C` | Mew |
+
+Two entries repeat a name at a different value (`Bumper` at both `0x10` and
+`0x17`; `Chansey` at both `0x1B` and `0x27`) — that's the source enum's own
+structure (a `standard`/`stage`/`pokemon` grouping with some overlap), not a
+transcription error here. Remix's `BOWSER_BOMB` is a custom out-of-range
+value (`0x011A`) specific to one stage hazard, not part of the normal
+`0x00`-`0x2C` span.
+
+### 7.7 `StageHazardUpdate.hazardFlags` bits (schema v3+)
+
+| Bit | Meaning |
+|---:|---|
+| `0x01` | Whispy Woods is currently blowing (Dream Land only — see §4.7). |
+
+All other bits are currently always `0`, reserved for hazards not yet
+tracked (Zebes' rising acid, Duel Zone's disappearing platforms, …).
 
 ## 8. Known limitations / not yet implemented
 
@@ -597,12 +702,15 @@ These are deliberate v1 scope cuts, not oversights — later format versions
 can add any of them as new event types or appended fields per §5, without
 breaking existing files or parsers:
 
-- **Item/projectile tracking is position-only, and can't yet distinguish
-  what it saw.** Schema v2's `ItemUpdate` (§4.6) records the shared item/
-  hazard/projectile list's raw `typeId` and position for every live object,
-  but there is no name table for `typeId` (§7.6) and no velocity, damage,
-  size, owner/attacker, or expiration data — none of that has been mapped
-  in memory yet.
+- **Item/weapon tracking has no velocity, damage, owner/attacker port, or
+  expiration data.** Schema v3's `ItemUpdate` (§4.6) records a named
+  `kind` (§7.6) and position for every live Item/Weapon object, but none of
+  those additional fields have been mapped in memory yet.
+- **Stage hazard tracking covers exactly one hazard.** Schema v3's
+  `StageHazardUpdate` (§4.7) currently only tracks Whispy Woods' wind on
+  Dream Land — other built-in hazards (Zebes' acid, Duel Zone's platforms,
+  …) are known to be resolvable the same way (smashremix `docs/ram-map.md`
+  §10.5) but haven't been added yet.
 - **No RNG/desync-detection event.** No `FrameStart`-equivalent event (RNG
   seed, internal scene frame counter); no known Smash Remix RNG seed address
   has been identified.
