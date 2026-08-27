@@ -62,6 +62,10 @@ enum class EventCode : uint8_t
     PreFrame      = 0x03,
     PostFrame     = 0x04,
     GameEnd       = 0x05,
+    // v2 (docs/RMGR_SPEC.md section 5, new event type - not a header version
+    // bump): one per live entry on the shared item/hazard/projectile list,
+    // per frame. See ItemUpdateEvent below.
+    ItemUpdate    = 0x06,
 };
 
 struct GameStartPortInfo
@@ -149,6 +153,25 @@ struct GameEndEvent
 };
 static_assert(sizeof(GameEndEvent) == 5, "GameEndEvent must be 5 bytes");
 
+// v2 new event type (docs/RMGR_SPEC.md section 5): one per live entry on
+// the shared item/hazard/projectile object list (ReplayMemory::ItemObject),
+// per frame - zero or more of these follow each frame's Pre/Post-Frame
+// pairs. Covers *everything* on that list (spawned items and stage hazards
+// too, not just character-special-move projectiles) since they can't
+// currently be told apart by typeId alone - see
+// ReplayMemory::ItemObject's own doc comment and
+// smashremix docs/ram-map.md section 14.3.
+struct ItemUpdateEvent
+{
+    int32_t  frame;         // same numbering as Pre/PostFrame
+    uint32_t objectAddress; // the object's own RDRAM address - not a semantic spawn ID, see ReplayMemory::ItemObject
+    uint32_t typeId;        // raw value read from the object; 0x00-0x1F vanilla, 0x20+ Remix-added (see docs/RMGR_SPEC.md section 7.6)
+    float    positionX;
+    float    positionY;
+    float    positionZ; // inferred by pattern, not independently confirmed - see ram-map.md section 14.2
+};
+static_assert(sizeof(ItemUpdateEvent) == 24, "ItemUpdateEvent must be 24 bytes");
+
 #pragma pack(pop)
 
 enum class State
@@ -195,6 +218,14 @@ int s_OverrideMatchNumber = 0;
 bool                       s_HasPlayerNamesOverride = false;
 std::array<std::string, 4> s_PlayerNamesOverride;
 
+// Per-session recordedAtEpochSeconds override, set via
+// Replay::SetRecordedAtBaseOverride(). Applies to every OpenNewFile() call
+// for the rest of this session; cleared at OnEmulationStop() - see that
+// function and SetRecordedAtBaseOverride's own doc comment in Replay.hpp.
+bool                          s_HasRecordedAtBaseOverride = false;
+uint64_t                      s_RecordedAtBaseEpochSeconds = 0;
+Replay::FrameIndexProvider    s_RecordedAtFrameIndexProvider = nullptr;
+
 // This feature's memory offsets were only ever derived/verified against
 // Smash Remix 2.0.1 (see docs/RMGR_SPEC.md); recording against any other
 // ROM would pointer-chase addresses that mean nothing there. GoodName
@@ -216,7 +247,11 @@ constexpr const char* kSupportedGoodName = "SmashRemix2.0.1";
 // silently changes recorded *values* without changing any event's byte
 // size. This is its own counter per goodName; a different goodName starts
 // its own numbering from 1, unrelated to this one.
-constexpr uint32_t kRecorderSchemaVersion = 1;
+//
+// v1 -> v2: added the ItemUpdate event (docs/RMGR_SPEC.md section 5/4.6) -
+// a wholly new capability rather than a field append, but still exactly the
+// kind of "recorded output changed" this counter exists to track.
+constexpr uint32_t kRecorderSchemaVersion = 2;
 
 bool IsSupportedGame(void)
 {
@@ -257,10 +292,15 @@ void WriteEventPayloadsEvent(void)
         uint16_t  size;
     };
     static const EventSize sizes[] = {
-        {EventCode::GameStart, static_cast<uint16_t>(sizeof(GameStartEvent))},
-        {EventCode::PreFrame,  static_cast<uint16_t>(sizeof(PreFrameEvent))},
-        {EventCode::PostFrame, static_cast<uint16_t>(sizeof(PostFrameEvent))},
-        {EventCode::GameEnd,   static_cast<uint16_t>(sizeof(GameEndEvent))},
+        {EventCode::GameStart,  static_cast<uint16_t>(sizeof(GameStartEvent))},
+        {EventCode::PreFrame,   static_cast<uint16_t>(sizeof(PreFrameEvent))},
+        {EventCode::PostFrame,  static_cast<uint16_t>(sizeof(PostFrameEvent))},
+        {EventCode::GameEnd,    static_cast<uint16_t>(sizeof(GameEndEvent))},
+        // v2 addition (docs/RMGR_SPEC.md section 5) - an old parser that
+        // reads `count` dynamically and skips codes it doesn't recognize
+        // (exactly what this declared-size mechanism exists for) still
+        // parses a file with this 5th entry correctly.
+        {EventCode::ItemUpdate, static_cast<uint16_t>(sizeof(ItemUpdateEvent))},
     };
 
     uint8_t codeByte = static_cast<uint8_t>(EventCode::EventPayloads);
@@ -373,7 +413,22 @@ bool OpenNewFile(const ReplayMemory::MatchInfo& matchInfo)
     s_FrameNumber = 0;
     s_StreamBytesWritten = 0;
 
-    time_t now = time(nullptr);
+    // Default: live recording, stamped with wall-clock "now". Headless
+    // .krec export overrides this (see SetRecordedAtBaseOverride's doc
+    // comment) so the file reflects the match's *original* recording time
+    // rather than when the headless replay (which can run at up to 2000%
+    // speed) happened to reach it.
+    time_t now;
+    if (s_HasRecordedAtBaseOverride)
+    {
+        const int elapsedFrames = s_RecordedAtFrameIndexProvider != nullptr ? s_RecordedAtFrameIndexProvider() : 0;
+        const uint64_t elapsedSeconds = static_cast<uint64_t>(elapsedFrames) / 60; // assumes a constant 60fps original recording
+        now = static_cast<time_t>(s_RecordedAtBaseEpochSeconds + elapsedSeconds);
+    }
+    else
+    {
+        now = time(nullptr);
+    }
     std::filesystem::path path;
     if (s_HasOutputPathOverride)
     {
@@ -558,6 +613,23 @@ void RecordFrame(const ReplayMemory::MatchInfo& matchInfo)
         WriteEvent(EventCode::PostFrame, post);
     }
 
+    // One ItemUpdate per currently-live entry on the shared item/hazard/
+    // projectile list (see docs/RMGR_SPEC.md section 4.6) - after every
+    // seated port's Pre/Post-Frame pair, same as the per-port events above.
+    // Zero events written when the list is empty this frame - never a
+    // zeroed/placeholder event, same convention as an unseated port.
+    for (const ReplayMemory::ItemObject& item : ReplayMemory::ReadItemObjects())
+    {
+        ItemUpdateEvent itemEvent{};
+        itemEvent.frame         = s_FrameNumber;
+        itemEvent.objectAddress = item.objectAddress;
+        itemEvent.typeId        = item.typeId;
+        itemEvent.positionX     = item.positionX;
+        itemEvent.positionY     = item.positionY;
+        itemEvent.positionZ     = item.positionZ;
+        WriteEvent(EventCode::ItemUpdate, itemEvent);
+    }
+
     s_FrameNumber++;
 }
 } // namespace
@@ -635,6 +707,14 @@ CORE_EXPORT void SetPlayerNamesOverride(const std::array<std::string, 4>& names)
     s_PlayerNamesOverride = names;
 }
 
+CORE_EXPORT void SetRecordedAtBaseOverride(uint64_t krecBaseEpochSeconds, FrameIndexProvider frameIndexProvider)
+{
+    std::lock_guard<std::mutex> lock(s_Mutex);
+    s_HasRecordedAtBaseOverride = true;
+    s_RecordedAtBaseEpochSeconds = krecBaseEpochSeconds;
+    s_RecordedAtFrameIndexProvider = frameIndexProvider;
+}
+
 CORE_EXPORT void OnEmulationStop(void)
 {
     std::lock_guard<std::mutex> lock(s_Mutex);
@@ -656,6 +736,9 @@ CORE_EXPORT void OnEmulationStop(void)
     s_OverrideMatchNumber = 0;
     s_HasPlayerNamesOverride = false;
     s_PlayerNamesOverride = {};
+    s_HasRecordedAtBaseOverride = false;
+    s_RecordedAtBaseEpochSeconds = 0;
+    s_RecordedAtFrameIndexProvider = nullptr;
 }
 
 CORE_EXPORT void OnFrame(void)

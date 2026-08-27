@@ -60,6 +60,23 @@ constexpr uint32_t PS_TEAM                 = 0x0C;
 constexpr uint32_t PS_HANDICAP             = 0x12;
 constexpr uint32_t PS_CPU_LEVEL            = 0x13;
 
+// Shared item/hazard/projectile object list - independent of MatchInfo, a
+// fixed global head pointer. See smashremix docs/ram-map.md sections 10.4
+// and 14.
+constexpr uint32_t ADDR_ITEM_LIST_HEAD = 0x80046700;
+constexpr uint32_t ITEM_NEXT           = 0x04;
+constexpr uint32_t ITEM_TYPE_ID        = 0x0C;
+constexpr uint32_t ITEM_TOPJOINT_PTR   = 0x74;
+constexpr uint32_t TOPJOINT_POSITION_X = 0x1C;
+constexpr uint32_t TOPJOINT_POSITION_Y = 0x20;
+constexpr uint32_t TOPJOINT_POSITION_Z = 0x24; // inferred by pattern, not independently confirmed
+
+// Slippi caps its own per-frame item event count at 15 (see
+// rmgk-replay-file-agent-prompt.md section 4.4); reused here as a sane
+// per-frame budget, mainly to bound a corrupt/cyclic list to a fixed number
+// of reads rather than looping until something crashes.
+constexpr int ITEM_LIST_MAX_OBJECTS = 32;
+
 // KSEG0, 8MB expansion-pak RDRAM window. A value outside this range means a
 // pointer chase hit garbage - treat as "not currently available", not a crash.
 bool IsValidRdramPointer(uint32_t ptr)
@@ -176,5 +193,31 @@ PortPlayerState ReadPortPlayerState(uint32_t matchInfoPtr, int port)
     }
 
     return state;
+}
+
+std::vector<ItemObject> ReadItemObjects(void)
+{
+    std::vector<ItemObject> objects;
+
+    uint32_t current = m64p::Core.DebugMemRead32(ADDR_ITEM_LIST_HEAD);
+    for (int i = 0; i < ITEM_LIST_MAX_OBJECTS && IsValidRdramPointer(current); i++)
+    {
+        ItemObject object{};
+        object.objectAddress = current;
+        object.typeId        = m64p::Core.DebugMemRead32(current + ITEM_TYPE_ID);
+
+        uint32_t topJoint = m64p::Core.DebugMemRead32(current + ITEM_TOPJOINT_PTR);
+        if (IsValidRdramPointer(topJoint))
+        {
+            object.positionX = ReadFloat(topJoint + TOPJOINT_POSITION_X);
+            object.positionY = ReadFloat(topJoint + TOPJOINT_POSITION_Y);
+            object.positionZ = ReadFloat(topJoint + TOPJOINT_POSITION_Z);
+        }
+        objects.push_back(object);
+
+        current = m64p::Core.DebugMemRead32(current + ITEM_NEXT);
+    }
+
+    return objects;
 }
 } // namespace ReplayMemory

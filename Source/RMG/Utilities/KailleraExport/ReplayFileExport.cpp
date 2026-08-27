@@ -373,6 +373,13 @@ static bool runReplayFileExport(ReplayFileExportOptions& options, std::string* e
     // bytes. The krec being replayed already has its own player names, so
     // pass those through instead.
     ReplaySetPlayerNamesOverride(krecData.header.playerNames);
+    // The .krec's own recording-start timestamp (header field, or a
+    // filename-derived fallback - see ParseKrecFile), plus GetPifReplayFrameIndex
+    // to track how far into the original session each match falls - see
+    // Replay::SetRecordedAtBaseOverride's doc comment for why this replaces
+    // the default time(nullptr) (which would otherwise reflect this headless
+    // export's own wall-clock time, not the original recording's).
+    ReplaySetRecordedAtBaseOverride(krecData.header.timestamp, &GetPifReplayFrameIndex);
     ReplayOnEmulationStart();
 
     const m64p_error executeResult = emulator.execute();

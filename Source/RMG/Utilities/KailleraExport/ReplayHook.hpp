@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <cstdint>
 #include <string>
 
 namespace KailleraExport
@@ -29,12 +30,16 @@ bool HookReplayCoreApi(void* coreLibraryHandle);
 bool IsReplayCoreApiHooked();
 
 // Thin pass-throughs to Replay::{SetEnabledOverride,SetOutputPathOverride,
-// SetPlayerNamesOverride,OnEmulationStart,OnFrame,OnEmulationStop} (see
-// RMG-Core/Replay.hpp for what each does). No-ops if this build wasn't
-// compiled with GAME_STATS.
+// SetPlayerNamesOverride,SetRecordedAtBaseOverride,OnEmulationStart,OnFrame,
+// OnEmulationStop} (see RMG-Core/Replay.hpp for what each does). No-ops if
+// this build wasn't compiled with GAME_STATS.
 void ReplaySetEnabledOverride(bool enabled);
 void ReplaySetOutputPathOverride(const std::string& path);
 void ReplaySetPlayerNamesOverride(const std::array<std::string, 4>& names);
+// `frameIndexProvider` is really a Replay::FrameIndexProvider (int(*)(void))
+// - taken as a plain function pointer here for the same reason every other
+// type in this file is primitive, see the isolation-boundary comment above.
+void ReplaySetRecordedAtBaseOverride(uint64_t krecBaseEpochSeconds, int (*frameIndexProvider)(void));
 void ReplayOnEmulationStart();
 void ReplayOnFrame();
 void ReplayOnEmulationStop();

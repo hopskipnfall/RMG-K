@@ -11,6 +11,7 @@
 #define REPLAY_MEMORY_HPP
 
 #include <cstdint>
+#include <vector>
 
 // Smash Remix (N64) memory-layout reader for the replay-file feature.
 // Every address/offset here comes from the hand-derived RAM map in
@@ -62,6 +63,26 @@ struct PortPlayerState
     uint8_t  cpuLevel;  // CPU difficulty; meaningless for human ports
 };
 
+// One live entry on the shared item/hazard/projectile object list (see
+// ReadItemObjects() below). Covers *everything* on that list, not just
+// character-special-move projectiles - spawned items and stage hazard
+// objects (thrown bananas, Poké Balls, Waddle Dees, ...) share the same
+// list and currently can't be told apart from projectiles by ID alone (see
+// smashremix docs/ram-map.md section 14.3 - the ID->name lookup table for
+// this game doesn't exist yet). `objectAddress` is that object's own RDRAM
+// address, the closest thing to a stable per-object identity available -
+// it's stable for as long as the object is alive, but isn't a semantic
+// "spawn ID" the engine itself assigns, so it's exposed as-is rather than
+// dressed up as one.
+struct ItemObject
+{
+    uint32_t objectAddress;
+    uint32_t typeId;
+    float    positionX;
+    float    positionY;
+    float    positionZ; // inferred by pattern, not independently confirmed - see ram-map.md section 14.2
+};
+
 struct MatchInfo
 {
     bool     valid;
@@ -94,6 +115,15 @@ PortMatchInfo ReadPortMatchInfo(uint32_t matchInfoPtr, int port);
 // PortPlayerState::valid == false (not a crash) if that port isn't
 // currently seated in a live match.
 PortPlayerState ReadPortPlayerState(uint32_t matchInfoPtr, int port);
+
+// Walks the shared item/hazard/projectile linked list (head pointer at a
+// fixed global address, independent of MatchInfo) and returns every live
+// entry found - see smashremix docs/ram-map.md sections 10.4 and 14. Empty
+// if the list is empty or the head pointer is invalid. The walk is capped
+// at a fixed number of iterations (ITEM_LIST_MAX_OBJECTS in the .cpp) so a
+// corrupt or unexpectedly-cyclic list can never hang recording - it doesn't
+// specifically detect/dedupe a cycle, just guarantees termination.
+std::vector<ItemObject> ReadItemObjects(void);
 } // namespace ReplayMemory
 
 #endif // REPLAY_MEMORY_HPP

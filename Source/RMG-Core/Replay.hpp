@@ -11,6 +11,7 @@
 #define REPLAY_HPP
 
 #include <array>
+#include <cstdint>
 #include <string>
 
 // New, independent per-match ".rmgr" replay recorder. Entirely separate
@@ -89,6 +90,32 @@ void SetOutputPathOverride(const std::string& path);
 // through to recording_player_names, and a stale override can never leak
 // into an unrelated later session.
 void SetPlayerNamesOverride(const std::array<std::string, 4>& names);
+
+// Per-session override for how OpenNewFile() derives recordedAtEpochSeconds,
+// for headless/offline .krec export tooling. Without this, OpenNewFile()
+// stamps every match with time(nullptr) at the moment the headless replay
+// reaches it - which, since headless replay runs at up to 2000% speed (see
+// ReplayFileExport.cpp), reflects when the *export* happened to reach that
+// match, not when it was originally played, and drifts further from the
+// truth with every match in a multi-game .krec.
+//
+// `krecBaseEpochSeconds` is the source .krec's own recording-start
+// timestamp (its header's timestamp field, or a filename-derived fallback -
+// see KailleraExport::ParseKrecFile). `frameIndexProvider` is called fresh
+// every time OpenNewFile() runs for the rest of this session; its return
+// value is how many of the .krec's own input frames have been consumed so
+// far (see KailleraExport::GetPifReplayFrameIndex()) - assuming the
+// original recording ran at a constant 60fps, dividing that by 60 gives the
+// real-world seconds elapsed since the .krec began, which OpenNewFile()
+// adds to krecBaseEpochSeconds to derive that specific match's
+// recordedAtEpochSeconds. A null frameIndexProvider is treated as "0 frames
+// elapsed" (i.e. every match gets krecBaseEpochSeconds itself).
+//
+// Cleared at OnEmulationStop(), same as the two overrides above - a launch
+// path that never calls this always falls through to time(nullptr), and a
+// stale override can never leak into an unrelated later session.
+using FrameIndexProvider = int (*)(void);
+void SetRecordedAtBaseOverride(uint64_t krecBaseEpochSeconds, FrameIndexProvider frameIndexProvider);
 
 // Call from CoreStopEmulation, and also from any UI-thread path that ends
 // emulation without necessarily going through CoreStopEmulation (see

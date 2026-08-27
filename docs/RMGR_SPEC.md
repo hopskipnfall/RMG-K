@@ -125,8 +125,9 @@ A sequence of events, back to back, no padding between them:
 The very first event in every file is always `EventPayloads` (`0x01`, §4.1).
 Every subsequent event is one of `GameStart` (`0x02`, once, immediately
 after `EventPayloads`), `PreFrameUpdate` (`0x03`), `PostFrameUpdate`
-(`0x04`), or `GameEnd` (`0x05`, once, at the very end — present only if the
-recording session finished cleanly).
+(`0x04`), `ItemUpdate` (`0x06`, schema v2+, see §4.6), or `GameEnd` (`0x05`,
+once, at the very end — present only if the recording session finished
+cleanly).
 
 For each real emulated frame that the match is actively ongoing
 (`game_status == 1`, see §7.5) and has at least one seated port, the
@@ -137,6 +138,12 @@ like `Pre(port 0), Post(port 0), Pre(port 1), Post(port 1)`. Ports that are
 empty or unseated that frame have no events at all — never a zeroed/dummy
 event — so a reader must not assume every frame has all four ports present,
 and must not assume a fixed number of events per frame.
+
+That same frame N is then followed by zero or more `ItemUpdate` events, one
+per object currently live on the shared item/hazard/projectile list (§4.6)
+— zero if that list is empty this frame, again never a zeroed/dummy event.
+A reader correlates `ItemUpdate` events to a frame via their own `frame`
+field, the same way it correlates a `PreFrameUpdate`/`PostFrameUpdate` pair.
 
 ### 3.3 `goodName` and `recorderSchemaVersion` — two independent axes
 
@@ -191,6 +198,19 @@ its own explicitly-numbered file from that base: `<krec name>-1.rmgr`,
 The same collision-avoidance above still applies on top, e.g. if the same
 `.krec` is exported a second time.
 
+For this headless export path, `recordedAtEpochSeconds` is **not** wall-clock
+export time (headless replay can run at up to 2000% speed, so that would
+reflect when the export happened to reach that match, not when it was
+originally played). Instead it's derived from the source `.krec`'s own
+recording-start timestamp (that file's header, or a filename-derived
+fallback if the header's is missing/zero - see
+`KailleraExport::ParseKrecFile()`), plus how many of the `.krec`'s own input
+frames have been consumed by the time that match is reached, divided by 60
+under the assumption that the original recording ran at a constant 60fps
+(true for any real Kaillera session) - see
+`Replay::SetRecordedAtBaseOverride()`. The exported filename itself is still
+just `<krec name>-N.rmgr` as above, not timestamp-based, for this path.
+
 ## 4. Events
 
 ### 4.1 Event Payloads — code `0x01`
@@ -214,13 +234,19 @@ Each entry:
 | +0x01          | 2    | `u16` | `size` | That event's payload size, in bytes.      |
 
 v1 always declares exactly 4 entries, in this order: `GameStart`,
-`PreFrameUpdate`, `PostFrameUpdate`, `GameEnd` — currently sized 164, 9, 42,
-and 5 bytes respectively (`GameStart` grew from its original 150 bytes via
-the field-append mechanism in §5; see §4.2's note on that). A future format
-version could declare more entries (new event types) or the same entries
-with even larger sizes (more fields appended to an existing event) — see
-§5. **A parser must always read an event's size from that file's own
-`EventPayloads` event, never hardcode it** — this is exactly why.
+`PreFrameUpdate`, `PostFrameUpdate`, `GameEnd` — currently sized 164, 9, 50,
+and 5 bytes respectively (`GameStart` grew from its original 150 bytes and
+`PostFrameUpdate` from its original 42 bytes via the field-append mechanism
+in §5; see §4.2/§4.4's notes on that). Recorder schema v2 (§3.3) declares a
+5th entry, `ItemUpdate` (§4.6), sized 24 bytes — a new event type, not a
+field append, per §5's second mechanism. A future format version could
+declare still more entries or the same entries with even larger sizes —
+see §5. **A parser must always read an event's size from that file's own
+`EventPayloads` event, never hardcode it, and must always read `count`
+itself rather than assuming a fixed number of entries** — this is exactly
+why: an old parser reading a v2 file that correctly implements both of
+those still parses it correctly, skipping the `ItemUpdate` entries it
+doesn't recognize.
 
 ### 4.2 Game Start — code `0x02`
 
@@ -338,6 +364,40 @@ Payload size: **5 bytes.**
 | 0x00   | 1    | `u8`    | `endReason`     | `0` aborted (match reset, or the emulator/process stopped mid-match — these two causes are not currently distinguished), `1` normal end. |
 | 0x01   | 4    | `i8[4]` | `placements`    | Final stocks remaining, per port 0-3. `-1` for any port that was never seated. |
 
+### 4.6 Item Update — code `0x06`
+
+**New in recorder schema v2** (§3.3) for `SmashRemix2.0.1` — a v1 file (schema
+`1`) never contains this event, and its `EventPayloads` event correctly
+declares only 4 entries, not 5. Added as a new event type per §5's second
+mechanism, **not a header `version` bump** — an old parser that reads
+`EventPayloads`'s `count` field dynamically and skips codes it doesn't
+recognize parses a schema-v2 file with no changes required.
+
+Zero or more per frame — one per object currently live on the shared
+item/hazard/projectile linked list (`ReplayMemory::ReadItemObjects()`),
+following that frame's `PreFrameUpdate`/`PostFrameUpdate` pairs. This is a
+single shared list, not a projectiles-only one: spawned items and stage
+hazard objects (thrown bananas, Poké Balls, Waddle Dees, …) live on it too,
+and cannot currently be told apart from a character's special-move
+projectile by `typeId` alone — see the note on `typeId` below and
+`ReplayMemory::ItemObject`'s own doc comment.
+
+Payload size: **24 bytes.**
+
+| Offset | Size | Type    | Field           | Notes                                                                 |
+|-------:|-----:|---------|------------------|--------------------------------------------------------------------------|
+| 0x00   | 4    | `i32`   | `frame`          | Same frame counter as that frame's `PreFrameUpdate`/`PostFrameUpdate`.    |
+| 0x04   | 4    | `u32`   | `objectAddress`  | The object's own RDRAM address. **Not a semantic spawn ID** the engine assigns — just the closest available stable per-object identity, valid for as long as that object is alive. Two `ItemUpdate` events across different frames with the same `objectAddress` are very likely (not guaranteed) the same live object; the address can be reused once an object is freed. |
+| 0x08   | 4    | `u32`   | `typeId`         | Raw value read from the object. `0x00`-`0x1F` is the vanilla item/projectile ID range, `0x20`+ is Remix-added — see §7.6. **There is currently no name lookup table for these IDs** (see §7.6/§8) — a reader gets a raw number, not "boomerang" or "bomb". |
+| 0x0C   | 4    | `f32`   | `positionX`      | IEEE-754 single precision.                                                |
+| 0x10   | 4    | `f32`   | `positionY`      |                                                                            |
+| 0x14   | 4    | `f32`   | `positionZ`      | Read using the same object→topjoint indirection as X/Y, but **not independently confirmed** to be correct for this specific field — see smashremix `docs/ram-map.md` §14.2. Recorded anyway since the cost is negligible and it's very likely right, but treat with more skepticism than X/Y until confirmed. |
+
+Deliberately not captured (not yet mapped in memory — see §8): velocity,
+damage/knockback dealt, size, owner/attacker port, and any per-object
+timer/expiration. A future schema version can append any of these as
+trailing fields (§5) once mapped, without breaking this version's readers.
+
 ## 5. Versioning and forward compatibility
 
 Two independent mechanisms, matching §4.6 of the original design rationale:
@@ -368,6 +428,13 @@ lack those fields entirely, at a different header size) — accepted
 deliberately both times, since no file predating this spec's current form
 has any external consumer yet. A `version 1` or `version 2` file is not
 expected to parse under this spec.
+
+**Recorder schema history, for `SmashRemix2.0.1`** (§3.3's separate,
+non-breaking axis): schema `1` is the original event set described above;
+schema `2` adds the `ItemUpdate` event (§4.6) — additive only, per the two
+mechanisms above, so a schema-`1`-aware parser correctly reads a schema-`2`
+file's `GameStart`/`PreFrameUpdate`/`PostFrameUpdate`/`GameEnd` events and
+simply never sees the `ItemUpdate` ones.
 
 ## 6. Byte order and encoding
 
@@ -506,14 +573,36 @@ but explains the `frame` counter's start point and `GameEnd.endReason`):
 `PreFrameUpdate`/`PostFrameUpdate` events, and `frame == 0` is the first
 frame this state is observed), `2` paused, `5` ended.
 
+### 7.6 Item/projectile type IDs (`ItemUpdate.typeId`, schema v2+)
+
+`0x00`-`0x1F`: vanilla item/projectile ID space (`VANILLA_LAST_ID = 0x1F` in
+the mod's own source, `src/Projectile.asm`). `0x20`+: Remix-added items and
+projectiles, numbered continuing from that boundary.
+
+**No name table exists for either range in this spec.** The vanilla range
+in particular is not named anywhere in Smash Remix's own source (it only
+ever references its *own* new IDs symbolically) — confirming which numeric
+ID is a boomerang vs. a thrown Poké Ball vs. Ness's PK Thunder ball requires
+either spawning each move and reading its live `typeId` off a recorded
+match, or locating a real SSB64 decompilation project's named enum (comment
+references to decompiled function names like `wpLinkBoomerangCheckOwnerCatch`
+suggest one exists — see smashremix `docs/ram-map.md` §14.3 for the current
+state of this gap). Until that mapping exists, a consumer of `ItemUpdate`
+gets a bare number and must build its own lookup empirically if it needs
+per-move identification rather than "some object was here."
+
 ## 8. Known limitations / not yet implemented
 
 These are deliberate v1 scope cuts, not oversights — later format versions
 can add any of them as new event types or appended fields per §5, without
 breaking existing files or parsers:
 
-- **No item tracking.** No `ItemUpdate`-equivalent event exists; N64 Smash
-  item/projectile memory offsets have not been mapped.
+- **Item/projectile tracking is position-only, and can't yet distinguish
+  what it saw.** Schema v2's `ItemUpdate` (§4.6) records the shared item/
+  hazard/projectile list's raw `typeId` and position for every live object,
+  but there is no name table for `typeId` (§7.6) and no velocity, damage,
+  size, owner/attacker, or expiration data — none of that has been mapped
+  in memory yet.
 - **No RNG/desync-detection event.** No `FrameStart`-equivalent event (RNG
   seed, internal scene frame counter); no known Smash Remix RNG seed address
   has been identified.

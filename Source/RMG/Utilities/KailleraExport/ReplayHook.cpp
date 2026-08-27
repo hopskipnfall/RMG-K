@@ -37,6 +37,11 @@ void ReplaySetPlayerNamesOverride(const std::array<std::string, 4>& names)
     Replay::SetPlayerNamesOverride(names);
 }
 
+void ReplaySetRecordedAtBaseOverride(uint64_t krecBaseEpochSeconds, int (*frameIndexProvider)(void))
+{
+    Replay::SetRecordedAtBaseOverride(krecBaseEpochSeconds, frameIndexProvider);
+}
+
 void ReplayOnEmulationStart()
 {
     Replay::OnEmulationStart();
@@ -67,6 +72,7 @@ bool IsReplayCoreApiHooked()
 void ReplaySetEnabledOverride(bool) {}
 void ReplaySetOutputPathOverride(const std::string&) {}
 void ReplaySetPlayerNamesOverride(const std::array<std::string, 4>&) {}
+void ReplaySetRecordedAtBaseOverride(uint64_t, int (*)(void)) {}
 void ReplayOnEmulationStart() {}
 void ReplayOnFrame() {}
 void ReplayOnEmulationStop() {}
