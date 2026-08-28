@@ -133,7 +133,14 @@ struct PostFrameEvent
     float    velocityY;
     uint32_t damagePercent;
     int8_t   stocksRemaining;
-    uint8_t  jumpsUsed;
+    // Named/interpreted as jumpsUsed through schema v6 - that read a
+    // constant 0 all game (wrong width AND wrong emulator byte-swizzle for
+    // a sub-word read, see ReplayMemory::ReadPortPlayerState()). Schema v7
+    // fixes the read and switches this to jumps *remaining* instead
+    // (jumpsMax - jumpsUsed) - more directly useful, and what this project
+    // wanted to export in the first place. Same wire position/size as
+    // before - a pure "what this byte means" fix, not a layout change.
+    uint8_t  jumpsRemaining;
     uint8_t  groundedState;
     uint8_t  hurtboxState;
     uint16_t hitstunCounter;
@@ -377,7 +384,21 @@ constexpr const char* kSupportedGoodName = "SmashRemix2.0.1";
 // phase - re-record rather than treat as complete. Byte layout unchanged,
 // same class of change as v3->v4. See ReplayMemory::IsHeldItemPosition()'s
 // doc comment.
-constexpr uint32_t kRecorderSchemaVersion = 6;
+// v6 -> v7: PostFrameUpdate.jumpsUsed was read at the wrong width - a u32
+// read at playerStruct+0x148, where the real field (decomp-confirmed) is a
+// single byte (u8); +0x14A-0x14B is padding. On a word-swapped emulator, a
+// *byte* read needs its address XORed with 3 to land correctly - without
+// that, this landed on the padding instead, reading a constant 0 for an
+// entire match, every port, no matter how much jumping happened. Fixed the
+// read width AND switched what gets exported: this field is now
+// jumpsRemaining (jumpsMax, chased from the per-character FTAttributes,
+// minus the corrected jumpsUsed) instead of jumpsUsed directly - more
+// directly useful, and what this project wanted from the start. Same wire
+// position/size (still a u8) - a pure "what this byte means" fix, not a
+// layout change. v6 and earlier files' jumpsUsed byte should be treated as
+// meaningless (it's the constant-0 bug's output, not real data) rather
+// than reinterpreted as anything.
+constexpr uint32_t kRecorderSchemaVersion = 7;
 
 bool IsSupportedGame(void)
 {
@@ -732,7 +753,12 @@ void RecordFrame(const ReplayMemory::MatchInfo& matchInfo)
         post.velocityY               = state.velocityY;
         post.damagePercent            = state.damagePercent;
         post.stocksRemaining           = portInfo.stocksRemaining;
-        post.jumpsUsed                  = static_cast<uint8_t>(state.jumpsUsed);
+        // Clamped rather than a raw cast: state.jumpsRemaining is signed
+        // and defaults to 0 if the FTAttributes pointer chase ever fails,
+        // but could in principle read momentarily negative mid-transition -
+        // wrapping that to a large uint8_t via a raw cast would be actively
+        // misleading, not just imprecise.
+        post.jumpsRemaining             = static_cast<uint8_t>(std::max(0, state.jumpsRemaining));
         post.groundedState               = state.groundedState;
         post.hurtboxState                 = state.hurtboxState;
         post.hitstunCounter                = state.hitstunCounter;

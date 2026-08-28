@@ -50,7 +50,27 @@ constexpr uint32_t PS_FACING_DIRECTION     = 0x44;
 constexpr uint32_t PS_VELOCITY_X           = 0x48;
 constexpr uint32_t PS_VELOCITY_Y           = 0x4C;
 constexpr uint32_t PS_POSITION_PTR         = 0x78;
+// A single byte (u8), NOT a u32 - confirmed via the decomp, where the very
+// next byte (+0x149) is independently named `unk_ft_0x149`, a naming
+// convention that literally encodes its own byte offset. +0x14A-0x14B are
+// padding; +0x14C (PS_KINETIC_STATE, "ga"/Ground-Air bool below) is the
+// next real field. An earlier version of this code read this as a u32,
+// which - on a word-swapped emulator, where a *byte* read needs its
+// address XORed with 3 to land correctly - explains the earlier symptom
+// exactly (a wrong-width/wrong-swizzle read landing on the 0x14A-0x14B
+// padding instead, reading a constant 0 for an entire match, both ports).
+// Resets to 0 on landing, so reading 0 through most of a grounded match is
+// completely normal, not a sign this is still broken.
 constexpr uint32_t PS_JUMPS_USED           = 0x148;
+// FTAttributes* - per-character static move data, cached once per port at
+// match start (jumps_max is per-character, not universal) rather than
+// re-chased every frame. See PS_ATTRIBUTES_PTR's own read site.
+constexpr uint32_t PS_ATTRIBUTES_PTR       = 0x9C8;
+// s32, within FTAttributes - confirmed by two independent sources
+// agreeing: counting FTAttributes' fields in the decomp (all 4-byte, no
+// bitfields/padding) lands on +0x64, and Smash Remix's own ASM
+// independently comments this exact read ("t0 = max jumps").
+constexpr uint32_t FT_ATTR_MAX_JUMPS       = 0x64;
 constexpr uint32_t PS_KINETIC_STATE        = 0x14C;
 constexpr uint32_t PS_PROCESSED_BUTTONS    = 0x1BC;
 constexpr uint32_t PS_STICK_X              = 0x1C2;
@@ -416,7 +436,6 @@ PortPlayerState ReadPortPlayerState(uint32_t matchInfoPtr, int port)
     state.facingDirection        = static_cast<int32_t>(m64p::Core.DebugMemRead32(playerStruct + PS_FACING_DIRECTION));
     state.velocityX               = ReadFloat(playerStruct + PS_VELOCITY_X);
     state.velocityY                = ReadFloat(playerStruct + PS_VELOCITY_Y);
-    state.jumpsUsed                 = m64p::Core.DebugMemRead32(playerStruct + PS_JUMPS_USED);
     state.groundedState              = static_cast<uint8_t>(m64p::Core.DebugMemRead32(playerStruct + PS_KINETIC_STATE));
     state.processedButtons            = m64p::Core.DebugMemRead16(playerStruct + PS_PROCESSED_BUTTONS);
     state.stickX                       = static_cast<int8_t>(m64p::Core.DebugMemRead8(playerStruct + PS_STICK_X));
@@ -433,6 +452,21 @@ PortPlayerState ReadPortPlayerState(uint32_t matchInfoPtr, int port)
     {
         state.positionX = ReadFloat(positionPtr + 0x00);
         state.positionY = ReadFloat(positionPtr + 0x04);
+    }
+
+    // jumps_used resets to 0 on landing and is a per-instance counter, not
+    // per-character, so it's cheap to just read fresh every frame. jumps_max
+    // IS per-character (FTAttributes is shared static move data), so chase
+    // it here rather than hardcoding 2 - Remix also writes jumps_used ==
+    // jumps_max in some places to deliberately exhaust jumps (e.g. certain
+    // up-specials), so jumpsRemaining can legitimately hit 0 without that
+    // many real jump inputs.
+    const uint8_t jumpsUsed = m64p::Core.DebugMemRead8(playerStruct + PS_JUMPS_USED);
+    const uint32_t attributesPtr = m64p::Core.DebugMemRead32(playerStruct + PS_ATTRIBUTES_PTR);
+    if (IsValidRdramPointer(attributesPtr))
+    {
+        const int32_t jumpsMax = static_cast<int32_t>(m64p::Core.DebugMemRead32(attributesPtr + FT_ATTR_MAX_JUMPS));
+        state.jumpsRemaining = jumpsMax - static_cast<int32_t>(jumpsUsed);
     }
 
     return state;

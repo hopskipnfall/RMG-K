@@ -50,7 +50,13 @@ struct PortPlayerState
     float    velocityY;
     float    positionX;
     float    positionY;
-    uint32_t jumpsUsed;
+    // jumpsMax (per-character, from FTAttributes) minus jumps_used
+    // (playerStruct+0x148, a u8 that resets to 0 on landing) - see
+    // ReadPortPlayerState()'s own comments for the read-width bug this
+    // fixed and the two behavioral caveats (0 through most of a grounded
+    // match is normal; Remix can force this to 0 without that many real
+    // jump inputs, e.g. certain up-specials).
+    int32_t  jumpsRemaining;
     uint8_t  groundedState;    // 0 grounded, 1 airborne
     uint16_t processedButtons; // works for human AND CPU ports
     int8_t   stickX;

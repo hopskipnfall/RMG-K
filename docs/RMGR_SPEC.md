@@ -346,7 +346,7 @@ Payload size: **50 bytes.**
 | 0x18   | 4    | `f32`  | `velocityY`             |                                                                        |
 | 0x1C   | 4    | `u32`  | `damagePercent`         | Whole-number percent, as the game itself stores it (not a float).     |
 | 0x20   | 1    | `i8`   | `stocksRemaining`       | 0-based; negative once eliminated.                                    |
-| 0x21   | 1    | `u8`   | `jumpsUsed`             |                                                                        |
+| 0x21   | 1    | `u8`   | `jumpsRemaining`        | Schema v7+. `jumpsMax` (per-character, from `FTAttributes`) minus `jumps_used` (`playerStruct+0x148`, a `u8` that resets to `0` on landing). `0` through most of a grounded match is normal, not a sign of a broken read; Smash Remix can also force this to `0` without that many real jump inputs (e.g. certain up-specials write `jumps_used = jumps_max` directly). Named/interpreted as `jumpsUsed` through schema v6 - that read was at the wrong width (`u32` instead of `u8`, landing on padding on a word-swapped emulator without the byte-read address XOR) and read a constant `0` for an entire match, every port, regardless of real jump activity. **Schema v6 and earlier files' byte here is meaningless - it's that bug's output, not real data.** |
 | 0x22   | 1    | `u8`   | `groundedState`         | `0` grounded, `1` airborne.                                           |
 | 0x23   | 1    | `u8`   | `hurtboxState`          | `0x03` = intangible/invincible; see `ReplayMemory.cpp` for the full set observed. |
 | 0x24   | 2    | `u16`  | `hitstunCounter`        | Non-zero while in hitstun.                                            |
@@ -646,6 +646,21 @@ unchanged — same class of fix as `3`→`4`. **Item `ItemUpdate` data from
 schema `4`/`5` is missing most or all of every thrown/dropped Item's real
 flight and should be re-recorded, not treated as complete** (Weapons are
 unaffected — this check never applied to `linkId == 5`).
+
+Schema `7` fixed `PostFrameUpdate.jumpsUsed`, which every prior schema got
+wrong: it was read as a `u32` at `playerStruct+0x148`, but the real field
+(decomp-confirmed) is a single `u8` there, with `+0x14A`-`0x14B` as padding
+— on a word-swapped emulator, a *byte* read needs its address XORed with
+`3` to land correctly, so the old `u32` read landed on that padding
+instead, reading a constant `0` for an entire match, every port, no matter
+how much jumping happened. Fixed the read width **and** switched what
+gets exported: this field is now `jumpsRemaining` (`jumpsMax`, chased from
+the per-character `FTAttributes`, minus the corrected `jumps_used`)
+instead of `jumpsUsed` directly — more directly useful, and the original
+goal. Same wire position/size (still a `u8`) — a pure "what this byte
+means" fix, not a layout change, same class as `5`→`6`. **Schema `6` and
+earlier files' byte here is meaningless — it's the constant-`0` bug's
+output, not real data.**
 
 ## 6. Byte order and encoding
 
