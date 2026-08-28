@@ -598,10 +598,18 @@ separate axis from the container format itself.
 (replacing `recordedAtEpochSeconds` with `recordedAtEpochMillis` and adding
 `recordedAtNanosOffset` — see below), each a breaking change to files
 already recorded under the prior version (they lack those fields entirely,
-or have them at a different meaning/size) — accepted deliberately every
-time, since no file predating this spec's current form has any external
-consumer yet. A `version 1`, `version 2`, or `version 3` file is not
-expected to parse under this spec.
+or have them at a different meaning/size). `version 1` and `version 2`
+files are not expected to parse under this spec at all — their header
+layouts are missing fields entirely, not just narrower ones, so there's
+nothing valid for a reader to fall back to. **`version 3` is different:**
+a `version 3` file's `recordedAtEpochSeconds` trivially determines what
+`version 4` would have written (`* 1000`, with `recordedAtNanosOffset` a
+correct `0`, since that precision genuinely didn't exist yet) — a reader
+*may* choose to keep parsing `version 3` files on that basis rather than
+rejecting them outright. `rmgr-ts`'s own parser does exactly this (see its
+`MIN_READABLE_FORMAT_VERSION`). This project's own writer (`Replay.cpp`)
+never writes anything below the current `version` regardless - this is a
+reader-side choice only.
 
 **Version `4`** replaced `version 3`'s `recordedAtEpochSeconds` (`u64`,
 whole seconds) with `recordedAtEpochMillis` (`u64`, milliseconds) plus a new
