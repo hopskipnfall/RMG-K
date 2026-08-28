@@ -409,13 +409,20 @@ A **held** Item (e.g. Link's bomb while still in his hand, before it's
 thrown) is not emitted at all: while held, the engine re-parents the
 item's position data onto the holding fighter's hand-bone joint, so it
 stops being a world coordinate and reads as a meaningless local offset
-(typically `(0,0,0)`) — `ITStruct::owner_gobj != NULL` is used as a proxy
-for "currently held" and such objects are skipped (schema v4+; skipped
-because there's nothing meaningful to report until the item is
-thrown/dropped, not because held items don't exist). Weapons are never
-held, so this doesn't apply to `linkId == 5`. Fighters and any other `GObj`
-kind that might appear on either list are also skipped, since the further
-pointer chase below only makes sense for Items/Weapons.
+near `(0,0,0)` instead — "position still reads near `(0,0,0)`" is used as
+a proxy for "currently held" and such objects are skipped (schema v4+;
+skipped because there's nothing meaningful to report until the item is
+thrown/dropped, not because held items don't exist). **Not**
+`ITStruct::owner_gobj != NULL`, despite schema v4/v5's use of exactly that
+proxy: decomp-confirmed (`itMainSetFighterRelease()`) that `owner_gobj` is
+deliberately retained across a throw/drop for later damage/KO attribution
+and is only cleared by a separate, not-always-called function — it reads
+non-NULL for essentially an item's *entire* lifetime, held or not, so it
+never actually distinguished the two states. Schema v6 fixes this — see
+§5. Weapons are never held, so this doesn't apply to `linkId == 5`.
+Fighters and any other `GObj` kind that might appear on either list are
+also skipped, since the further pointer chase below only makes sense for
+Items/Weapons.
 
 Payload size: **25 bytes.**
 
@@ -624,6 +631,21 @@ that a character's hitbox/hurtbox geometry is reliably derivable from
 `(characterId, actionStateId, actionFrameCounter)` alone, stop recording
 it for that character (starting with the original 12, across both
 versions) and compute it instead in a future schema. See §8.
+
+Schema `6` fixed `ReadItemObjects()`'s "currently held" check, which
+schema `4`/`5` got wrong: it used `ITStruct::owner_gobj != NULL` as a
+proxy for "held," but decomp confirms (`itMainSetFighterRelease()`)
+`owner_gobj` is deliberately *retained* across a throw/drop for later
+damage/KO attribution — it's non-NULL for essentially an item's entire
+lifetime, not just while held, so that check silently skipped nearly every
+Item's flight, not just its brief held phase, for every schema `4`/`5`
+file. Fixed by switching to a position-based proxy (still reads near
+`(0,0,0)`, the hand-parented placeholder written while genuinely held —
+see §4.6) that actually flips at the real release moment. Byte layout
+unchanged — same class of fix as `3`→`4`. **Item `ItemUpdate` data from
+schema `4`/`5` is missing most or all of every thrown/dropped Item's real
+flight and should be re-recorded, not treated as complete** (Weapons are
+unaffected — this check never applied to `linkId == 5`).
 
 ## 6. Byte order and encoding
 

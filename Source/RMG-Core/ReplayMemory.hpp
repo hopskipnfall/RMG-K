@@ -218,14 +218,17 @@ PortPlayerState ReadPortPlayerState(uint32_t matchInfoPtr, int port);
 // trusted. A held Item (e.g. Link's bomb while still in his hand) is also
 // skipped: the engine re-parents a held item's DObj onto the holding
 // fighter's hand-bone joint, so its position stops being a world coordinate
-// and reads as a meaningless local offset (typically (0,0,0)) instead -
-// ITStruct::owner_gobj != NULL is used as a proxy for "currently held" (see
-// IT_STRUCT_OWNER_GOBJ in the .cpp). Weapons are never held, so this check
-// doesn't apply to them. Empty if both lists are empty or their head
-// pointers are invalid. Each list's walk is capped at a fixed number of
-// iterations (ITEM_LIST_MAX_OBJECTS in the .cpp) so a corrupt or
-// unexpectedly-cyclic list can never hang recording - it doesn't
-// specifically detect/dedupe a cycle, just guarantees termination.
+// and reads as a meaningless local offset near (0,0,0) instead -
+// IsHeldItemPosition() in the .cpp uses "position still reads near
+// (0,0,0)" as the proxy for "currently held" (NOT ITStruct::owner_gobj,
+// which decomp confirms stays non-NULL for essentially an item's whole
+// lifetime regardless of held/thrown - see that function's doc comment for
+// the full story). Weapons are never held, so this check doesn't apply to
+// them. Empty if both lists are empty or their head pointers are invalid.
+// Each list's walk is capped at a fixed number of iterations
+// (ITEM_LIST_MAX_OBJECTS in the .cpp) so a corrupt or unexpectedly-cyclic
+// list can never hang recording - it doesn't specifically detect/dedupe a
+// cycle, just guarantees termination.
 std::vector<ItemObject> ReadItemObjects(void);
 
 // Reads every currently-active hitbox: 4 fighter slots per seated port

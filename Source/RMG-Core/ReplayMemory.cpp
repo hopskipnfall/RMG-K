@@ -10,6 +10,7 @@
 #include "ReplayMemory.hpp"
 #include "m64p/Api.hpp"
 
+#include <cmath>
 #include <cstring>
 
 namespace
@@ -84,20 +85,41 @@ constexpr uint8_t  GOBJ_LINK_ID_WEAPON  = 5;
 // Both ITStruct and WPStruct happen to place `kind` at the same sub-offset
 // (a coincidence of parallel struct design per the ram-map, not a rule).
 constexpr uint32_t IT_OR_WP_STRUCT_KIND = 0x0C; // s32: ITKind or WPKind, per GOBJ_LINK_ID
-// ITStruct-only (Weapons are never held): GObj* of the fighter currently
-// holding this item, or NULL if it isn't held. Set (together with the real
-// is_hold flag, whose own offset isn't pinned down yet) by the engine's
-// itMainSetFighterHold() whenever a fighter picks an item up (e.g. Link
-// pulling out a bomb). While held, the engine re-parents the item's DObj
-// onto the holding fighter's hand-bone joint, so GOBJ_OBJ_PTR's position
-// stops being a world coordinate and reads as a small/zero local offset
-// instead - using owner_gobj != NULL as a proxy to skip these avoids
-// recording a phantom "item at the stage origin" for every held item. See
-// ram-map.md section 10.4.2.
-constexpr uint32_t IT_STRUCT_OWNER_GOBJ = 0x08;
-constexpr uint32_t DOBJ_POSITION_X      = 0x1C;
-constexpr uint32_t DOBJ_POSITION_Y      = 0x20;
-constexpr uint32_t DOBJ_POSITION_Z      = 0x24;
+constexpr uint32_t DOBJ_POSITION_X = 0x1C;
+constexpr uint32_t DOBJ_POSITION_Y = 0x20;
+constexpr uint32_t DOBJ_POSITION_Z = 0x24;
+
+// ITStruct+0x08 (owner_gobj) is NOT usable to detect "currently held" -
+// confirmed against the decomp's itMainSetFighterRelease(): owner_gobj is
+// deliberately RETAINED across the throw/drop (needed later for damage/KO
+// attribution) and is only cleared by the separate, not-always-called
+// itMainClearOwnerStats(). It's non-NULL for essentially an item's entire
+// lifetime, held or not - an earlier version of this code used
+// `owner_gobj != NULL` as a "currently held" proxy, which silently
+// swallowed every thrown/dropped item for its whole flight (see git
+// history for the investigation). The real per-instance flag
+// (ITStruct.is_hold, a single bit inside a packed bitfield run well past
+// the embedded MPCollData) doesn't have a pinned-down offset yet.
+//
+// What IS available today without new offset work: while held, the engine
+// re-parents the item's DObj onto the holding fighter's hand-bone joint
+// (lbCommonEjectTreeDObj() undoes this exactly once, in the same release
+// function, writing the item's real world coordinates back), so
+// GOBJ_OBJ_PTR's position reads as a small/near-zero local offset instead
+// of a world coordinate for as long as it's held. IsHeldItemPosition()
+// below treats "still reads as ~(0,0,0)" as the proxy for "still held" -
+// imperfect (a genuinely free item passing through world-origin on all
+// three axes simultaneously would be misclassified for that one frame),
+// but unlike the owner_gobj proxy this one actually flips at the right
+// moment. See ram-map.md section 10.4.2.
+constexpr float HELD_ITEM_POSITION_EPSILON = 10.0f;
+
+bool IsHeldItemPosition(float x, float y, float z)
+{
+    return std::fabs(x) < HELD_ITEM_POSITION_EPSILON &&
+        std::fabs(y) < HELD_ITEM_POSITION_EPSILON &&
+        std::fabs(z) < HELD_ITEM_POSITION_EPSILON;
+}
 
 // Slippi caps its own per-frame item event count at 15 (see
 // rmgk-replay-file-agent-prompt.md section 4.4); reused here as a sane
@@ -424,19 +446,28 @@ std::vector<ItemObject> ReadItemObjects(void)
     {
         WalkGObjLinkList(linkId, [&](uint32_t current, uint32_t userData)
         {
-            int32_t kind   = 0;
-            bool    isHeld = false;
+            int32_t kind = 0;
             if (IsValidRdramPointer(userData))
             {
                 kind = static_cast<int32_t>(m64p::Core.DebugMemRead32(userData + IT_OR_WP_STRUCT_KIND));
-
-                if (linkId == GOBJ_LINK_ID_ITEM)
-                {
-                    const uint32_t ownerGobj = m64p::Core.DebugMemRead32(userData + IT_STRUCT_OWNER_GOBJ);
-                    isHeld = IsValidRdramPointer(ownerGobj);
-                }
             }
-            if (isHeld)
+
+            // Position has to be read before the held-item check can even
+            // run (see IsHeldItemPosition's doc comment) - an invalid DObj
+            // pointer means there's no reliable position either way, so
+            // skip the object entirely rather than recording a
+            // meaningless (0,0,0).
+            const uint32_t dObj = m64p::Core.DebugMemRead32(current + GOBJ_OBJ_PTR);
+            if (!IsValidRdramPointer(dObj))
+            {
+                return;
+            }
+
+            const float posX = ReadFloat(dObj + DOBJ_POSITION_X);
+            const float posY = ReadFloat(dObj + DOBJ_POSITION_Y);
+            const float posZ = ReadFloat(dObj + DOBJ_POSITION_Z);
+
+            if (linkId == GOBJ_LINK_ID_ITEM && IsHeldItemPosition(posX, posY, posZ))
             {
                 return;
             }
@@ -445,14 +476,9 @@ std::vector<ItemObject> ReadItemObjects(void)
             object.objectAddress = current;
             object.linkId        = linkId;
             object.kind          = kind;
-
-            const uint32_t dObj = m64p::Core.DebugMemRead32(current + GOBJ_OBJ_PTR);
-            if (IsValidRdramPointer(dObj))
-            {
-                object.positionX = ReadFloat(dObj + DOBJ_POSITION_X);
-                object.positionY = ReadFloat(dObj + DOBJ_POSITION_Y);
-                object.positionZ = ReadFloat(dObj + DOBJ_POSITION_Z);
-            }
+            object.positionX     = posX;
+            object.positionY     = posY;
+            object.positionZ     = posZ;
             objects.push_back(object);
         });
     };

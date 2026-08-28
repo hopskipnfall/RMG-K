@@ -363,7 +363,21 @@ constexpr const char* kSupportedGoodName = "SmashRemix2.0.1";
 // from (characterId, actionStateId, actionFrameCounter) instead. Expect
 // this to shrink again in a future schema once that's confirmed per
 // character.
-constexpr uint32_t kRecorderSchemaVersion = 5;
+// v5 -> v6: ReadItemObjects()'s "currently held" check was wrong -
+// decomp-confirmed (itMainSetFighterRelease()) that ITStruct::owner_gobj is
+// deliberately retained across a throw/drop for later damage/KO
+// attribution, not cleared on release, so `owner_gobj != NULL` was
+// non-NULL for essentially an item's *entire* lifetime and silently
+// swallowed every thrown/dropped Item for its whole flight - not just the
+// brief hand-held window it was meant to skip. Replaced with a position-
+// based proxy (still reads near (0,0,0), the hand-parented placeholder)
+// that actually flips at the release moment. v4/v5 files' Item ItemUpdate
+// data (Weapons unaffected - this check never applied to them) is missing
+// most or all of every thrown/dropped Item's flight, not just its held
+// phase - re-record rather than treat as complete. Byte layout unchanged,
+// same class of change as v3->v4. See ReplayMemory::IsHeldItemPosition()'s
+// doc comment.
+constexpr uint32_t kRecorderSchemaVersion = 6;
 
 bool IsSupportedGame(void)
 {
