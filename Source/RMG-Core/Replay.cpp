@@ -19,6 +19,8 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -35,7 +37,7 @@ namespace
 struct FileHeader
 {
     char     magic[4];     // "RMGR"
-    uint8_t  version;      // 3 - container/framing format only, see docs/RMGR_SPEC.md section 5
+    uint8_t  version;      // 4 - container/framing format only, see docs/RMGR_SPEC.md section 5
     uint8_t  reserved[3];  // zero
     uint32_t streamLength; // 0 while recording, patched to the real value at close
     // v2: which game produced this file, and which revision of this
@@ -47,13 +49,20 @@ struct FileHeader
     // v3" and "SmashRemix2.0.2 schema v1" are unrelated numbering spaces.
     char     goodName[64];           // NUL-padded; not necessarily NUL-terminated if it fills the field. UTF-8.
     uint32_t recorderSchemaVersion;  // see IsSupportedGame()/kRecorderSchemaVersion below
-    // v3: wall-clock time this recording started, independent of the
+    // v3/v4: wall-clock time this recording started, independent of the
     // filename (which is derived from local time - see BuildFileName() -
     // and can't be trusted to round-trip through arbitrary filesystems/
-    // renames the way this field can).
-    uint64_t recordedAtEpochSeconds; // seconds since the Unix epoch (UTC), i.e. what time(nullptr) returns
+    // renames the way this field can). v4 replaced v3's whole-seconds
+    // recordedAtEpochSeconds with recordedAtEpochMillis - see OpenNewFile()
+    // and docs/RMGR_SPEC.md section 5.
+    uint64_t recordedAtEpochMillis;  // milliseconds since the Unix epoch (UTC)
+    // v4: nanosecond offset within recordedAtEpochMillis's millisecond, for
+    // callers with a clock source finer than millisecond resolution - see
+    // OpenNewFile(). 0 when the value being written wasn't read from a
+    // clock directly (e.g. the .krec-derived override path).
+    uint32_t recordedAtNanosOffset;
 };
-static_assert(sizeof(FileHeader) == 88, "FileHeader must be 88 bytes");
+static_assert(sizeof(FileHeader) == 92, "FileHeader must be 92 bytes");
 
 enum class EventCode : uint8_t
 {
@@ -315,10 +324,13 @@ int s_OverrideMatchNumber = 0;
 bool                       s_HasPlayerNamesOverride = false;
 std::array<std::string, 4> s_PlayerNamesOverride;
 
-// Per-session recordedAtEpochSeconds override, set via
+// Per-session recordedAtEpochMillis override, set via
 // Replay::SetRecordedAtBaseOverride(). Applies to every OpenNewFile() call
 // for the rest of this session; cleared at OnEmulationStop() - see that
 // function and SetRecordedAtBaseOverride's own doc comment in Replay.hpp.
+// Still stored as whole seconds - that's all the .krec format this is
+// derived from actually has (see OpenNewFile(), which converts to
+// milliseconds when combining it with the frame-derived offset).
 bool                          s_HasRecordedAtBaseOverride = false;
 uint64_t                      s_RecordedAtBaseEpochSeconds = 0;
 Replay::FrameIndexProvider    s_RecordedAtFrameIndexProvider = nullptr;
@@ -488,9 +500,10 @@ std::string SanitizeForFilename(const std::string& input)
 // same, but YYYYMMDD-HHMMSS (4-digit year, dashed) rather than krec's
 // compact YYMMDDHHMMSS, for a name that reads as a timestamp at a glance.
 // `now` is passed in (rather than this function calling time(nullptr)
-// itself) so the caller can write the exact same instant into the file's
-// own recordedAtEpochSeconds header field - the filename and the header
-// should never disagree about when the recording started.
+// itself) so the caller can derive it from the exact same instant it
+// writes into the file's own recordedAtEpochMillis header field - the
+// filename and the header should never disagree about when the recording
+// started, even though the filename itself is only second-resolution.
 std::string BuildFileName(time_t now)
 {
     tm localNow{};
@@ -563,22 +576,41 @@ bool OpenNewFile(const ReplayMemory::MatchInfo& matchInfo)
     s_FrameNumber = 0;
     s_StreamBytesWritten = 0;
 
-    // Default: live recording, stamped with wall-clock "now". Headless
+    // Default: live recording, stamped with wall-clock "now" - read from
+    // system_clock (not time(nullptr)) so recordedAtEpochMillis/
+    // recordedAtNanosOffset below get real sub-second precision. Headless
     // .krec export overrides this (see SetRecordedAtBaseOverride's doc
     // comment) so the file reflects the match's *original* recording time
     // rather than when the headless replay (which can run at up to 2000%
-    // speed) happened to reach it.
-    time_t now;
+    // speed) happened to reach it - that path has no sub-millisecond
+    // information to offer, so recordedAtNanosOffset is always 0 for it.
+    std::chrono::system_clock::time_point nowTimePoint;
+    uint32_t                              nowNanosOffset = 0;
     if (s_HasRecordedAtBaseOverride)
     {
         const int elapsedFrames = s_RecordedAtFrameIndexProvider != nullptr ? s_RecordedAtFrameIndexProvider() : 0;
-        const uint64_t elapsedSeconds = static_cast<uint64_t>(elapsedFrames) / 60; // assumes a constant 60fps original recording
-        now = static_cast<time_t>(s_RecordedAtBaseEpochSeconds + elapsedSeconds);
+        // Milliseconds, not truncated whole seconds, so multiple matches
+        // recorded from the same .krec land at distinguishable,
+        // frame-accurate (~16.67ms) offsets from krecBaseEpochSeconds
+        // instead of all bucketing into whichever whole second they
+        // happened to start in.
+        const int64_t elapsedMillis = static_cast<int64_t>(std::llround(elapsedFrames * 1000.0 / 60.0));
+        const int64_t baseMillis = static_cast<int64_t>(s_RecordedAtBaseEpochSeconds) * 1000;
+        nowTimePoint = std::chrono::system_clock::time_point(
+            std::chrono::milliseconds(baseMillis) + std::chrono::milliseconds(elapsedMillis));
     }
     else
     {
-        now = time(nullptr);
+        nowTimePoint = std::chrono::system_clock::now();
+        const auto sinceEpoch = nowTimePoint.time_since_epoch();
+        nowNanosOffset = static_cast<uint32_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(sinceEpoch).count() % 1'000'000);
     }
+    const uint64_t nowEpochMillis = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(nowTimePoint.time_since_epoch()).count());
+    // BuildFileName()'s date part is still just local wall-clock seconds -
+    // see docs/RMGR_SPEC.md section 3.4.
+    const time_t now = static_cast<time_t>(nowEpochMillis / 1000);
     std::filesystem::path path;
     if (s_HasOutputPathOverride)
     {
@@ -625,7 +657,7 @@ bool OpenNewFile(const ReplayMemory::MatchInfo& matchInfo)
 
     FileHeader header{};
     std::memcpy(header.magic, "RMGR", 4);
-    header.version = 3;
+    header.version = 4;
     header.streamLength = 0;
     // Reaching here already implies IsSupportedGame() was true (see
     // OnEmulationStart()), so this is just re-fetching the same value to
@@ -634,7 +666,8 @@ bool OpenNewFile(const ReplayMemory::MatchInfo& matchInfo)
     CoreGetCurrentRomSettings(romSettings);
     WriteFixedString(header.goodName, sizeof(header.goodName), romSettings.GoodName);
     header.recorderSchemaVersion = kRecorderSchemaVersion;
-    header.recordedAtEpochSeconds = static_cast<uint64_t>(now);
+    header.recordedAtEpochMillis = nowEpochMillis;
+    header.recordedAtNanosOffset = nowNanosOffset;
     s_File.write(reinterpret_cast<const char*>(&header), sizeof(header));
 
     WriteEventPayloadsEvent();

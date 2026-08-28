@@ -1,6 +1,6 @@
 # RMG-K Replay File Format (`.rmgr`) — Specification
 
-**Status:** format version `3`, implemented in `Source/RMG-Core/Replay.cpp` /
+**Status:** format version `4`, implemented in `Source/RMG-Core/Replay.cpp` /
 `Source/RMG-Core/ReplayMemory.cpp` on the `feature/replay-file-format` branch.
 
 **Target game:** Super Smash Bros. (N64) — Smash Remix 2.0.1. The container
@@ -73,7 +73,7 @@ several of Slippi's choices. See §2.
 
 ```
 +----------------+----------------------------------------+
-| File Header    | 88 bytes, fixed                         |
+| File Header    | 92 bytes, fixed                         |
 +----------------+----------------------------------------+
 | Event Stream   | variable length, sequence of events      |
 |                | (EventPayloads, then GameStart, then     |
@@ -87,17 +87,18 @@ of any kind — the event stream *is* the rest of the file, up to
 `streamLength` bytes (§3.1) after the header, or up to EOF for a file whose
 recording session never cleanly finished.
 
-### 3.1 File header (88 bytes)
+### 3.1 File header (92 bytes)
 
 | Offset | Size | Type       | Field                  | Notes                                                  |
 |-------:|-----:|------------|------------------------|---------------------------------------------------------|
 | 0x00   | 4    | `char[4]`  | `magic`                | Always the ASCII bytes `R`, `M`, `G`, `R` (no NUL).      |
-| 0x04   | 1    | `u8`       | `version`               | Format version. `3` for everything described here.      |
+| 0x04   | 1    | `u8`       | `version`               | Format version. `4` for everything described here.      |
 | 0x05   | 3    | `u8[3]`    | `reserved`              | Always zero. Reserved for future header fields.          |
 | 0x08   | 4    | `u32`      | `streamLength`          | Byte length of the event stream that follows the header. |
 | 0x0C   | 64   | `char[64]` | `goodName`              | The recorded ROM's `GoodName` (mupen64plus-core's ROM database identity string), UTF-8, NUL-padded — not necessarily NUL-terminated if it fills the field. Truncated if longer than 64 bytes. |
 | 0x4C   | 4    | `u32`      | `recorderSchemaVersion` | This recorder's revision of its own understanding of `goodName`'s memory layout — see §3.3. |
-| 0x50   | 8    | `u64`      | `recordedAtEpochSeconds`| Wall-clock time the recording started, seconds since the Unix epoch (UTC) — what `time(nullptr)` returns. Independent of the filename's timestamp (§3.4), though the recorder writes the same instant to both. |
+| 0x50   | 8    | `u64`      | `recordedAtEpochMillis` | Wall-clock time the recording started, **milliseconds** since the Unix epoch (UTC) — from `std::chrono::system_clock`. Independent of the filename's timestamp (§3.4), though the recorder writes the same instant to both (truncated to whole seconds there — see §3.4). |
+| 0x58   | 4    | `u32`      | `recordedAtNanosOffset`| Nanosecond offset *within* `recordedAtEpochMillis`'s millisecond — i.e. `recordedAtEpochMillis * 1_000_000 + recordedAtNanosOffset` is the full-precision epoch time in nanoseconds, for callers that want to align multiple recordings from the same session more precisely than a millisecond. Range `0`-`999999`. Best-effort: written as `0` whenever the value being written doesn't come from a clock read directly (see §3.4's headless-export path) — readers should treat `0` as "no sub-millisecond precision available," not literally "exactly on the millisecond boundary." |
 
 **`streamLength` is written as `0` when the file is opened**, and is the
 *only* field patched after the fact: once the match ends (or is otherwise
@@ -180,14 +181,15 @@ was produced by the same game and recorder revision it was built against.
 ### 3.4 Filename convention
 
 Not part of the on-disk format itself (a reader must not depend on it — the
-header's own `recordedAtEpochSeconds` is the source of truth for when a
+header's own `recordedAtEpochMillis` is the source of truth for when a
 recording started, precisely because filenames get renamed/copied/re-shared
 and can't be trusted), but the recorder names files
 `YYYYMMDD-HHMMSS[-Player1][-Player2]...rmgr` — 4-digit year, 24-hour clock,
 local time, one hyphen-joined segment per seated player's name (each capped
 at 24 characters, filesystem-unsafe characters replaced with `_`). The
-timestamp reflects the same instant written to `recordedAtEpochSeconds`,
-just rendered as local wall-clock time instead of a UTC epoch value.
+timestamp reflects the same instant written to `recordedAtEpochMillis`,
+just truncated to whole seconds and rendered as local wall-clock time
+instead of a UTC epoch value.
 
 If that name is already taken (e.g. two matches recorded within the same
 second), the recorder appends `-2`, `-3`, ... before the extension until it
@@ -202,18 +204,25 @@ its own explicitly-numbered file from that base: `<krec name>-1.rmgr`,
 The same collision-avoidance above still applies on top, e.g. if the same
 `.krec` is exported a second time.
 
-For this headless export path, `recordedAtEpochSeconds` is **not** wall-clock
+For this headless export path, `recordedAtEpochMillis` is **not** wall-clock
 export time (headless replay can run at up to 2000% speed, so that would
 reflect when the export happened to reach that match, not when it was
 originally played). Instead it's derived from the source `.krec`'s own
 recording-start timestamp (that file's header, or a filename-derived
 fallback if the header's is missing/zero - see
-`KailleraExport::ParseKrecFile()`), plus how many of the `.krec`'s own input
-frames have been consumed by the time that match is reached, divided by 60
-under the assumption that the original recording ran at a constant 60fps
-(true for any real Kaillera session) - see
-`Replay::SetRecordedAtBaseOverride()`. The exported filename itself is still
-just `<krec name>-N.rmgr` as above, not timestamp-based, for this path.
+`KailleraExport::ParseKrecFile()`, still only second-resolution — that's an
+external, third-party format this project doesn't control), plus how many
+of the `.krec`'s own input frames have been consumed by the time that match
+is reached, converted to milliseconds (`elapsedFrames * 1000 / 60`, rounded
+to the nearest millisecond) under the assumption that the original
+recording ran at a constant 60fps (true for any real Kaillera session) -
+see `Replay::SetRecordedAtBaseOverride()`. This gives frame-accurate
+(~16.67ms) relative offsets between matches recorded from the same
+multi-game `.krec`, even though the *base* instant they're offset from is
+still only second-accurate. `recordedAtNanosOffset` is always `0` for this
+path — there's no sub-millisecond information to derive it from. The
+exported filename itself is still just `<krec name>-N.rmgr` as above, not
+timestamp-based, for this path.
 
 ## 4. Events
 
@@ -577,7 +586,7 @@ Two independent mechanisms, matching §4.6 of the original design rationale:
   recognize looks up its declared size in `EventPayloads` and skips exactly
   that many bytes, then continues from the next event.
 
-`FileHeader.version` (currently `3`) is reserved for a breaking change to
+`FileHeader.version` (currently `4`) is reserved for a breaking change to
 the *header* or the overall framing itself — not for anything the two
 mechanisms above already cover, and not for tracking which game/ROM
 produced a file or how that recorder's understanding of it has evolved
@@ -585,12 +594,26 @@ either — that's `goodName`/`recorderSchemaVersion` (§3.3), a deliberately
 separate axis from the container format itself.
 
 **Compatibility note:** `version` jumped `1` → `2` (adding `goodName` and
-`recorderSchemaVersion`) → `3` (adding `recordedAtEpochSeconds`), each a
-breaking change to files already recorded under the prior version (they
-lack those fields entirely, at a different header size) — accepted
-deliberately both times, since no file predating this spec's current form
-has any external consumer yet. A `version 1` or `version 2` file is not
+`recorderSchemaVersion`) → `3` (adding `recordedAtEpochSeconds`) → `4`
+(replacing `recordedAtEpochSeconds` with `recordedAtEpochMillis` and adding
+`recordedAtNanosOffset` — see below), each a breaking change to files
+already recorded under the prior version (they lack those fields entirely,
+or have them at a different meaning/size) — accepted deliberately every
+time, since no file predating this spec's current form has any external
+consumer yet. A `version 1`, `version 2`, or `version 3` file is not
 expected to parse under this spec.
+
+**Version `4`** replaced `version 3`'s `recordedAtEpochSeconds` (`u64`,
+whole seconds) with `recordedAtEpochMillis` (`u64`, milliseconds) plus a new
+trailing `recordedAtNanosOffset` (`u32`) field — see §3.1. Motivation:
+second-resolution timestamps aren't enough to line up multiple `.rmgr`
+recordings from the same session (e.g. several matches played back to back,
+or multiple local recordings of the same netplay match) against each other
+or against other capture streams (video, `.krec`) with any real precision.
+The header grew from 88 to 92 bytes as a result — a genuine breaking change
+to the fixed-size header, not something the field-append mechanism above
+could cover, since that mechanism only applies to event *payloads*, not the
+header itself.
 
 **Recorder schema history, for `SmashRemix2.0.1`** (§3.3's separate,
 non-breaking axis): schema `1` is the original event set described above.

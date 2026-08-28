@@ -91,25 +91,31 @@ void SetOutputPathOverride(const std::string& path);
 // into an unrelated later session.
 void SetPlayerNamesOverride(const std::array<std::string, 4>& names);
 
-// Per-session override for how OpenNewFile() derives recordedAtEpochSeconds,
+// Per-session override for how OpenNewFile() derives recordedAtEpochMillis,
 // for headless/offline .krec export tooling. Without this, OpenNewFile()
-// stamps every match with time(nullptr) at the moment the headless replay
-// reaches it - which, since headless replay runs at up to 2000% speed (see
-// ReplayFileExport.cpp), reflects when the *export* happened to reach that
-// match, not when it was originally played, and drifts further from the
-// truth with every match in a multi-game .krec.
+// stamps every match with the wall-clock time it reaches it - which, since
+// headless replay runs at up to 2000% speed (see ReplayFileExport.cpp),
+// reflects when the *export* happened to reach that match, not when it was
+// originally played, and drifts further from the truth with every match in
+// a multi-game .krec.
 //
 // `krecBaseEpochSeconds` is the source .krec's own recording-start
 // timestamp (its header's timestamp field, or a filename-derived fallback -
-// see KailleraExport::ParseKrecFile). `frameIndexProvider` is called fresh
+// see KailleraExport::ParseKrecFile) - still whole seconds, since that's
+// all the .krec format itself stores. `frameIndexProvider` is called fresh
 // every time OpenNewFile() runs for the rest of this session; its return
 // value is how many of the .krec's own input frames have been consumed so
 // far (see KailleraExport::GetPifReplayFrameIndex()) - assuming the
-// original recording ran at a constant 60fps, dividing that by 60 gives the
-// real-world seconds elapsed since the .krec began, which OpenNewFile()
-// adds to krecBaseEpochSeconds to derive that specific match's
-// recordedAtEpochSeconds. A null frameIndexProvider is treated as "0 frames
-// elapsed" (i.e. every match gets krecBaseEpochSeconds itself).
+// original recording ran at a constant 60fps, converting that to
+// milliseconds (elapsedFrames * 1000 / 60, rounded to the nearest
+// millisecond) gives a frame-accurate offset from krecBaseEpochSeconds,
+// which OpenNewFile() adds (after converting the base to milliseconds) to
+// derive that specific match's recordedAtEpochMillis. A null
+// frameIndexProvider is treated as "0 frames elapsed" (i.e. every match
+// gets krecBaseEpochSeconds itself, converted to milliseconds).
+// recordedAtNanosOffset is always written as 0 for matches recorded via
+// this override - there's no sub-millisecond information to derive it
+// from.
 //
 // Cleared at OnEmulationStop(), same as the two overrides above - a launch
 // path that never calls this always falls through to time(nullptr), and a
