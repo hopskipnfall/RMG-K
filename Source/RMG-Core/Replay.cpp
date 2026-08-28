@@ -69,6 +69,12 @@ enum class EventCode : uint8_t
     // v3: emitted only on frames where at least one tracked stage hazard is
     // active. See StageHazardUpdateEvent below.
     StageHazardUpdate = 0x07,
+    // v5: one per currently-active hitbox slot, per frame. See
+    // HitboxUpdateEvent below.
+    HitboxUpdate      = 0x08,
+    // v5: one per fighter hurtbox slot, per seated port, per frame. See
+    // HurtboxUpdateEvent below.
+    HurtboxUpdate     = 0x09,
 };
 
 struct GameStartPortInfo
@@ -190,6 +196,66 @@ static_assert(sizeof(StageHazardUpdateEvent) == 5, "StageHazardUpdateEvent must 
 
 constexpr uint8_t kHazardFlagWhispyBlowing = 0x01;
 
+// v5 new event type: one per currently-active hitbox slot (a fighter's own
+// attack, or an item's/weapon's), per frame - zero or more of these follow
+// that frame's ItemUpdate/StageHazardUpdate events, same sparse convention
+// (a disabled slot is never emitted). See ReplayMemory::HitboxObject's own
+// doc comment for the confidence caveat on Item/Weapon offsets, and
+// docs/RMGR_SPEC.md section 4.8.
+//
+// This is deliberately verbose (every active slot, every frame) rather than
+// deduplicated - the plan is to record exhaustively for now and, once
+// hitbox/hurtbox geometry is shown to be reliably derivable from
+// (characterId, actionStateId, actionFrameCounter) alone for a given
+// character, stop recording it for that character and compute it instead.
+struct HitboxUpdateEvent
+{
+    int32_t  frame;
+    uint8_t  ownerKind;   // 0 = Fighter, 1 = Item, 2 = Weapon - see ReplayMemory::HitboxObject
+    uint32_t ownerId;     // Fighter: port (0-3). Item/Weapon: GObj address, correlates with that frame's ItemUpdate.objectAddress
+    uint8_t  slotIndex;   // Fighter: 0-3. Item/Weapon: 0-1.
+    uint8_t  attackState; // 1 fresh, 2 transfer, 3 interpolate - never 0 (disabled slots aren't emitted)
+    int32_t  damage;
+    float    positionX;   // world-space, already transformed
+    float    positionY;
+    float    positionZ;
+    float    size;        // radius - hitboxes are spheres, not boxes
+    int32_t  angle;
+    int32_t  knockbackScale;
+    int32_t  knockbackWeight;
+    int32_t  knockbackBase;
+    int32_t  element;
+    int32_t  shieldDamage;
+};
+static_assert(sizeof(HitboxUpdateEvent) == 55, "HitboxUpdateEvent must be 55 bytes");
+
+// v5 new event type: one per fighter hurtbox slot (11 per seated port), per
+// frame - see ReplayMemory::HurtboxObject's own doc comment, including the
+// approximation noted for positionX/Y/Z, and docs/RMGR_SPEC.md section 4.9.
+// Unlike ItemUpdate/HitboxUpdate this isn't sparse - a seated port's 11
+// slots are (almost) always all present, since hurtboxes exist essentially
+// continuously while a fighter is alive. See HitboxUpdateEvent's doc
+// comment above for why this verbosity is intentional for now.
+struct HurtboxUpdateEvent
+{
+    int32_t  frame;
+    uint8_t  port;
+    uint8_t  slotIndex;   // 0-10
+    int32_t  hitStatus;   // per-bone Vulnerable/Invincible/Intangible - raw value, see ReplayMemory::HurtboxObject
+    int32_t  placement;   // 0 low, 1 middle, 2 high
+    uint8_t  isGrabbable;
+    float    positionX;   // APPROXIMATION - the bone's own joint position, not the true transformed hurtbox center
+    float    positionY;
+    float    positionZ;
+    float    offsetX;     // authored, bone-relative, untransformed
+    float    offsetY;
+    float    offsetZ;
+    float    sizeX;       // anisotropic - a Vec3f, not a single radius like a hitbox
+    float    sizeY;
+    float    sizeZ;
+};
+static_assert(sizeof(HurtboxUpdateEvent) == 51, "HurtboxUpdateEvent must be 51 bytes");
+
 #pragma pack(pop)
 
 enum class State
@@ -203,6 +269,12 @@ State         s_State = State::Idle;
 std::ofstream s_File;
 int32_t       s_FrameNumber = 0;
 uint32_t      s_StreamBytesWritten = 0;
+// Set once per session in OnEmulationStart() from
+// SettingsID::GameStats_RecordHitboxData (off by default) - gates
+// HitboxUpdate/HurtboxUpdate in RecordFrame() only; every other event type
+// is unaffected. See that setting's own doc comment in Settings.hpp for why
+// this exists as a separate opt-in from GameStats_ReplayEnabled itself.
+bool s_RecordHitboxData = false;
 
 // Guards s_State/s_File (and, transitively, everything the helpers below
 // touch). OnFrame() runs on the emulation thread while OnEmulationStop()
@@ -274,7 +346,24 @@ constexpr const char* kSupportedGoodName = "SmashRemix2.0.1";
 // further pointer chase through ITStruct/WPStruct. v2 files' ItemUpdate
 // data should be treated as garbage, not just "coarser." Also added
 // StageHazardUpdate (Whispy Woods' wind on Dream Land).
-constexpr uint32_t kRecorderSchemaVersion = 3;
+// v3 -> v4: ReadItemObjects() was walking only the Item list
+// (gGCCommonLinks[4]) - Weapons (fireballs, boomerang, charge shot, PK
+// Fire/Thunder, ...) live on a separate list (gGCCommonLinks[5]) that was
+// never actually reached, so no v3 file ever contains a real Weapon
+// ItemUpdate despite the wire format supporting linkId == 5. Also, held
+// Items (e.g. Link's bomb while still in his hand) were being recorded with
+// a meaningless re-parented position (typically (0,0,0)) instead of being
+// skipped. Byte layout is unchanged from v3 - this is a pure "which objects
+// get emitted" fix, same class of change as the v2->v3 bump. See
+// ReplayMemory::ReadItemObjects()'s doc comment.
+// v4 -> v5: added HitboxUpdate and HurtboxUpdate (docs/RMGR_SPEC.md section
+// 5/4.8/4.9) - deliberately verbose (every active hitbox slot and every
+// hurtbox slot, every frame) for now, to exhaustively capture real data
+// before it's known whether hitbox/hurtbox geometry can be derived purely
+// from (characterId, actionStateId, actionFrameCounter) instead. Expect
+// this to shrink again in a future schema once that's confirmed per
+// character.
+constexpr uint32_t kRecorderSchemaVersion = 5;
 
 bool IsSupportedGame(void)
 {
@@ -319,12 +408,14 @@ void WriteEventPayloadsEvent(void)
         {EventCode::PreFrame,   static_cast<uint16_t>(sizeof(PreFrameEvent))},
         {EventCode::PostFrame,  static_cast<uint16_t>(sizeof(PostFrameEvent))},
         {EventCode::GameEnd,    static_cast<uint16_t>(sizeof(GameEndEvent))},
-        // v2/v3 additions (docs/RMGR_SPEC.md section 5) - an old parser that
-        // reads `count` dynamically and skips codes it doesn't recognize
-        // (exactly what this declared-size mechanism exists for) still
-        // parses a file with these extra entries correctly.
+        // v2/v3/v5 additions (docs/RMGR_SPEC.md section 5) - an old parser
+        // that reads `count` dynamically and skips codes it doesn't
+        // recognize (exactly what this declared-size mechanism exists for)
+        // still parses a file with these extra entries correctly.
         {EventCode::ItemUpdate,        static_cast<uint16_t>(sizeof(ItemUpdateEvent))},
         {EventCode::StageHazardUpdate, static_cast<uint16_t>(sizeof(StageHazardUpdateEvent))},
+        {EventCode::HitboxUpdate,      static_cast<uint16_t>(sizeof(HitboxUpdateEvent))},
+        {EventCode::HurtboxUpdate,     static_cast<uint16_t>(sizeof(HurtboxUpdateEvent))},
     };
 
     uint8_t codeByte = static_cast<uint8_t>(EventCode::EventPayloads);
@@ -671,6 +762,65 @@ void RecordFrame(const ReplayMemory::MatchInfo& matchInfo)
         WriteEvent(EventCode::StageHazardUpdate, hazardEvent);
     }
 
+    // HitboxUpdate/HurtboxUpdate - gated behind
+    // SettingsID::GameStats_RecordHitboxData (off by default): both are
+    // deliberately verbose (every active hitbox slot, and literally every
+    // hurtbox slot, every frame - see HurtboxUpdateEvent's own doc comment)
+    // and dominate a .rmgr file's size when on. Skipping the read entirely
+    // when off, not just the write, since ReplayMemory::ReadHitboxes()/
+    // ReadHurtboxes() aren't free (multiple pointer chases per port/slot).
+    if (s_RecordHitboxData)
+    {
+        // HitboxUpdate - one per currently-active hitbox slot (see
+        // docs/RMGR_SPEC.md section 4.8). Sparse like ItemUpdate: a
+        // disabled slot is never written.
+        for (const ReplayMemory::HitboxObject& hitbox : ReplayMemory::ReadHitboxes(matchInfo.matchInfoPtr))
+        {
+            HitboxUpdateEvent hitboxEvent{};
+            hitboxEvent.frame           = s_FrameNumber;
+            hitboxEvent.ownerKind       = hitbox.ownerKind;
+            hitboxEvent.ownerId         = hitbox.ownerId;
+            hitboxEvent.slotIndex       = hitbox.slotIndex;
+            hitboxEvent.attackState     = hitbox.attackState;
+            hitboxEvent.damage          = hitbox.damage;
+            hitboxEvent.positionX       = hitbox.positionX;
+            hitboxEvent.positionY       = hitbox.positionY;
+            hitboxEvent.positionZ       = hitbox.positionZ;
+            hitboxEvent.size            = hitbox.size;
+            hitboxEvent.angle           = hitbox.angle;
+            hitboxEvent.knockbackScale  = hitbox.knockbackScale;
+            hitboxEvent.knockbackWeight = hitbox.knockbackWeight;
+            hitboxEvent.knockbackBase   = hitbox.knockbackBase;
+            hitboxEvent.element         = hitbox.element;
+            hitboxEvent.shieldDamage    = hitbox.shieldDamage;
+            WriteEvent(EventCode::HitboxUpdate, hitboxEvent);
+        }
+
+        // HurtboxUpdate - one per fighter hurtbox slot, per seated port
+        // (see docs/RMGR_SPEC.md section 4.9). NOT sparse like the events
+        // above - see HurtboxUpdateEvent's own doc comment for why.
+        for (const ReplayMemory::HurtboxObject& hurtbox : ReplayMemory::ReadHurtboxes(matchInfo.matchInfoPtr))
+        {
+            HurtboxUpdateEvent hurtboxEvent{};
+            hurtboxEvent.frame       = s_FrameNumber;
+            hurtboxEvent.port        = hurtbox.port;
+            hurtboxEvent.slotIndex   = hurtbox.slotIndex;
+            hurtboxEvent.hitStatus   = hurtbox.hitStatus;
+            hurtboxEvent.placement   = hurtbox.placement;
+            hurtboxEvent.isGrabbable = hurtbox.isGrabbable ? 1 : 0;
+            hurtboxEvent.positionX   = hurtbox.positionX;
+            hurtboxEvent.positionY   = hurtbox.positionY;
+            hurtboxEvent.positionZ   = hurtbox.positionZ;
+            hurtboxEvent.offsetX     = hurtbox.offsetX;
+            hurtboxEvent.offsetY     = hurtbox.offsetY;
+            hurtboxEvent.offsetZ     = hurtbox.offsetZ;
+            hurtboxEvent.sizeX       = hurtbox.sizeX;
+            hurtboxEvent.sizeY       = hurtbox.sizeY;
+            hurtboxEvent.sizeZ       = hurtbox.sizeZ;
+            WriteEvent(EventCode::HurtboxUpdate, hurtboxEvent);
+        }
+    }
+
     s_FrameNumber++;
 }
 } // namespace
@@ -715,6 +865,11 @@ CORE_EXPORT void OnEmulationStart(void)
             "Replay: enabled, but the loaded ROM isn't Smash Remix 2.0.1 - not recording");
         enabled = false;
     }
+
+    // Only meaningful when replay recording itself is enabled - no override
+    // mechanism needed for this one (unlike `enabled` above), so this is a
+    // plain per-session settings read.
+    s_RecordHitboxData = enabled && CoreSettingsGetBoolValue(SettingsID::GameStats_RecordHitboxData);
 
     s_State = enabled ? State::WaitingForMatch : State::Idle;
     if (enabled)

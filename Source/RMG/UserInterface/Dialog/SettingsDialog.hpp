@@ -145,6 +145,7 @@ class SettingsDialog : public QDialog, private Ui::SettingsDialog
     void setIconsForEmulationInfoText(void);
     void hideEmulationInfoText(void);
     void updateKailleraRecordingCapControls(void);
+    void updateKailleraReplayHitboxControls(void);
     void updateOSDSettingsEnabledState(void);
 
     void chooseDirectory(QLineEdit *, QString caption);
@@ -166,6 +167,7 @@ class SettingsDialog : public QDialog, private Ui::SettingsDialog
     void on_changeKailleraRecordsDirectoryButton_clicked(void);
     void on_kailleraRecordByDefaultCheckBox_toggled(bool checked);
     void on_kailleraRecordingCapEnabledCheckBox_toggled(bool checked);
+    void on_kailleraReplayByDefaultCheckBox_toggled(bool checked);
 
     void on_changeBackgroundColorButton_clicked(void);
     void on_changeTextColorButton_clicked(void);

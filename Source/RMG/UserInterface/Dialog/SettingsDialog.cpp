@@ -851,13 +851,18 @@ void SettingsDialog::load64DDSettings(void)
 #ifdef RMGK_GAME_STATS
     this->kailleraReplayByDefaultCheckBox->setChecked(
         CoreSettingsGetBoolValue(SettingsID::GameStats_ReplayEnabled));
+    this->kailleraReplayHitboxesCheckBox->setChecked(
+        CoreSettingsGetBoolValue(SettingsID::GameStats_RecordHitboxData));
 #else
     this->kailleraReplayByDefaultCheckBox->setChecked(false);
     this->kailleraReplayByDefaultCheckBox->setEnabled(false);
     this->kailleraReplayByDefaultCheckBox->setToolTip(
         "This build was compiled without GAME_STATS support (-DGAME_STATS=ON), "
         "so replay recording is unavailable.");
+    this->kailleraReplayHitboxesCheckBox->setChecked(false);
+    this->kailleraReplayHitboxesCheckBox->setEnabled(false);
 #endif
+    this->updateKailleraReplayHitboxControls();
     this->kailleraPortSpinBox->setValue(kailleraPort);
     this->kailleraRecordsDirectoryLineEdit->setProperty("rawPath", recordsDirectoryRaw);
     this->kailleraRecordsDirectoryLineEdit->setText(getDisplayDirectoryPath(recordsDirectoryRaw));
@@ -1127,7 +1132,10 @@ void SettingsDialog::loadDefault64DDSettings(void)
 #ifdef RMGK_GAME_STATS
     this->kailleraReplayByDefaultCheckBox->setChecked(
         CoreSettingsGetDefaultBoolValue(SettingsID::GameStats_ReplayEnabled));
+    this->kailleraReplayHitboxesCheckBox->setChecked(
+        CoreSettingsGetDefaultBoolValue(SettingsID::GameStats_RecordHitboxData));
 #endif
+    this->updateKailleraReplayHitboxControls();
     this->kailleraPortSpinBox->setValue(kailleraPort);
     this->kailleraRecordsDirectoryLineEdit->setProperty("rawPath", recordsDirectoryRaw);
     this->kailleraRecordsDirectoryLineEdit->setText(getDisplayDirectoryPath(recordsDirectoryRaw));
@@ -1424,6 +1432,7 @@ void SettingsDialog::save64DDSettings(void)
     CoreSettingsSetValue(SettingsID::Kaillera_RecordingEnabled, this->kailleraRecordByDefaultCheckBox->isChecked());
 #ifdef RMGK_GAME_STATS
     CoreSettingsSetValue(SettingsID::GameStats_ReplayEnabled, this->kailleraReplayByDefaultCheckBox->isChecked());
+    CoreSettingsSetValue(SettingsID::GameStats_RecordHitboxData, this->kailleraReplayHitboxesCheckBox->isChecked());
 #endif
     CoreSettingsSetValue(SettingsID::Kaillera_Port, this->kailleraPortSpinBox->value());
     CoreSettingsSetValue(SettingsID::Kaillera_RecordsDirectory, recordsDirectory);
@@ -1838,6 +1847,14 @@ void SettingsDialog::updateKailleraRecordingCapControls(void)
     this->kailleraRecordingCapMBSpinBox->setEnabled(recordingByDefault && capEnabled);
 }
 
+void SettingsDialog::updateKailleraReplayHitboxControls(void)
+{
+#ifdef RMGK_GAME_STATS
+    this->kailleraReplayHitboxesCheckBox->setEnabled(
+        this->kailleraReplayByDefaultCheckBox->isChecked());
+#endif
+}
+
 void SettingsDialog::updateOSDSettingsEnabledState(void)
 {
     const bool osdEnabled = this->osdEnabledCheckBox->isChecked();
@@ -2068,6 +2085,12 @@ void SettingsDialog::on_kailleraRecordingCapEnabledCheckBox_toggled(bool checked
 {
     (void)checked;
     this->updateKailleraRecordingCapControls();
+}
+
+void SettingsDialog::on_kailleraReplayByDefaultCheckBox_toggled(bool checked)
+{
+    (void)checked;
+    this->updateKailleraReplayHitboxControls();
 }
 
 void SettingsDialog::on_changeBackgroundColorButton_clicked(void)

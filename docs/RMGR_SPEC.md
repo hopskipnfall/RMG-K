@@ -140,8 +140,10 @@ event — so a reader must not assume every frame has all four ports present,
 and must not assume a fixed number of events per frame.
 
 That same frame N is then followed by zero or more `ItemUpdate` events, one
-per Item/Weapon object currently live on the shared `GObj` list (§4.6) —
-zero if none are live this frame, again never a zeroed/dummy event. After
+per Item/Weapon `GObj` currently live and not currently held by a fighter
+(§4.6) — zero if none are live this frame, again never a zeroed/dummy event.
+Items and Weapons live on two separate `GObj` lists, not one shared list
+(§4.6/§7.6). After
 those, zero or one `StageHazardUpdate` event (§4.7) — written only if at
 least one tracked hazard is currently active. A reader correlates both
 event types to a frame via their own `frame` field, the same way it
@@ -241,8 +243,9 @@ and 5 bytes respectively (`GameStart` grew from its original 150 bytes and
 `PostFrameUpdate` from its original 42 bytes via the field-append mechanism
 in §5; see §4.2/§4.4's notes on that). Recorder schema v2 (§3.3) declares a
 5th entry, `ItemUpdate` (§4.6); schema v3 declares a 6th, `StageHazardUpdate`
-(§4.7) — both new event types, not field appends, per §5's second
-mechanism. A future format version could declare still more entries or the
+(§4.7); schema v5 declares a 7th and 8th, `HitboxUpdate` (§4.8) and
+`HurtboxUpdate` (§4.9) — all new event types, not field appends, per §5's
+second mechanism. A future format version could declare still more entries or the
 same entries with even larger sizes — see §5. **A parser must always read
 an event's size from that file's own `EventPayloads` event, never hardcode
 it, and must always read `count` itself rather than assuming a fixed number
@@ -388,17 +391,31 @@ constantly-changing value (the `frame_draw_last` byte alone guarantees
 that), never a stable type. See smashremix `docs/ram-map.md` §10.4 for the
 full story.
 
-Zero or more per frame — one per object currently live on the shared `GObj`
-(the engine's universal object base) linked list rooted at a fixed global
-address (`ReplayMemory::ReadItemObjects()`), following that frame's
-`PreFrameUpdate`/`PostFrameUpdate` pairs. Every `GObj` on this list has a
-`link_id` byte identifying its kind — `4` = **Item** (thrown/spawned items,
-stage hazard objects, and some fighter-held things like Link's pulled
-bomb), `5` = **Weapon** (a free-flying character special-move projectile:
-boomerang, fireball, charge shot, …). This recorder only emits `ItemUpdate`
-for `link_id` `4` or `5`; fighters and any other `GObj` kind that might
-appear on this list are skipped, since the further pointer chase below only
-makes sense for Items/Weapons.
+Zero or more per frame — one per live Item or Weapon `GObj` (the engine's
+universal object base), following that frame's `PreFrameUpdate`/
+`PostFrameUpdate` pairs. Items and Weapons live on two **separate** fixed
+global `GObj` lists — `gGCCommonLinks[4]` (Item) and `gGCCommonLinks[5]`
+(Weapon), not one shared list filtered by `link_id`
+(`ReplayMemory::ReadItemObjects()` walks both). An earlier version of this
+recorder (schema v3 and below) only walked the Item list, so **no file
+recorded under schema v3 or earlier ever contains a real Weapon
+`ItemUpdate`**, even though the wire format already supported `linkId ==
+5` — see §5's v3→v4 note. `4` = **Item** (thrown/spawned items, stage
+hazard objects, and some fighter-held things like Link's pulled bomb), `5`
+= **Weapon** (a free-flying character special-move projectile: boomerang,
+fireball, charge shot, …).
+
+A **held** Item (e.g. Link's bomb while still in his hand, before it's
+thrown) is not emitted at all: while held, the engine re-parents the
+item's position data onto the holding fighter's hand-bone joint, so it
+stops being a world coordinate and reads as a meaningless local offset
+(typically `(0,0,0)`) — `ITStruct::owner_gobj != NULL` is used as a proxy
+for "currently held" and such objects are skipped (schema v4+; skipped
+because there's nothing meaningful to report until the item is
+thrown/dropped, not because held items don't exist). Weapons are never
+held, so this doesn't apply to `linkId == 5`. Fighters and any other `GObj`
+kind that might appear on either list are also skipped, since the further
+pointer chase below only makes sense for Items/Weapons.
 
 Payload size: **25 bytes.**
 
@@ -437,6 +454,105 @@ Payload size: **5 bytes.**
 |-------:|-----:|-------|----------------|--------------------------------------------------------------------------|
 | 0x00   | 4    | `i32` | `frame`        | Same frame counter as that frame's `PreFrameUpdate`/`PostFrameUpdate`.    |
 | 0x04   | 1    | `u8`  | `hazardFlags`  | Bitmask, currently only bit `0x01` defined: Whispy Woods currently blowing (Dream Land only — the underlying memory this reads from is a per-stage union, so this flag is only ever set to `1` when `GameStart.stageId` is Dream Land; see smashremix `docs/ram-map.md` §10.3). |
+
+### 4.8 Hitbox Update — code `0x08`
+
+**New in recorder schema v5.** Zero or more per frame, one per currently
+*active* hitbox slot, following that frame's `StageHazardUpdate` event (if
+any) — sparse like `ItemUpdate`: a disabled slot (`attackState == 0`) is
+never emitted, never a zeroed/placeholder event. Fighters have 4
+simultaneous hitbox slots (`FTAttackColl`); each live Item or Weapon
+(§4.6) has up to 2 (`ITAttackColl`/`WPAttackColl`). Hitboxes are **spheres**
+— a world-space center plus a single radius, not a box — per smashremix
+`docs/ram-map.md` §14's intro.
+
+This is deliberately verbose rather than deduplicated against action state:
+the plan is to record every active slot every frame for now, and — once
+it's confirmed that a character's hitbox geometry is reliably derivable
+from `(characterId, actionStateId, actionFrameCounter)` alone — stop
+recording it for that character and compute it instead. See §8.
+
+**Confidence caveat:** Fighter hitbox fields (`ownerKind == 0`) are
+high-confidence — confirmed both via real Remix ASM call sites and the
+decomp, agreeing exactly. Item/Weapon hitbox fields (`ownerKind == 1` or
+`2`) have high-confidence field *order* (read directly from source) but
+their exact byte *offsets* are hand-derived, not compiler-verified — see
+smashremix `docs/ram-map.md` §14.5 for the full caveat, including why
+`MPCollData`'s 208-byte size is the largest single source of possible
+error.
+
+Payload size: **55 bytes.**
+
+| Offset | Size | Type  | Field              | Notes                                                                 |
+|-------:|-----:|-------|---------------------|--------------------------------------------------------------------------|
+| 0x00   | 4    | `i32` | `frame`              | Same frame counter as that frame's `PreFrameUpdate`/`PostFrameUpdate`.    |
+| 0x04   | 1    | `u8`  | `ownerKind`          | `0` = Fighter, `1` = Item, `2` = Weapon — which struct this hitbox came from, and how `ownerId` below is interpreted. |
+| 0x05   | 4    | `u32` | `ownerId`            | Fighter: the port (`0`-`3`), zero-extended. Item/Weapon: the owning `GObj`'s own RDRAM address — same identity as `ItemUpdate.objectAddress` (§4.6), so a `HitboxUpdate` can be correlated to that frame's `ItemUpdate` for the same live object. |
+| 0x09   | 1    | `u8`  | `slotIndex`          | Fighter: `0`-`3`. Item/Weapon: `0`-`1`.                                   |
+| 0x0A   | 1    | `u8`  | `attackState`        | `1` = fresh (became active this frame), `2` = transfer, `3` = interpolate. Never `0` — disabled slots aren't emitted at all. |
+| 0x0B   | 4    | `i32` | `damage`             |                                                                            |
+| 0x0F   | 4    | `f32` | `positionX`          | World-space, already transformed (`pos_curr`).                           |
+| 0x13   | 4    | `f32` | `positionY`          |                                                                            |
+| 0x17   | 4    | `f32` | `positionZ`          |                                                                            |
+| 0x1B   | 4    | `f32` | `size`               | Radius.                                                                   |
+| 0x1F   | 4    | `i32` | `angle`              | Knockback angle.                                                          |
+| 0x23   | 4    | `i32` | `knockbackScale`     |                                                                            |
+| 0x27   | 4    | `i32` | `knockbackWeight`    |                                                                            |
+| 0x2B   | 4    | `i32` | `knockbackBase`      |                                                                            |
+| 0x2F   | 4    | `i32` | `element`            |                                                                            |
+| 0x33   | 4    | `i32` | `shieldDamage`       |                                                                            |
+
+Deliberately not captured: attack group ID, which body-part joint a
+Fighter hitbox is bone-anchored to, `fgm`/motion-attack bitfield flags,
+`interact_mask` (Item/Weapon only — which object classes a hitbox can hit),
+priority (Item/Weapon only), and already-hit-target tracking
+(`attack_records`/`GMAttackRecord`, so a reader currently cannot tell
+whether two `HitboxUpdate`s on different frames already hit the same
+target or are two separate hits). A future schema version can append any
+of these (§5) once there's a concrete use for them.
+
+### 4.9 Hurtbox Update — code `0x09`
+
+**New in recorder schema v5.** One per fighter hurtbox slot (11 per seated
+port — `FTDamageColl`, one per body region), following that frame's
+`HitboxUpdate` events. **Unlike every other per-frame event in this
+format, this one is NOT sparse** — a seated port's 11 slots are (almost)
+always all present, since hurtboxes exist essentially continuously while a
+fighter is alive; there's no "disabled" state analogous to a hitbox's
+`attackState == 0` to filter on. Fighter-only: items/weapons have at most
+a single *static*, per-item-type hurtbox template
+(`ITAttributes.damage_coll_offset`/`damage_coll_size`) with no live
+per-instance struct traced yet, so there is nothing per-frame to report
+for them.
+
+Same verbosity rationale as `HitboxUpdate` (§4.8) — record exhaustively
+now, prune later once shown to be derivable from action state alone. See
+§8.
+
+Payload size: **51 bytes.**
+
+| Offset | Size | Type  | Field         | Notes                                                                 |
+|-------:|-----:|-------|----------------|--------------------------------------------------------------------------|
+| 0x00   | 4    | `i32` | `frame`        | Same frame counter as that frame's `PreFrameUpdate`/`PostFrameUpdate`.    |
+| 0x04   | 1    | `u8`  | `port`         | `0`-`3`.                                                                  |
+| 0x05   | 1    | `u8`  | `slotIndex`    | `0`-`10`.                                                                 |
+| 0x06   | 4    | `i32` | `hitStatus`    | Per-bone Vulnerable/Invincible/Intangible. Raw value — the exact numeric mapping for this *per-bone* field isn't independently confirmed the way the whole-character convention is (`PostFrameUpdate.hurtboxState`, §4.4, `3` = intangible). |
+| 0x0A   | 4    | `i32` | `placement`    | `0` = low, `1` = middle, `2` = high.                                     |
+| 0x0E   | 1    | `u8`  | `isGrabbable`  | `0`/`1`.                                                                  |
+| 0x0F   | 4    | `f32` | `positionX`    | **Approximation, not the true hurtbox center** — the bone's own world-space joint position (its `DObj`'s translate). Does NOT apply `offsetX/Y/Z` below or the bone's rotation on top. |
+| 0x13   | 4    | `f32` | `positionY`    |                                                                            |
+| 0x17   | 4    | `f32` | `positionZ`    |                                                                            |
+| 0x1B   | 4    | `f32` | `offsetX`      | Authored, bone-relative, untransformed — the raw value that would need to be composed with the bone's rotation to get the true center.    |
+| 0x1F   | 4    | `f32` | `offsetY`      |                                                                            |
+| 0x23   | 4    | `f32` | `offsetZ`      |                                                                            |
+| 0x27   | 4    | `f32` | `sizeX`        | Anisotropic — a `Vec3f`, not a single radius like a hitbox's `size`.      |
+| 0x2B   | 4    | `f32` | `sizeY`        |                                                                            |
+| 0x2F   | 4    | `f32` | `sizeZ`        |                                                                            |
+
+Deliberately not captured: no per-hurtbox weak-point flag or damage
+multiplier exists in the underlying struct (`FTStruct.damage_mul` is a
+related but different, *whole-fighter* multiplier, not per-hurtbox) — see
+smashremix `docs/ram-map.md` §14.2.
 
 ## 5. Versioning and forward compatibility
 
@@ -482,6 +598,32 @@ size — 25 bytes, not 24 — so a parser that reads the size from
 added the `StageHazardUpdate` event (§4.7). **Any data captured under
 schema `2` should be discarded and re-recorded, not migrated** — its
 `typeId` values were never meaningful.
+
+Schema `4` fixed two bugs in `ReadItemObjects()` that changed *which*
+objects get emitted, not the `ItemUpdate` payload's byte layout (still 25
+bytes, same as schema `3`): (1) Weapons were never actually reachable —
+schema `3` and earlier only walked the Item list (`gGCCommonLinks[4]`), so
+despite `ItemUpdate.linkId` supporting `5` (Weapon) in the wire format, no
+file recorded before schema `4` contains a real Weapon event (fireballs,
+boomerang, charge shot, PK Fire/Thunder, …); (2) held Items (e.g. Link's
+bomb while still in his hand) were recorded with a meaningless, re-parented
+position (typically `(0,0,0)`) instead of being skipped — see §4.6. **Data
+captured under schema `3` and earlier undercounts real projectile activity
+(no Weapons, phantom held-item entries) but isn't corrupt the way schema
+`2` was** — it doesn't need discarding, just doesn't reflect Weapons at
+all.
+
+Schema `5` added the `HitboxUpdate` (§4.8) and `HurtboxUpdate` (§4.9)
+events — additive only, so a schema-`4`-aware parser correctly reads a
+schema-`5` file's other events and simply never sees these two. Both are
+deliberately verbose (every active hitbox slot, and *every* hurtbox slot
+every frame, not just active ones) rather than deduplicated against action
+state — the intent is to record exhaustively while the RAM mapping is
+still being validated against real gameplay, then, once it's confirmed
+that a character's hitbox/hurtbox geometry is reliably derivable from
+`(characterId, actionStateId, actionFrameCounter)` alone, stop recording
+it for that character (starting with the original 12, across both
+versions) and compute it instead in a future schema. See §8.
 
 ## 6. Byte order and encoding
 
@@ -703,9 +845,9 @@ can add any of them as new event types or appended fields per §5, without
 breaking existing files or parsers:
 
 - **Item/weapon tracking has no velocity, damage, owner/attacker port, or
-  expiration data.** Schema v3's `ItemUpdate` (§4.6) records a named
-  `kind` (§7.6) and position for every live Item/Weapon object, but none of
-  those additional fields have been mapped in memory yet.
+  expiration data.** `ItemUpdate` (§4.6) records a named `kind` (§7.6) and
+  position for every live, non-held Item/Weapon object, but none of those
+  additional fields have been mapped in memory yet.
 - **Stage hazard tracking covers exactly one hazard.** Schema v3's
   `StageHazardUpdate` (§4.7) currently only tracks Whispy Woods' wind on
   Dream Land — other built-in hazards (Zebes' acid, Duel Zone's platforms,
@@ -714,9 +856,28 @@ breaking existing files or parsers:
 - **No RNG/desync-detection event.** No `FrameStart`-equivalent event (RNG
   seed, internal scene frame counter); no known Smash Remix RNG seed address
   has been identified.
-- **No aggregate damage-dealt/taken breakdown, no shield-damage, no
-  incoming-damage-this-hit field**, even though the emulator exposes them —
-  deferred as not essential for a first version.
+- **No aggregate damage-dealt/taken breakdown or incoming-damage-this-hit
+  field**, even though the emulator exposes them — deferred as not
+  essential for a first version. (A hitbox's own `shieldDamage` *attribute*
+  is captured per-slot in `HitboxUpdate`, §4.8 — this is about a different,
+  still-missing per-victim aggregate.)
+- **Hitbox/hurtbox tracking (§4.8/§4.9) is opt-in and off by default** (the
+  Settings dialog's "Include hitbox and hurtbox data" checkbox /
+  `SettingsID::GameStats_RecordHitboxData`) precisely because of the
+  verbosity below - a typical user gets small files unless they explicitly
+  turn it on. **It's also deliberately temporary, not a final design.** It records every active hitbox slot and
+  every hurtbox slot, every frame, with no deduplication against action
+  state — the plan is to keep doing that only until it's shown that a
+  character's geometry is reliably derivable from `(characterId,
+  actionStateId, actionFrameCounter)` alone (starting with the original 12
+  characters, both versions), at which point recording can stop for that
+  character and a lookup/formula can replace it in a future schema. Also:
+  no already-hit-target tracking (`attack_records`/`GMAttackRecord`) is
+  captured, so two `HitboxUpdate`s can't currently be told apart as "same
+  hit, still active" vs. "a new hit"; Item/Weapon hitbox byte offsets are
+  hand-derived, not compiler-verified (§4.8's own caveat); and items have
+  no live per-instance hurtbox data, only a static per-type template not
+  currently read at all.
 - **`GameEnd.endReason` cannot currently distinguish time-out from
   stock-out** — both collapse to `1` ("normal end"); only "aborted vs. not"
   is currently derivable from available memory.

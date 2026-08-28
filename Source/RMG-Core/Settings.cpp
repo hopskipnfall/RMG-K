@@ -1655,6 +1655,9 @@ static l_Setting get_setting(SettingsID settingId)
     case SettingsID::GameStats_ReplayEnabled:
         setting = {SETTING_SECTION_GAMESTATS, "ReplayEnabled", false};
         break;
+    case SettingsID::GameStats_RecordHitboxData:
+        setting = {SETTING_SECTION_GAMESTATS, "RecordHitboxData", false};
+        break;
 
     // Internal settings (runtime-only, not persisted)
     case SettingsID::Internal_InputPluginSwitchRequested:
