@@ -69,7 +69,7 @@ private:
     QString resolveExportFfmpegPath();
     QString promptForFfmpegPath();
     QString downloadManagedFfmpeg();
-    void showExportFinishedDialog(const QString& outputPath);
+    void showExportFinishedDialog(const QString& outputPath, const QString& logText);
     void resetExportUi();
     void startExportProcess(const QString& recordingPath,
                             const QString& romPath,

@@ -54,6 +54,7 @@
 #include <QComboBox>
 #include <QListView>
 #include <QStringList>
+#include <QTextEdit>
 
 #include <algorithm>
 #include <climits>
@@ -1395,7 +1396,7 @@ QString KailleraPlaybackDialog::exportDialogTitle() const
 #endif
 }
 
-void KailleraPlaybackDialog::showExportFinishedDialog(const QString& outputPath)
+void KailleraPlaybackDialog::showExportFinishedDialog(const QString& outputPath, const QString& logText)
 {
     QDialog dialog(this);
     dialog.setWindowTitle(exportDialogTitle());
@@ -1422,13 +1423,24 @@ void KailleraPlaybackDialog::showExportFinishedDialog(const QString& outputPath)
 
     auto* openFolderButton = new QPushButton("Open Folder", &dialog);
     auto* openFileButton = new QPushButton("Open File", &dialog);
+    // The export subprocess's own diagnostic/info output (RMG-Core's
+    // "Replay: ..." messages, e.g. hitbox/hurtbox recording status) is
+    // otherwise invisible on a successful export - only a failed export's
+    // message box showed any of it (see summarizeExportLog() below). A
+    // successful export can still be worth inspecting, e.g. while
+    // debugging a recording feature - so this button is always shown, not
+    // just gated on logText being non-empty (an empty log is itself
+    // informative here, not a reason to hide the button).
+    auto* viewLogButton = new QPushButton("View Log", &dialog);
     auto* okButton = new QPushButton("OK", &dialog);
     configurePlaybackButton(openFolderButton, "KailleraSecondaryButton");
     configurePlaybackButton(openFileButton, "KailleraSecondaryButton");
+    configurePlaybackButton(viewLogButton, "KailleraSecondaryButton");
     configurePlaybackButton(okButton, "KailleraPrimaryButton");
 
     buttonLayout->addWidget(openFolderButton);
     buttonLayout->addWidget(openFileButton);
+    buttonLayout->addWidget(viewLogButton);
     buttonLayout->addStretch(1);
     buttonLayout->addWidget(okButton);
     mainLayout->addLayout(buttonLayout);
@@ -1439,6 +1451,33 @@ void KailleraPlaybackDialog::showExportFinishedDialog(const QString& outputPath)
     });
     connect(openFileButton, &QPushButton::clicked, &dialog, [outputPath]() {
         QDesktopServices::openUrl(QUrl::fromLocalFile(outputPath));
+    });
+    connect(viewLogButton, &QPushButton::clicked, &dialog, [&dialog, logText]() {
+        QDialog logDialog(&dialog);
+        logDialog.setWindowTitle("Export Log");
+        logDialog.setMinimumSize(640, 480);
+        if (useModernPlaybackUi())
+        {
+            logDialog.setObjectName("KailleraPlaybackDialog");
+            logDialog.setStyleSheet(buildPlaybackStyleSheet());
+        }
+
+        auto* logLayout = new QVBoxLayout(&logDialog);
+        auto* logTextEdit = new QTextEdit(&logDialog);
+        logTextEdit->setReadOnly(true);
+        logTextEdit->setPlainText(logText.isEmpty() ? "(no output captured)" : logText);
+        logTextEdit->setLineWrapMode(QTextEdit::NoWrap);
+        logLayout->addWidget(logTextEdit);
+
+        auto* logCloseButton = new QPushButton("Close", &logDialog);
+        configurePlaybackButton(logCloseButton, "KailleraPrimaryButton");
+        connect(logCloseButton, &QPushButton::clicked, &logDialog, &QDialog::accept);
+        auto* logButtonLayout = new QHBoxLayout();
+        logButtonLayout->addStretch(1);
+        logButtonLayout->addWidget(logCloseButton);
+        logLayout->addLayout(logButtonLayout);
+
+        logDialog.exec();
     });
     connect(okButton, &QPushButton::clicked, &dialog, &QDialog::accept);
 
@@ -1986,6 +2025,7 @@ void KailleraPlaybackDialog::onExportProcessFinished(int exitCode, QProcess::Exi
 
     const bool canceled = m_exportCanceled;
     const QString outputPath = m_exportOutputPath;
+    const QString fullLog = m_exportLog;
     const QString logSummary = summarizeExportLog(m_exportLog);
 
     resetExportUi();
@@ -2000,7 +2040,7 @@ void KailleraPlaybackDialog::onExportProcessFinished(int exitCode, QProcess::Exi
 
     if (exitStatus == QProcess::NormalExit && exitCode == 0)
     {
-        showExportFinishedDialog(outputPath);
+        showExportFinishedDialog(outputPath, fullLog);
         return;
     }
 
