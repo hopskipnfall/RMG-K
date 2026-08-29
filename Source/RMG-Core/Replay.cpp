@@ -266,7 +266,12 @@ struct HurtboxUpdateEvent
     float    offsetX;     // authored, bone-relative, untransformed
     float    offsetY;
     float    offsetZ;
-    float    sizeX;       // anisotropic - a Vec3f, not a single radius like a hitbox
+    // Anisotropic (Vec3f, not a single radius like a hitbox) - and, per the
+    // decomp's fighter-hurtbox init, stored PRE-HALVED (size.{x,y,z} *= 0.5F
+    // there): these are half-extents, not full extents. A consumer that
+    // wants the real box dimensions needs to double these, not use them
+    // directly as width/height/depth.
+    float    sizeX;
     float    sizeY;
     float    sizeZ;
 };
@@ -410,7 +415,20 @@ constexpr const char* kSupportedGoodName = "SmashRemix2.0.1";
 // layout change. v6 and earlier files' jumpsUsed byte should be treated as
 // meaningless (it's the constant-0 bug's output, not real data) rather
 // than reinterpreted as anything.
-constexpr uint32_t kRecorderSchemaVersion = 7;
+// v7 -> v8: ReplayMemory::ReadHurtboxes()'s "is this slot in use" check was
+// wrong - decomp-confirmed (ftmanager.c's fighter-hurtbox init) that an
+// unused FTDamageColl slot leaves its `joint` field untouched (not NULL,
+// not necessarily even outside the valid RDRAM range - just whatever was
+// in that memory before), while `hitstatus` is explicitly set to
+// nGMHitStatusNone (0) for unused slots and Normal/Invincible/Intangible
+// for used ones. Gating on IsValidRdramPointer(joint) instead of
+// `hitstatus != 0` filtered out every slot, used or not, every frame - a
+// real match with real hurtboxes the whole time produced zero
+// HurtboxUpdate events. Fixed by gating on hitStatus first. Byte layout
+// unchanged, same class of fix as v5->v6/v6->v7. **v7 and earlier files'
+// HurtboxUpdate data is empty/missing, not incomplete** - re-record rather
+// than treat as a real "no hurtboxes this match" result.
+constexpr uint32_t kRecorderSchemaVersion = 8;
 
 bool IsSupportedGame(void)
 {

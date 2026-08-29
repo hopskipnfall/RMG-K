@@ -589,6 +589,20 @@ std::vector<HurtboxObject> ReadHurtboxes(uint32_t matchInfoPtr)
             const uint32_t slotBase =
                 playerStruct + PS_DAMAGE_COLL_BASE + static_cast<uint32_t>(slot) * PS_DAMAGE_COLL_STRIDE;
 
+            // hitStatus, not joint's pointer validity, is the decomp-
+            // confirmed "is this slot in use" signal (ftmanager.c): an
+            // unused slot's hitstatus is explicitly set to nGMHitStatusNone
+            // (0), but its joint field is left untouched from whatever was
+            // in that memory before - not NULL, not necessarily even
+            // outside the valid RDRAM range, just meaningless. Gating on
+            // IsValidRdramPointer(joint) instead filtered out every slot,
+            // used or not, every frame - see docs/RMGR_SPEC.md section 5.
+            const int32_t hitStatus = static_cast<int32_t>(m64p::Core.DebugMemRead32(slotBase + FTDC_HITSTATUS));
+            if (hitStatus == 0)
+            {
+                continue;
+            }
+
             const uint32_t joint = m64p::Core.DebugMemRead32(slotBase + FTDC_JOINT_PTR);
             if (!IsValidRdramPointer(joint))
             {
@@ -598,7 +612,7 @@ std::vector<HurtboxObject> ReadHurtboxes(uint32_t matchInfoPtr)
             HurtboxObject hurtbox{};
             hurtbox.port        = static_cast<uint8_t>(port);
             hurtbox.slotIndex   = static_cast<uint8_t>(slot);
-            hurtbox.hitStatus   = static_cast<int32_t>(m64p::Core.DebugMemRead32(slotBase + FTDC_HITSTATUS));
+            hurtbox.hitStatus   = hitStatus;
             hurtbox.placement   = static_cast<int32_t>(m64p::Core.DebugMemRead32(slotBase + FTDC_PLACEMENT));
             hurtbox.isGrabbable = m64p::Core.DebugMemRead32(slotBase + FTDC_IS_GRABBABLE) != 0;
 

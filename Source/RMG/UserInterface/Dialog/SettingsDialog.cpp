@@ -862,7 +862,6 @@ void SettingsDialog::load64DDSettings(void)
     this->kailleraReplayHitboxesCheckBox->setChecked(false);
     this->kailleraReplayHitboxesCheckBox->setEnabled(false);
 #endif
-    this->updateKailleraReplayHitboxControls();
     this->kailleraPortSpinBox->setValue(kailleraPort);
     this->kailleraRecordsDirectoryLineEdit->setProperty("rawPath", recordsDirectoryRaw);
     this->kailleraRecordsDirectoryLineEdit->setText(getDisplayDirectoryPath(recordsDirectoryRaw));
@@ -1135,7 +1134,6 @@ void SettingsDialog::loadDefault64DDSettings(void)
     this->kailleraReplayHitboxesCheckBox->setChecked(
         CoreSettingsGetDefaultBoolValue(SettingsID::GameStats_RecordHitboxData));
 #endif
-    this->updateKailleraReplayHitboxControls();
     this->kailleraPortSpinBox->setValue(kailleraPort);
     this->kailleraRecordsDirectoryLineEdit->setProperty("rawPath", recordsDirectoryRaw);
     this->kailleraRecordsDirectoryLineEdit->setText(getDisplayDirectoryPath(recordsDirectoryRaw));
@@ -1847,14 +1845,6 @@ void SettingsDialog::updateKailleraRecordingCapControls(void)
     this->kailleraRecordingCapMBSpinBox->setEnabled(recordingByDefault && capEnabled);
 }
 
-void SettingsDialog::updateKailleraReplayHitboxControls(void)
-{
-#ifdef RMGK_GAME_STATS
-    this->kailleraReplayHitboxesCheckBox->setEnabled(
-        this->kailleraReplayByDefaultCheckBox->isChecked());
-#endif
-}
-
 void SettingsDialog::updateOSDSettingsEnabledState(void)
 {
     const bool osdEnabled = this->osdEnabledCheckBox->isChecked();
@@ -2085,12 +2075,6 @@ void SettingsDialog::on_kailleraRecordingCapEnabledCheckBox_toggled(bool checked
 {
     (void)checked;
     this->updateKailleraRecordingCapControls();
-}
-
-void SettingsDialog::on_kailleraReplayByDefaultCheckBox_toggled(bool checked)
-{
-    (void)checked;
-    this->updateKailleraReplayHitboxControls();
 }
 
 void SettingsDialog::on_changeBackgroundColorButton_clicked(void)

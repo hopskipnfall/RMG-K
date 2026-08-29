@@ -534,8 +534,12 @@ port — `FTDamageColl`, one per body region), following that frame's
 `HitboxUpdate` events. **Unlike every other per-frame event in this
 format, this one is NOT sparse** — a seated port's 11 slots are (almost)
 always all present, since hurtboxes exist essentially continuously while a
-fighter is alive; there's no "disabled" state analogous to a hitbox's
-`attackState == 0` to filter on. Fighter-only: items/weapons have at most
+fighter is alive. A slot IS filtered out when `hitStatus == 0`
+(`nGMHitStatusNone`, decomp-confirmed) — the fighter-hurtbox init leaves
+that slot's whole record, including its otherwise-unrelated `joint`
+pointer, untouched/uninitialized whenever it's unused, so `hitStatus` is
+the only reliable "is this slot in use" signal (see schema `8`'s history
+entry below for the bug this caused before it was fixed). Fighter-only: items/weapons have at most
 a single *static*, per-item-type hurtbox template
 (`ITAttributes.damage_coll_offset`/`damage_coll_size`) with no live
 per-instance struct traced yet, so there is nothing per-frame to report
@@ -692,6 +696,22 @@ goal. Same wire position/size (still a `u8`) — a pure "what this byte
 means" fix, not a layout change, same class as `5`→`6`. **Schema `6` and
 earlier files' byte here is meaningless — it's the constant-`0` bug's
 output, not real data.**
+
+Schema `8` fixed `ReadHurtboxes()`'s "is this slot in use" check, which
+schema `5`-`7` got wrong: it gated on `IsValidRdramPointer(joint)`, but
+decomp confirms (`ftmanager.c`'s fighter-hurtbox init) that an unused
+`FTDamageColl` slot leaves its `joint` field untouched — not `NULL`, not
+necessarily even outside the valid RDRAM window, just whatever garbage was
+in that memory before — while `hitStatus` is explicitly set to
+`nGMHitStatusNone` (`0`) for unused slots and a real
+Vulnerable/Invincible/Intangible value for used ones. Gating on the wrong
+field filtered out every slot, used or not, every frame — a real match
+with real hurtboxes the entire time produced **zero** `HurtboxUpdate`
+events. Fixed by checking `hitStatus != 0` first. Byte layout unchanged —
+same class of fix as `6`→`7`. **`HurtboxUpdate` data from schema `5`-`7`
+is empty, not incomplete, and should be re-recorded** (`HitboxUpdate` is a
+separate, independently-gated read and is not known to share this bug —
+see §8's note on it).
 
 ## 6. Byte order and encoding
 
@@ -946,6 +966,18 @@ breaking existing files or parsers:
   hand-derived, not compiler-verified (§4.8's own caveat); and items have
   no live per-instance hurtbox data, only a static per-type template not
   currently read at all.
+- **`HitboxUpdate` (§4.8) is still unverified against a real capture with
+  known combat.** Schema `8` fixed the *hurtbox* side's wrong "in use" gate
+  (see §5), but a real match with confirmed hits/KOs recorded zero
+  `HitboxUpdate` events even after that fix — `PS_ATTACK_COLL_BASE`/
+  `PS_ATTACK_COLL_STRIDE`/`FTAC_ATTACK_STATE` (§4.8) have been independently
+  re-derived from the decomp and confirmed correct, so the offsets
+  themselves aren't the suspect. Leading candidates: the recorder samples
+  `attack_state` at a point in the frame after collision processing has
+  already reset it back to `0` for that frame, or `s_RecordHitboxData`
+  isn't actually `true` at the moment `ReadHitboxes()` runs despite the
+  setting being on. Needs a live diagnostic (raw-value logging at a known
+  mid-combat frame) to distinguish the two - not yet done.
 - **`GameEnd.endReason` cannot currently distinguish time-out from
   stock-out** — both collapse to `1` ("normal end"); only "aborted vs. not"
   is currently derivable from available memory.

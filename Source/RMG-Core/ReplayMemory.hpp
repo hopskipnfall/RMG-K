@@ -168,7 +168,11 @@ struct HurtboxObject
     float offsetX; // authored, bone-relative, untransformed
     float offsetY;
     float offsetZ;
-    float sizeX;    // anisotropic - a Vec3f, unlike a hitbox's single radius
+    // Anisotropic (Vec3f, unlike a hitbox's single radius) - and, per the
+    // decomp's fighter-hurtbox init, stored PRE-HALVED (size.{x,y,z} *= 0.5F
+    // there): these are half-extents, not full extents. Double these for
+    // the real box dimensions rather than using them directly.
+    float sizeX;
     float sizeY;
     float sizeZ;
 };
