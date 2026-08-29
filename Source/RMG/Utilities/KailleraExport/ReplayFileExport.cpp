@@ -8,6 +8,7 @@
 #include <QCommandLineParser>
 #include <QTemporaryDir>
 
+#include <RMG-Core/Callback.hpp>
 #include <RMG-Core/Directories.hpp>
 
 #include <cstdio>
@@ -415,6 +416,26 @@ int RunReplayFileExportFromCommandLine(const QCommandLineParser& parser)
     printExportError("Replay file export requires Windows and a GAME_STATS build");
     return 1;
 #else
+    // RMG-Core's own CoreAddCallbackMessage() (used throughout Replay.cpp
+    // for its info/warning messages - "Replay: recording to <path>",
+    // "Replay: enabled, but the loaded ROM isn't Smash Remix 2.0.1 - not
+    // recording", etc.) is otherwise a black hole in this process: the
+    // normal GUI wires it up to the Log viewer in MainWindow::Init(), but
+    // this CLI-only headless path never reaches that code (see the early
+    // return in main.cpp, before MainWindow is even constructed) and never
+    // calls CoreSetupCallbacks() itself - every message silently queues
+    // into RMG-Core's internal pending-message buffer and is discarded
+    // when this process exits, with no indication anything was ever said.
+    // Wire up a callback that does nothing itself - the actual printing
+    // happens inside CoreDebugCallback() via CoreSetPrintDebugCallback
+    // below - just to satisfy RMG-Core's "has anyone registered yet" gate.
+    // stdout is captured by the GUI's QProcess (MergedChannels) and shown
+    // in the export progress dialog, same as this file's existing
+    // fprintf(stderr, ...) progress messages.
+    CoreSetupCallbacks([](CoreDebugMessageType, std::string, std::string) {},
+                        [](CoreStateCallbackType, int) {});
+    CoreSetPrintDebugCallback(true);
+
     ReplayFileExportOptions options;
     std::string errorMessage;
     if (!parseOptions(parser, options, &errorMessage))
