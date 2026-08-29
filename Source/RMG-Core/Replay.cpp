@@ -29,6 +29,7 @@
 #include <fstream>
 #include <mutex>
 #include <string>
+#include <vector>
 
 namespace
 {
@@ -862,10 +863,27 @@ void RecordFrame(const ReplayMemory::MatchInfo& matchInfo)
     // ReadHurtboxes() aren't free (multiple pointer chases per port/slot).
     if (s_RecordHitboxData)
     {
+        const std::vector<ReplayMemory::HitboxObject> hitboxObjects = ReplayMemory::ReadHitboxes(matchInfo.matchInfoPtr);
+        const std::vector<ReplayMemory::HurtboxObject> hurtboxObjects = ReplayMemory::ReadHurtboxes(matchInfo.matchInfoPtr);
+
+        // Diagnostic: both reads have come back empty for an entire real
+        // match on every test so far despite s_RecordHitboxData being true
+        // (see the log line in OnEmulationStart()) - see docs/RMGR_SPEC.md
+        // section 8's HitboxUpdate note. Logged every 5 seconds, not every
+        // frame, to stay readable; remove once the root cause is confirmed
+        // and fixed.
+        if ((s_FrameNumber % 300) == 0)
+        {
+            CoreAddCallbackMessage(CoreDebugMessageType::Info,
+                "Replay: hitbox/hurtbox diagnostic - frame " + std::to_string(s_FrameNumber) +
+                ": " + std::to_string(hitboxObjects.size()) + " active hitbox(es), " +
+                std::to_string(hurtboxObjects.size()) + " hurtbox(es) found");
+        }
+
         // HitboxUpdate - one per currently-active hitbox slot (see
         // docs/RMGR_SPEC.md section 4.8). Sparse like ItemUpdate: a
         // disabled slot is never written.
-        for (const ReplayMemory::HitboxObject& hitbox : ReplayMemory::ReadHitboxes(matchInfo.matchInfoPtr))
+        for (const ReplayMemory::HitboxObject& hitbox : hitboxObjects)
         {
             HitboxUpdateEvent hitboxEvent{};
             hitboxEvent.frame           = s_FrameNumber;
@@ -890,7 +908,7 @@ void RecordFrame(const ReplayMemory::MatchInfo& matchInfo)
         // HurtboxUpdate - one per fighter hurtbox slot, per seated port
         // (see docs/RMGR_SPEC.md section 4.9). NOT sparse like the events
         // above - see HurtboxUpdateEvent's own doc comment for why.
-        for (const ReplayMemory::HurtboxObject& hurtbox : ReplayMemory::ReadHurtboxes(matchInfo.matchInfoPtr))
+        for (const ReplayMemory::HurtboxObject& hurtbox : hurtboxObjects)
         {
             HurtboxUpdateEvent hurtboxEvent{};
             hurtboxEvent.frame       = s_FrameNumber;
@@ -965,6 +983,17 @@ CORE_EXPORT void OnEmulationStart(void)
     s_State = enabled ? State::WaitingForMatch : State::Idle;
     if (enabled)
     {
+        // Diagnostic: hitbox/hurtbox recording has produced zero events on
+        // every real test so far despite the setting being checked and the
+        // gating logic (RecordFrame()'s `if (s_RecordHitboxData)`) reading
+        // correctly in review - see docs/RMGR_SPEC.md section 8's
+        // HitboxUpdate note. This makes it visible in RMG-K's own log
+        // whether the flag actually ends up true for a given session,
+        // without needing an external memory debugger.
+        CoreAddCallbackMessage(CoreDebugMessageType::Info,
+            s_RecordHitboxData
+                ? "Replay: hitbox/hurtbox recording is ON for this session"
+                : "Replay: hitbox/hurtbox recording is OFF for this session (checkbox unchecked, or setting didn't save)");
         CoreAddCallbackMessage(CoreDebugMessageType::Info,
             "Replay: enabled, watching for a match to start");
     }
