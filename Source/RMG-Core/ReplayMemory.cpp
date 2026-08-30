@@ -237,13 +237,15 @@ constexpr uint8_t HITBOX_OWNER_FIGHTER = 0;
 constexpr uint8_t HITBOX_OWNER_ITEM    = 1;
 constexpr uint8_t HITBOX_OWNER_WEAPON  = 2;
 
-// Stage hazards. See smashremix docs/ram-map.md section 10.3 - Dream
-// Land's live hazard state (Whispy's wind) lives in a fixed global that is
-// a *union* shared by every "common ground" stage; these exact offsets are
-// only valid when the current stage is actually Dream Land.
+// Stage hazards. See smashremix docs/ram-map.md section 10.3 (is Whispy
+// blowing) and 10.3.1 (which direction) - Dream Land's live hazard state
+// lives in a fixed global that is a *union* shared by every "common
+// ground" stage; these exact offsets are only valid when the current
+// stage is actually Dream Land.
 constexpr uint8_t  STAGE_ID_DREAM_LAND       = 0x06;
 constexpr uint32_t ADDR_PUPUPU_WHISPY_STATUS = 0x80131416; // gGRCommonStruct (0x801313F0) + 0x26, Dream Land's union view
 constexpr uint8_t  WHISPY_STATUS_BLOW        = 4;          // grPupupuWhispyWindStatus::Blow
+constexpr uint32_t ADDR_PUPUPU_WHISPY_LR     = 0x8013141A; // gGRCommonStruct + 0x2A - lr_players: 0 = blowing left, 1 = blowing right
 
 // KSEG0, 8MB expansion-pak RDRAM window. A value outside this range means a
 // pointer chase hit garbage - treat as "not currently available", not a crash.
@@ -642,6 +644,13 @@ StageHazards ReadStageHazards(uint8_t stageId)
     {
         hazards.whispyBlowing =
             m64p::Core.DebugMemRead8(ADDR_PUPUPU_WHISPY_STATUS) == WHISPY_STATUS_BLOW;
+        // Read unconditionally (cheap, single byte) even when not currently
+        // blowing - the engine holds the last-decided direction steady
+        // between blows too (see ram-map.md section 10.3.1), harmless to
+        // read regardless; only meaningful to a caller when whispyBlowing
+        // is true.
+        hazards.whispyBlowingRight =
+            m64p::Core.DebugMemRead8(ADDR_PUPUPU_WHISPY_LR) != 0;
     }
     return hazards;
 }

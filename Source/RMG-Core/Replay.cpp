@@ -207,11 +207,15 @@ static_assert(sizeof(ItemUpdateEvent) == 25, "ItemUpdateEvent must be 25 bytes")
 struct StageHazardUpdateEvent
 {
     int32_t frame;
-    uint8_t hazardFlags; // bit 0 = Whispy Woods currently blowing (Dream Land only)
+    uint8_t hazardFlags; // bit 0 = Whispy Woods currently blowing (Dream Land only);
+                          // bit 1 = blowing direction (0 = left, 1 = right) -
+                          // only meaningful when bit 0 is set, and only ever
+                          // written alongside it (see below)
 };
 static_assert(sizeof(StageHazardUpdateEvent) == 5, "StageHazardUpdateEvent must be 5 bytes");
 
-constexpr uint8_t kHazardFlagWhispyBlowing = 0x01;
+constexpr uint8_t kHazardFlagWhispyBlowing      = 0x01;
+constexpr uint8_t kHazardFlagWhispyBlowingRight = 0x02;
 
 // v5 new event type: one per currently-active hitbox slot (a fighter's own
 // attack, or an item's/weapon's), per frame - zero or more of these follow
@@ -429,7 +433,16 @@ constexpr const char* kSupportedGoodName = "SmashRemix2.0.1";
 // unchanged, same class of fix as v5->v6/v6->v7. **v7 and earlier files'
 // HurtboxUpdate data is empty/missing, not incomplete** - re-record rather
 // than treat as a real "no hurtboxes this match" result.
-constexpr uint32_t kRecorderSchemaVersion = 8;
+//
+// v9 adds StageHazardUpdate.hazardFlags bit 1: Whispy's wind direction
+// (0 = left, 1 = right), only meaningful/only ever set alongside bit 0
+// (currently blowing) - see docs/RMGR_SPEC.md section 4.7 and smashremix
+// docs/ram-map.md section 10.3.1. Byte layout unchanged (still a single
+// hazardFlags byte) - purely new meaning for a previously-always-0 bit,
+// same class of additive change as v1->v2's ItemUpdate. v8 and earlier
+// files' bit 1 is always 0 - indistinguishable from a real "blowing left"
+// read, so don't infer direction from data recorded before v9.
+constexpr uint32_t kRecorderSchemaVersion = 9;
 
 bool IsSupportedGame(void)
 {
@@ -845,6 +858,10 @@ void RecordFrame(const ReplayMemory::MatchInfo& matchInfo)
     if (hazards.whispyBlowing)
     {
         hazardFlags |= kHazardFlagWhispyBlowing;
+        if (hazards.whispyBlowingRight)
+        {
+            hazardFlags |= kHazardFlagWhispyBlowingRight;
+        }
     }
     if (hazardFlags != 0)
     {

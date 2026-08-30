@@ -183,7 +183,11 @@ struct HurtboxObject
 // docs/ram-map.md section 10.5.
 struct StageHazards
 {
-    bool whispyBlowing; // Dream Land only; always false on any other stage
+    bool whispyBlowing;      // Dream Land only; always false on any other stage
+    bool whispyBlowingRight; // Only meaningful when whispyBlowing is true - see
+                              // smashremix docs/ram-map.md section 10.3.1. true =
+                              // blowing right (pushes players right of Whispy
+                              // further right), false = blowing left.
 };
 
 struct MatchInfo

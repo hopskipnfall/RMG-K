@@ -469,7 +469,7 @@ Payload size: **5 bytes.**
 | Offset | Size | Type  | Field         | Notes                                                                 |
 |-------:|-----:|-------|----------------|--------------------------------------------------------------------------|
 | 0x00   | 4    | `i32` | `frame`        | Same frame counter as that frame's `PreFrameUpdate`/`PostFrameUpdate`.    |
-| 0x04   | 1    | `u8`  | `hazardFlags`  | Bitmask, currently only bit `0x01` defined: Whispy Woods currently blowing (Dream Land only — the underlying memory this reads from is a per-stage union, so this flag is only ever set to `1` when `GameStart.stageId` is Dream Land; see smashremix `docs/ram-map.md` §10.3). |
+| 0x04   | 1    | `u8`  | `hazardFlags`  | Bitmask. Bit `0x01`: Whispy Woods currently blowing (Dream Land only — the underlying memory this reads from is a per-stage union, so this flag is only ever set to `1` when `GameStart.stageId` is Dream Land; see smashremix `docs/ram-map.md` §10.3). Bit `0x02` (**new in schema v9**): wind direction — `0` = blowing left, `1` = blowing right; only meaningful (and only ever set) when bit `0x01` is also set (see smashremix `docs/ram-map.md` §10.3.1). |
 
 ### 4.8 Hitbox Update — code `0x08`
 
@@ -712,6 +712,20 @@ same class of fix as `6`→`7`. **`HurtboxUpdate` data from schema `5`-`7`
 is empty, not incomplete, and should be re-recorded** (`HitboxUpdate` is a
 separate, independently-gated read and is not known to share this bug —
 see §8's note on it).
+
+Schema `9` adds `StageHazardUpdate.hazardFlags` bit `0x02`: Whispy Woods'
+wind *direction* (`0` = left, `1` = right), alongside the existing bit
+`0x01` (currently blowing) — see §4.7. Resolved via
+`grPupupuWhispyGetLR`/`grPupupuWhispySetWindPush` in the real decomp
+(smashremix `docs/ram-map.md` §10.3.1), a fixed `s8` global
+(`gGRCommonStruct + 0x2A`) holding the engine's already-decided direction
+for the current wind cycle — no recomputation needed, just a second byte
+read alongside the existing status read. Purely additive: the event's
+byte layout is unchanged (still a single `hazardFlags` byte), the same
+class of change as `1`→`2`'s new event type, just one bit narrower in
+scope. **Schema `8` and earlier files always have bit `0x02` unset (`0`)
+— indistinguishable from a genuine "blowing left" read — so don't infer
+direction from data recorded before schema `9`.**
 
 ## 6. Byte order and encoding
 
