@@ -1,10 +1,16 @@
 # `.rmgr` v2 — Format Redesign for Real-User Rollout
 
-**Status:** Design, approved by user 2026-09-04. Not yet implemented.
+**Status:** Design, approved by user 2026-09-04 (revised same day: `version`
+keeps incrementing rather than resetting). Spec doc (`docs/RMGR_SPEC.md`)
+rewritten to match; code changes not yet implemented.
 
 **Supersedes:** `docs/RMGR_SPEC.md` (current format version `4`, recorder schema
 history up to `9`). This is an intentional, total break — old `.rmgr` files
-are not expected to remain readable, and the version counter resets.
+are not expected to remain readable. The `version` counter does **not**
+reset, though: it continues incrementing (`4` → `5`), specifically so an old
+reader (or a human staring at a hex dump) sees an unfamiliar version number
+and knows unambiguously "this isn't a format I understand" instead of the
+number colliding in value with an unrelated earlier format.
 
 ## 1. Why
 
@@ -21,7 +27,7 @@ fixing:
 3. No clean way to support a second, structurally different game (e.g.
    Mario Kart 64) without it inheriting Smash-only fields like damage/stocks.
 4. Some spec language (historical bug narration, byte-level rationale) is
-   dead weight once the version resets.
+   dead weight now that this is a from-scratch rewrite.
 5. The format should double as a game-agnostic input recording (like
    `.krec`), with per-game analysis data layered on top only when the
    recorder recognizes the loaded ROM.
@@ -79,7 +85,7 @@ recorded:
 | Offset | Size | Type       | Field                    | Notes |
 |-------:|-----:|------------|---------------------------|-------|
 | 0x00   | 4    | `char[4]`  | `magic`                   | `R`,`M`,`G`,`R`, unchanged. |
-| 0x04   | 1    | `u8`       | `version`                 | Resets to `1`. **Deliberately collides in value (not in meaning) with the format's original pre-`goodName` v1** — accepted, given the tiny/prototype-only install base at this stage; flagged here rather than silently assumed. |
+| 0x04   | 1    | `u8`       | `version`                 | `5` — continues incrementing from the old spec's `4`, not reset. An old reader (or a human inspecting a file) sees a version number it has never seen before and correctly treats the file as unparseable, rather than the value colliding with an unrelated earlier format. |
 | 0x05   | 3    | `u8[3]`    | `reserved`                | Always zero. |
 | 0x08   | 16   | `char[16]` | `gameFamily`              | NUL-padded ASCII, e.g. `"smash64"`. Empty (all zero) if the loaded ROM wasn't recognized — core events are still valid in that case. |
 | 0x18   | 64   | `char[64]` | `goodName`                | Unchanged from v1: exact ROM build identity, NUL-padded, truncated if longer. |

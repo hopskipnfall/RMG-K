@@ -1,753 +1,515 @@
 # RMG-K Replay File Format (`.rmgr`) — Specification
 
-**Status:** format version `4`, implemented in `Source/RMG-Core/Replay.cpp` /
-`Source/RMG-Core/ReplayMemory.cpp` on the `feature/replay-file-format` branch.
+**Status:** format version `5`, design finalized on the
+`feature/replay-file-format` branch. **Not yet implemented** — this
+document describes the target format; `Source/RMG-Core/Replay.cpp` /
+`Source/RMG-Core/ReplayMemory.cpp` still implement format version `4` as of
+this writing. See `docs/superpowers/specs/2026-09-04-rmgr-v2-design.md` for
+the design rationale behind this rewrite.
 
-**Target game:** Super Smash Bros. (N64) — Smash Remix 2.0.1. The container
-format itself (header framing, event stream mechanics) isn't game-specific,
-and the header's `goodName`/`recorderSchemaVersion` (§3.3) exist precisely so
-a future file for a different ROM/game is identifiable without guessing —
-but the `GameStart`/`PostFrame` event field sets below are still
-Smash-specific; a genuinely different game would need its own event
-definitions, not just a different `goodName` value.
-
-This document is the authoritative description of the on-disk byte layout.
-If code and this document disagree, treat that as a bug — in either the code
-or the document — and fix the mismatch rather than trusting one side blindly.
+**Total break from version `4`.** Every version-`4` file becomes
+unreadable under this spec — there is no migration path and none is
+planned. `version` continues incrementing (`4` → `5`) rather than
+resetting, specifically so a reader that only understands `4` sees an
+unfamiliar number and correctly refuses to parse, rather than the value
+colliding with some earlier, unrelated meaning.
 
 ## 1. Overview
 
-A `.rmgr` file is a self-contained binary recording of one N64 match: every
-seated player's controller inputs, frame by frame, plus a snapshot of game
-state (position, damage, stocks, action state, …) read directly from
-emulated RAM. It is designed for two distinct consumers:
+A `.rmgr` file is a self-contained binary recording of one N64 match. It
+is designed for two distinct consumers:
 
-1. **Deterministic replay** — the recorded inputs are enough to re-simulate
-   the match from scratch.
-2. **Direct analysis** — the recorded game state is enough to build stats,
-   visualizations, or search tooling *without* re-running the emulator at
-   all.
+1. **Deterministic replay** — the recorded controller inputs are enough to
+   re-simulate the match from scratch.
+2. **Direct analysis** — recorded game state (position, damage, stocks,
+   action state, …) is enough to build stats, visualizations, or search
+   tooling *without* re-running the emulator at all.
+
+Two things distinguish this format from a plain input-recording format
+like `.krec`:
+
+- **It's split into two layers.** A small **core** event set (player
+  names, port slot types, controller inputs, match end) is always recorded
+  for *any* N64 title, recognized or not — this layer alone makes a
+  `.rmgr` file at least as useful as a `.krec` recording. A second,
+  **game-family-specific extension** event set (position, damage, stocks,
+  items, stage hazards, …) is only recorded when the loaded ROM's game
+  family is recognized by this recorder. A different, unrecognized N64
+  game still produces a valid, useful, input-only `.rmgr` file; a
+  recognized game gets the full analysis layer on top. See §2.
+- **The event stream is compressed.** Per-frame data is highly redundant
+  frame-to-frame, so the entire event stream (everything after the fixed
+  header) is deflate-compressed as a single block, written once when the
+  match ends. See §3.4.
 
 The design is modeled on [Slippi's `.slp` format](https://github.com/project-slippi/slippi-wiki/blob/master/SPEC.md)
-(Super Smash Bros. Melee / Dolphin) — a self-describing binary event stream —
-but is **not** byte-compatible with it, and deliberately drops or changes
-several of Slippi's choices. See §2.
+(Super Smash Bros. Melee / Dolphin) — a self-describing binary event stream
+— but is **not** byte-compatible with it, and deliberately drops or changes
+several of Slippi's choices.
 
-## 2. Design goals and explicit non-goals
+**Target platform:** N64 titles specifically (the container format is not
+attempting to be console-agnostic) — see §2 for how it generalizes across
+*different* N64 titles rather than different consoles.
 
-- **Streamed, not buffered.** A file is written incrementally, event by
-  event, for the duration of a match — never built up in memory and flushed
-  once at the end. A whole match's worth of per-frame data held in RAM is
-  wasteful, and streaming means a crash mid-match still leaves a usable,
-  truncated file on disk rather than nothing at all.
+## 2. Design goals
+
+- **Buffered, then written once.** Unlike version `4` (which streamed
+  events to disk incrementally, one write per event, specifically so a
+  crash mid-match left a usable truncated file), this format buffers the
+  entire match's events in memory as it plays and writes the file in a
+  single pass — header, then the compressed event-stream blob — only once
+  the match ends. Every header field (including both length fields) is
+  known before the first byte is written; there is no seek-back-and-patch
+  step. **Trade-off, accepted deliberately:** a crash or force-quit
+  mid-match now produces no file at all, not a truncated one. A match's
+  event data is at most a few MB, so holding it in RAM for a match's
+  duration is not a real memory concern.
 - **Self-describing, forward-compatible event stream, no schema compiler.**
   Every event is a 1-byte command code followed by a payload whose size was
-  declared up front by the very first event in the file (`EventPayloads`,
-  §4.1). A parser that doesn't recognize a command code can still skip it
+  declared up front by the very first event in the stream (`EventPayloads`,
+  §5.1). A parser that doesn't recognize a command code can still skip it
   correctly and keep reading — the file can grow new event types or new
   trailing fields on existing events without breaking old parsers, and an
   old file's smaller payload sizes are exactly as valid to a new parser.
-- **No FlatBuffers, no UBJSON, no schema-compiler toolchain.** FlatBuffers is
-  built around finishing one complete buffer atomically; adapting it to a
-  growing append-only stream means wrapping each event in its own
-  independently-finished message, at which point most of its actual benefit
-  (shared schema, zero-copy across a whole buffer) is gone and the per-message
-  overhead (vtable, root offset) is a real cost against file size at 50-60
-  events/sec. Slippi wraps its raw event stream in a UBJSON container
-  (`{"raw": <binary>, "metadata": {...}}`) to embed a binary blob inside a
-  JSON-like document; this format skips that problem entirely by not having
-  a JSON-like document — the file *is* the binary event stream, with a small
-  fixed binary header instead of a UBJSON wrapper.
-- **Little-endian**, matching the host platforms this project targets
-  (Linux/Windows, both little-endian in practice) — not Slippi's
-  big-endian, which was a holdover from the GameCube/Wii's native PowerPC
-  byte order and has no reason to carry over here. All multi-byte
-  integer and float fields in this document are little-endian unless
-  stated otherwise.
+  This mechanism is unchanged from version `4` and is already game-agnostic
+  — what's new in this version is *which* events exist and which layer
+  (§2.1) each belongs to, not the mechanism itself.
+- **Core vs. game-family-extension event layering.** See §2.1.
+- **No FlatBuffers, no UBJSON, no schema-compiler toolchain.** Same
+  rationale as version `4`: FlatBuffers' benefits don't survive being
+  wrapped per-event in a growing append-only stream, and this format skips
+  the JSON-like-wrapper problem entirely by not having one — the
+  decompressed stream *is* the binary event data.
+- **Little-endian**, matching the host platforms this project targets.
+  All multi-byte integer and float fields in this document are
+  little-endian unless stated otherwise.
 - **Native struct layout, no bit-packing.** Every event payload is a
   fixed-size, `#pragma pack(push, 1)` C struct with no padding and no
   bitfields — the byte layout tables below are exactly `sizeof()` that
-  struct, field by field, in declaration order.
+  struct, field by field, in declaration order. Space efficiency is
+  achieved by compressing the resulting stream (§3.4), not by hand-rolled
+  bit-packing or delta-encoding of the struct layout itself.
+
+### 2.1 The core / game-family-extension split
+
+Every `.rmgr` file always contains the **core** event set: `MatchStart`
+(player names, port slot types), `InputFrame` (controller state, one per
+seated port per frame), and `MatchEnd` (final frame count, end reason).
+This is deliberately close to a `.krec`-equivalent recording — enough to
+know who played, on which ports, and what they pressed, for *any* N64
+title, whether or not this recorder has ever heard of it.
+
+A file *additionally* contains a **game-family extension** event set when
+`FileHeader.gameFamily` (§3.1) is non-empty — i.e. when this recorder
+specifically knows how to read that title's memory layout. Right now
+exactly one family is defined, `smash64` (§4), covering Smash Remix and
+(in principle) vanilla SSB64. A future family (e.g. Mario Kart 64) would
+define its own, entirely separate extension event set under its own
+`gameFamily` string — it would never carry Smash-only fields like
+`damagePercent` or `stocksRemaining`, the same way `smash64` files never
+carry fields a future racing-game family would need.
+
+`gameFamily` is a coarser identity than `goodName` (§3.2): `goodName`
+pins down the exact ROM build a file came from; `gameFamily` tells a
+reader which extension event *definitions* apply, without that reader
+needing to maintain its own list of every `goodName` string that has ever
+meant "this is Smash." A new Smash Remix build is automatically readable
+by any tool that already understands `gameFamily == "smash64"`, with zero
+changes to that tool, the moment its recorder starts stamping that family
+string.
 
 ## 3. File structure
 
 ```
 +----------------+----------------------------------------+
-| File Header    | 92 bytes, fixed                         |
+| File Header    | 112 bytes, fixed, uncompressed          |
 +----------------+----------------------------------------+
-| Event Stream   | variable length, sequence of events      |
-|                | (EventPayloads, then GameStart, then     |
-|                | interleaved PreFrame/PostFrame per real   |
-|                | frame, then GameEnd)                      |
+| Event Stream   | deflate-compressed block, decompresses  |
+| (compressed)   | to the sequence of events described in  |
+|                | §4/§5                                    |
 +----------------+----------------------------------------+
 ```
 
 There is no footer, no trailing metadata block, and no UBJSON/JSON wrapper
-of any kind — the event stream *is* the rest of the file, up to
-`streamLength` bytes (§3.1) after the header, or up to EOF for a file whose
-recording session never cleanly finished.
+of any kind. The header is followed immediately by exactly
+`compressedLength` (§3.1) bytes of deflate-compressed data — nothing
+before it, nothing after it, no framing around the compressed block itself.
 
-### 3.1 File header (92 bytes)
+### 3.1 File header (112 bytes)
 
-| Offset | Size | Type       | Field                  | Notes                                                  |
-|-------:|-----:|------------|------------------------|---------------------------------------------------------|
-| 0x00   | 4    | `char[4]`  | `magic`                | Always the ASCII bytes `R`, `M`, `G`, `R` (no NUL).      |
-| 0x04   | 1    | `u8`       | `version`               | Format version. `4` for everything described here.      |
-| 0x05   | 3    | `u8[3]`    | `reserved`              | Always zero. Reserved for future header fields.          |
-| 0x08   | 4    | `u32`      | `streamLength`          | Byte length of the event stream that follows the header. |
-| 0x0C   | 64   | `char[64]` | `goodName`              | The recorded ROM's `GoodName` (mupen64plus-core's ROM database identity string), UTF-8, NUL-padded — not necessarily NUL-terminated if it fills the field. Truncated if longer than 64 bytes. |
-| 0x4C   | 4    | `u32`      | `recorderSchemaVersion` | This recorder's revision of its own understanding of `goodName`'s memory layout — see §3.3. |
-| 0x50   | 8    | `u64`      | `recordedAtEpochMillis` | Wall-clock time the recording started, **milliseconds** since the Unix epoch (UTC) — from `std::chrono::system_clock`. Independent of the filename's timestamp (§3.4), though the recorder writes the same instant to both (truncated to whole seconds there — see §3.4). |
-| 0x58   | 4    | `u32`      | `recordedAtNanosOffset`| Nanosecond offset *within* `recordedAtEpochMillis`'s millisecond — i.e. `recordedAtEpochMillis * 1_000_000 + recordedAtNanosOffset` is the full-precision epoch time in nanoseconds, for callers that want to align multiple recordings from the same session more precisely than a millisecond. Range `0`-`999999`. Best-effort: written as `0` whenever the value being written doesn't come from a clock read directly (see §3.4's headless-export path) — readers should treat `0` as "no sub-millisecond precision available," not literally "exactly on the millisecond boundary." |
+| Offset | Size | Type       | Field                    | Notes |
+|-------:|-----:|------------|---------------------------|-------|
+| 0x00   | 4    | `char[4]`  | `magic`                   | Always the ASCII bytes `R`, `M`, `G`, `R` (no NUL). |
+| 0x04   | 1    | `u8`       | `version`                 | Format version. `5` for everything described here. Continues incrementing from version `4`'s files rather than resetting — see the note at the top of this document. |
+| 0x05   | 3    | `u8[3]`    | `reserved`                | Always zero. Reserved for future header fields. |
+| 0x08   | 16   | `char[16]` | `gameFamily`              | NUL-padded ASCII identifier for which game-family extension event set (§2.1, §4) applies, e.g. `"smash64"`. **All-zero** (empty) if the loaded ROM's game family isn't recognized by this recorder — the file is still a fully valid core-only recording in that case, just with no extension events. Truncated if longer than 16 bytes (no defined family name is expected to need that much room). |
+| 0x18   | 64   | `char[64]` | `goodName`                | The recorded ROM's `GoodName` (mupen64plus-core's ROM database identity string), UTF-8, NUL-padded — not necessarily NUL-terminated if it fills the field. Truncated if longer than 64 bytes. All-zero if the ROM database has no identity for the loaded ROM. |
+| 0x58   | 4    | `u32`      | `recorderSchemaVersion`   | This recorder's revision of its own understanding of `goodName`'s memory layout — see §3.3. `0` when `gameFamily` is empty (no extension schema applies to an unrecognized game). |
+| 0x5C   | 8    | `u64`      | `recordedAtEpochMillis`   | Wall-clock time the recording started, **milliseconds** since the Unix epoch (UTC) — from `std::chrono::system_clock`. Independent of the filename's timestamp (§3.5), though the recorder writes the same instant to both (truncated to whole seconds there). |
+| 0x64   | 4    | `u32`      | `recordedAtNanosOffset`   | Nanosecond offset *within* `recordedAtEpochMillis`'s millisecond — i.e. `recordedAtEpochMillis * 1_000_000 + recordedAtNanosOffset` is the full-precision epoch time in nanoseconds. Range `0`-`999999`. Best-effort: written as `0` whenever the value being written doesn't come from a clock read directly (see §3.5's headless-export path) — readers should treat `0` as "no sub-millisecond precision available," not literally "exactly on the millisecond boundary." |
+| 0x68   | 4    | `u32`      | `uncompressedLength`      | Byte length of the event stream *after* decompression. Lets a reader preallocate its decompression output buffer instead of growing it dynamically. |
+| 0x6C   | 4    | `u32`      | `compressedLength`        | Byte length of the deflate-compressed block immediately following the header — i.e. `header_size (112) + compressedLength` is the total file size. Always correct on disk: because the whole match is buffered before anything is written (§2), there is no "0 until finalized" convention like version `4` had, and no truncated-but-valid file is possible — see §2's buffering trade-off. |
 
-**`streamLength` is written as `0` when the file is opened**, and is the
-*only* field patched after the fact: once the match ends (or is otherwise
-finalized), the recorder seeks back to offset `0x08` and writes the real
-length, then closes the file. This is a direct crash-safety trick: a reader
-can tell "was this file's recording session ever cleanly finished" just by
-checking whether `streamLength` is nonzero, and a file left at `streamLength
-== 0` (the process died, or the emulator was killed, mid-match) is still a
-valid, parseable, truncated recording — a reader should fall back to reading
-events until EOF instead of trusting the header's length in that case.
+### 3.2 `goodName`, `gameFamily`, and `recorderSchemaVersion` — three independent axes
 
-### 3.2 Event stream
+Three fields, three different questions, and conflating any two of them is
+the mistake to avoid:
 
-A sequence of events, back to back, no padding between them:
+- **`gameFamily`** identifies *which extension event definitions apply* —
+  a coarse, slow-growing identifier (§2.1). Empty means "core events only,
+  no extension layer, whatever this ROM is isn't recognized."
+- **`goodName`** identifies *which exact ROM build* produced the file — a
+  unique identity within a family, not the family itself. `SmashRemix2.0.1`
+  and a hypothetical `SmashRemix2.0.2` are different `goodName`s, both
+  under `gameFamily = "smash64"`, even though they're the "same" mod,
+  because their memory layouts can differ build to build.
+- **`recorderSchemaVersion`** identifies *which revision of this
+  recorder's interpretation* of that specific `goodName`'s memory layout
+  produced the file. It's bumped whenever that interpretation changes in a
+  way that affects recorded output — which includes but isn't limited to
+  adding a new field. A fix to an *existing* field's offset (silently
+  changing recorded *values* without changing any event's declared byte
+  size) needs a bump too, since the per-event `EventPayloads`
+  declared-size mechanism (§6) has no way to signal that on its own.
 
-```
-+------+----------------------------+
-| 1B   | command code               |
-+------+----------------------------+
-| N B  | payload (N declared by      |
-|      | the EventPayloads event)   |
-+------+----------------------------+
-```
+`recorderSchemaVersion` is its own counter **per `goodName`**, not global
+and not per-`gameFamily`: `SmashRemix2.0.1` schema `3` and
+`SmashRemix2.0.2` schema `1` are unrelated numbering spaces, each starting
+fresh at `1` for that `goodName`'s first supported revision. This is
+deliberately how one shared `gameFamily` accommodates ROM builds with
+different field sets — e.g. Smash Remix's extra settings (teams, handicap,
+CPU level, item frequency, a wider character-ID range) that a
+hypothetical vanilla-SSB64 recorder wouldn't have are just later-schema
+field-appends (§6) on the shared `smash64` extension events. A
+vanilla-only reader simply never advances far enough in schema version to
+know about Remix-only trailing fields, and the per-file `EventPayloads`
+declared size means it never misreads them either.
 
-The very first event in every file is always `EventPayloads` (`0x01`, §4.1).
-Every subsequent event is one of `GameStart` (`0x02`, once, immediately
-after `EventPayloads`), `PreFrameUpdate` (`0x03`), `PostFrameUpdate`
-(`0x04`), `ItemUpdate` (`0x06`, schema v2+, see §4.6), `StageHazardUpdate`
-(`0x07`, schema v3+, see §4.7), or `GameEnd` (`0x05`, once, at the very end
-— present only if the recording session finished cleanly).
+A reader that only knows how to interpret one specific `(gameFamily,
+goodName, recorderSchemaVersion)` combination should check all three
+explicitly before trusting an extension event's semantics, rather than
+assuming every file it can open was produced by the same recorder
+revision it was built against. Core events (§4.1-§4.3) need none of this
+— they're valid to read regardless of `gameFamily`/`goodName`.
 
-For each real emulated frame that the match is actively ongoing
-(`game_status == 1`, see §7.5) and has at least one seated port, the
-recorder writes one `PreFrameUpdate` immediately followed by one
-`PostFrameUpdate` for each seated port, ports visited in ascending order
-(0, 1, 2, 3) — i.e. for a 2-player match on ports 0 and 1, frame N looks
-like `Pre(port 0), Post(port 0), Pre(port 1), Post(port 1)`. Ports that are
-empty or unseated that frame have no events at all — never a zeroed/dummy
-event — so a reader must not assume every frame has all four ports present,
-and must not assume a fixed number of events per frame.
+### 3.3 Filename convention
 
-That same frame N is then followed by zero or more `ItemUpdate` events, one
-per Item/Weapon `GObj` currently live and not currently held by a fighter
-(§4.6) — zero if none are live this frame, again never a zeroed/dummy event.
-Items and Weapons live on two separate `GObj` lists, not one shared list
-(§4.6/§7.6). After
-those, zero or one `StageHazardUpdate` event (§4.7) — written only if at
-least one tracked hazard is currently active. A reader correlates both
-event types to a frame via their own `frame` field, the same way it
-correlates a `PreFrameUpdate`/`PostFrameUpdate` pair.
-
-### 3.3 `goodName` and `recorderSchemaVersion` — two independent axes
-
-These two fields exist to answer two different questions, and conflating
-them is the mistake to avoid:
-
-- **`goodName`** identifies *which ROM build* produced the file — a unique
-  identity, not a family. `SmashRemix2.0.1` and a hypothetical
-  `SmashRemix2.0.2` are different `goodName`s even though they're the "same"
-  mod, because their memory layouts can differ.
-- **`recorderSchemaVersion`** identifies *which revision of this recorder's
-  interpretation* of that specific `goodName`'s memory layout produced the
-  file. It's bumped whenever that interpretation changes in a way that
-  affects recorded output — which includes but isn't limited to adding a new
-  field. A fix to an *existing* field's offset (silently changing recorded
-  *values* without changing any event's declared byte size) needs a bump
-  too, since the per-event `EventPayloads` declared-size mechanism (§5) has
-  no way to signal that on its own.
-
-`recorderSchemaVersion` is its own counter **per `goodName`**, not global:
-`SmashRemix2.0.1` schema `3` and `SmashRemix2.0.2` schema `1` are unrelated
-numbering spaces, each starting fresh at `1` for that `goodName`'s first
-supported revision.
-
-A reader that only knows how to interpret one specific `(goodName,
-recorderSchemaVersion)` pair should check both explicitly before trusting
-any event payload's semantics, rather than assuming every file it can parse
-was produced by the same game and recorder revision it was built against.
-
-### 3.4 Filename convention
-
-Not part of the on-disk format itself (a reader must not depend on it — the
-header's own `recordedAtEpochMillis` is the source of truth for when a
-recording started, precisely because filenames get renamed/copied/re-shared
-and can't be trusted), but the recorder names files
+Not part of the on-disk format itself (a reader must not depend on it —
+the header's own `recordedAtEpochMillis` is the source of truth for when a
+recording started), but the recorder names files
 `YYYYMMDD-HHMMSS[-Player1][-Player2]...rmgr` — 4-digit year, 24-hour clock,
-local time, one hyphen-joined segment per seated player's name (each capped
-at 24 characters, filesystem-unsafe characters replaced with `_`). The
-timestamp reflects the same instant written to `recordedAtEpochMillis`,
-just truncated to whole seconds and rendered as local wall-clock time
-instead of a UTC epoch value.
+local time, one hyphen-joined segment per seated player's name (each
+sourced from `MatchStart.playerNames`, §4.1, capped at 24 characters,
+filesystem-unsafe characters replaced with `_`). The timestamp reflects the
+same instant written to `recordedAtEpochMillis`, just truncated to whole
+seconds and rendered as local wall-clock time instead of a UTC epoch
+value.
 
 If that name is already taken (e.g. two matches recorded within the same
 second), the recorder appends `-2`, `-3`, ... before the extension until it
 finds a free name, rather than overwriting an existing file.
 
 Headless export of an existing `.krec` (see `Replay::SetOutputPathOverride()`)
-uses a different, caller-chosen base name instead - by convention
-`<krec name>.rmgr`, the same stem as the source `.krec` it was exported from,
-so the two plainly correspond by name. Each match within that `.krec` gets
-its own explicitly-numbered file from that base: `<krec name>-1.rmgr`,
-`<krec name>-2.rmgr`, ... (not just `<krec name>.rmgr` for the first match).
-The same collision-avoidance above still applies on top, e.g. if the same
-`.krec` is exported a second time.
+uses a different, caller-chosen base name instead — by convention
+`<krec name>.rmgr`, the same stem as the source `.krec` it was exported
+from. Each match within that `.krec` gets its own explicitly-numbered file:
+`<krec name>-1.rmgr`, `<krec name>-2.rmgr`, ... The same collision-avoidance
+above still applies on top.
 
-For this headless export path, `recordedAtEpochMillis` is **not** wall-clock
-export time (headless replay can run at up to 2000% speed, so that would
-reflect when the export happened to reach that match, not when it was
-originally played). Instead it's derived from the source `.krec`'s own
-recording-start timestamp (that file's header, or a filename-derived
-fallback if the header's is missing/zero - see
-`KailleraExport::ParseKrecFile()`, still only second-resolution — that's an
-external, third-party format this project doesn't control), plus how many
-of the `.krec`'s own input frames have been consumed by the time that match
-is reached, converted to milliseconds (`elapsedFrames * 1000 / 60`, rounded
-to the nearest millisecond) under the assumption that the original
-recording ran at a constant 60fps (true for any real Kaillera session) -
-see `Replay::SetRecordedAtBaseOverride()`. This gives frame-accurate
-(~16.67ms) relative offsets between matches recorded from the same
-multi-game `.krec`, even though the *base* instant they're offset from is
-still only second-accurate. `recordedAtNanosOffset` is always `0` for this
-path — there's no sub-millisecond information to derive it from. The
-exported filename itself is still just `<krec name>-N.rmgr` as above, not
-timestamp-based, for this path.
+For this headless export path, `recordedAtEpochMillis` is derived from the
+source `.krec`'s own recording-start timestamp plus elapsed frames
+converted to milliseconds under a constant-60fps assumption — unchanged
+from version `4`'s approach; see `Replay::SetRecordedAtBaseOverride()`.
+`recordedAtNanosOffset` is always `0` for this path.
 
-## 4. Events
+### 3.4 Compression
 
-### 4.1 Event Payloads — code `0x01`
+Everything after the 112-byte header is one deflate-compressed block,
+covering the entire event stream (§4/§5) — `EventPayloads` through the
+final `MatchEnd`/`MatchResult`. Compressed at the highest available
+deflate level; this only costs CPU time once, at match end, not per frame,
+since the recorder buffers events in memory during the match (§2) rather
+than compressing incrementally.
 
-Always the first event in the file. Declares the exact payload size (not
-including the 1-byte command code) of every other event type this file
-uses. This is the entire forward-compatibility mechanism: a parser that
-doesn't recognize a command code looks it up here and skips exactly that
-many bytes, rather than guessing or breaking.
+The header itself is **not** compressed — `magic`, `version`, `gameFamily`,
+`goodName`, and the timestamp fields are readable by any tool without
+decompressing anything, which matters for a file browser or library UI
+that wants to list many recordings' identity/timestamp without paying the
+cost of decompressing each one's (much larger) event stream.
 
-| Offset | Size    | Type      | Field         | Notes                                          |
-|-------:|--------:|-----------|---------------|--------------------------------------------------|
-| 0x00   | 1       | `u8`      | `count`       | Number of `(code, size)` entries that follow.    |
-| 0x01   | 3×count | see below | `entries`     | `count` repetitions of the 3-byte entry below.   |
+A reader decompresses exactly `compressedLength` bytes starting at file
+offset `112` (`0x70`) and should get back exactly `uncompressedLength`
+bytes of event-stream data (§4/§5) to parse as described below. There is
+no partial-file/truncated-recording case to handle for the event stream
+itself: because the whole match is buffered before any of this is written
+(§2), a `.rmgr` file on disk is either the complete, valid output of a
+match that reached `MatchEnd`, or the file doesn't exist at all.
 
-Each entry:
+## 4. Core events
 
-| Offset (rel.) | Size | Type  | Field  | Notes                                    |
-|---------------:|-----:|-------|--------|-------------------------------------------|
-| +0x00          | 1    | `u8`  | `code` | The event command code this entry describes. |
-| +0x01          | 2    | `u16` | `size` | That event's payload size, in bytes.      |
+Always present in every file, regardless of `gameFamily`.
 
-v1 always declares exactly 4 entries, in this order: `GameStart`,
-`PreFrameUpdate`, `PostFrameUpdate`, `GameEnd` — currently sized 164, 9, 50,
-and 5 bytes respectively (`GameStart` grew from its original 150 bytes and
-`PostFrameUpdate` from its original 42 bytes via the field-append mechanism
-in §5; see §4.2/§4.4's notes on that). Recorder schema v2 (§3.3) declares a
-5th entry, `ItemUpdate` (§4.6); schema v3 declares a 6th, `StageHazardUpdate`
-(§4.7); schema v5 declares a 7th and 8th, `HitboxUpdate` (§4.8) and
-`HurtboxUpdate` (§4.9) — all new event types, not field appends, per §5's
-second mechanism. A future format version could declare still more entries or the
-same entries with even larger sizes — see §5. **A parser must always read
-an event's size from that file's own `EventPayloads` event, never hardcode
-it, and must always read `count` itself rather than assuming a fixed number
-of entries** — this is exactly why: an old parser reading a newer-schema
-file that correctly implements both of those still parses it correctly,
-skipping entries it doesn't recognize.
+### 4.1 Match Start — code `0x02`
 
-### 4.2 Game Start — code `0x02`
+Written exactly once, as the first event after `EventPayloads`. Player
+display names are sourced from netplay room metadata (RMG-K's own
+slot-indexed name table, populated by every netplay path), never from any
+in-game name tag — for an offline match, or a port with no assigned name,
+the corresponding `playerNames` entry is all zero bytes.
 
-Written exactly once, immediately after `EventPayloads`. Everything static
-for the whole match — nothing here changes frame to frame. **Player display
-names are sourced from netplay room metadata (RMG-K's own slot-indexed name
-table, populated by every netplay path), never from Smash Remix's in-game
-name tags** — for an offline match, or a port with no assigned name, the
-corresponding `playerNames` entry is all zero bytes.
+Payload size: **132 bytes.**
 
-Payload size: **164 bytes.**
+| Offset | Size | Type        | Field         | Notes |
+|-------:|-----:|-------------|---------------|-------|
+| 0x00   | 128  | `char[4][32]` | `playerNames` | 4× a 32-byte, NUL-padded (not necessarily NUL-terminated if exactly 32 chars) name string, port 0-3 in order. |
+| 0x80   | 4    | `u8[4]`     | `slotType`    | Per port 0-3: `0` human, `1` CPU, `2` empty. |
 
-| Offset | Size | Type      | Field                | Notes                                                    |
-|-------:|-----:|-----------|-----------------------|------------------------------------------------------------|
-| 0x00   | 1    | `u8`      | `stageId`             | See §7.2.                                                  |
-| 0x01   | 1    | `u8`      | `gameType`             | `1` time, `2` stock, `3` both (Remix always forces stock). |
-| 0x02   | 1    | `u8`      | `stockCountSetting`    | 0-based (i.e. `2` means "3 stocks").                       |
-| 0x03   | 1    | `u8`      | `timeLimitMinutes`     | `100` = infinite.                                          |
-| 0x04   | 1    | `u8`      | `damageRatio`          | `50` = 50%, `200` = 200%.                                  |
-| 0x05   | 1    | `u8`      | `itemFrequency`        | `0` none .. `5` high.                                      |
-| 0x06   | 16   | struct[4] | `ports`                | 4× the 4-byte `PortSettings` struct below, port 0-3 in order. |
-| 0x16   | 128  | char[4][32]| `playerNames`         | 4× a 32-byte, NUL-padded (not necessarily NUL-terminated if exactly 32 chars) name string, port 0-3 in order. |
-| 0x96   | 1    | `u8`      | `teamsEnabled`         | `0` off, `1` on. **Appended field** — see the note below the table. |
-| 0x97   | 1    | `u8`      | `handicapMode`         | `0` off, `1` on, `2` auto.                                 |
-| 0x98   | 4    | `u8[4]`   | `portTeam`             | Team number per port, index = port 0-3.                    |
-| 0x9C   | 4    | `u8[4]`   | `portHandicap`         | Per-port handicap value, meaningful only when `handicapMode != 0`. |
-| 0xA0   | 4    | `u8[4]`   | `portCpuLevel`         | CPU difficulty per port; meaningless for a `human` port.    |
+Game-family-specific match settings (stage, character, stock count,
+damage ratio, items, teams, handicap, CPU difficulty, …) are **not** part
+of this event — see `MatchSettings` (§5.1) for the `smash64` extension
+equivalent. A game-agnostic reader (or a recognized-but-not-yet-supported
+title) has everything it needs from `MatchStart`/`InputFrame`/`MatchEnd`
+alone to reconstruct who played what inputs, on which ports.
 
-**`teamsEnabled` through `portCpuLevel` (offsets `0x96`-`0xA3`) were appended
-after the original v1 fields** (`stageId` through `playerNames`, offsets
-`0x00`-`0x95`, unchanged since the format's first version) — per §5's
-field-addition rule, this is why they sit after `playerNames` rather than
-next to the other match-wide settings at the top of the struct. The four
-`port*` arrays require the same player-object/player-struct pointer chase
-as Post-Frame Update (§4.4); if a ReadPortMatchInfo/ReadPortPlayerState open
-finds a port's characters not yet spawned (e.g. `GameStart` was written
-during the pre-match countdown, before `game_status` reaches `1`), that
-port's `portTeam`/`portHandicap`/`portCpuLevel` entries are left at `0`
-rather than the real value — a reader can't distinguish "genuinely 0" from
-"not available yet" for these three fields alone.
+### 4.2 Input Frame — code `0x03`
 
-`PortSettings` (4 bytes, repeated 4× inline above at offset `0x06` — **not**
-a separately declared event, just a fixed sub-layout within `GameStart`,
-and distinct from the appended `portTeam`/`portHandicap`/`portCpuLevel`
-arrays above):
+Input-side data, captured **before** the game processes that frame's
+inputs. One event per seated port per frame. Uses the game's
+already-processed button/stick values, which is the one input
+representation available uniformly for **both** human and CPU-controlled
+ports.
 
-| Offset (rel.) | Size | Type | Field         | Notes                              |
-|---------------:|-----:|------|---------------|--------------------------------------|
-| +0x00          | 1    | `u8` | `slotType`     | `0` human, `1` CPU, `2` empty.       |
-| +0x01          | 1    | `u8` | `characterId`  | See §7.1. Meaningless if `slotType == 2`. |
-| +0x02          | 1    | `u8` | `costumeId`    |                                        |
-| +0x03          | 1    | `u8` | `teamColor`    |                                        |
-
-### 4.3 Pre-Frame Update — code `0x03`
-
-Input-side data, captured **before** the game processes that frame's inputs.
-One event per seated port per frame (§3.2). Uses the game's already-processed
-button/stick values (`playerStruct+0x1BC/+0x1C2/+0x1C3` — see
-`Source/RMG-Core/ReplayMemory.cpp`), which is the one input representation
-available uniformly for **both** human and CPU-controlled ports; the raw
-physical-controller struct (`+0x1B0`) is human-ports-only and is not
-recorded.
+Named `InputFrame` (not `PreFrameUpdate`, version `4`'s name) since this
+event has no game-family-specific counterpart to be "pre-" relative to —
+it's the entire core per-frame input record, full stop.
 
 Payload size: **9 bytes.**
 
-| Offset | Size | Type   | Field     | Notes                                                        |
-|-------:|-----:|--------|-----------|-----------------------------------------------------------------|
-| 0x00   | 4    | `i32`  | `frame`   | Frame counter, `0` at the first frame this match's recording enters the "ongoing" game state (`game_status == 1`). Monotonically increasing, one recorded frame per real emulated frame. |
-| 0x04   | 1    | `u8`   | `port`    | `0`-`3`.                                                        |
-| 0x05   | 2    | `u16`  | `buttons` | Processed button bitmask. See §7.4.                             |
-| 0x07   | 1    | `i8`   | `stickX`  | Processed stick X, signed.                                      |
-| 0x08   | 1    | `i8`   | `stickY`  | Processed stick Y, signed.                                      |
+| Offset | Size | Type   | Field     | Notes |
+|-------:|-----:|--------|-----------|-------|
+| 0x00   | 4    | `i32`  | `frame`   | Frame counter, `0` at the first frame this match's recording enters the "ongoing" game state. Monotonically increasing, one recorded frame per real emulated frame. |
+| 0x04   | 1    | `u8`   | `port`    | `0`-`3`. |
+| 0x05   | 2    | `u16`  | `buttons` | Processed button bitmask. See §7.4. |
+| 0x07   | 1    | `i8`   | `stickX`  | Processed stick X, signed. |
+| 0x08   | 1    | `i8`   | `stickY`  | Processed stick Y, signed. |
 
-### 4.4 Post-Frame Update — code `0x04`
+### 4.3 Match End — code `0x05`
+
+Written exactly once, as the last event in the stream.
+
+Payload size: **5 bytes.**
+
+| Offset | Size | Type   | Field        | Notes |
+|-------:|-----:|--------|--------------|-------|
+| 0x00   | 4    | `i32`  | `finalFrame` | The last `frame` value seen in any `InputFrame` event this match — total recorded match length. |
+| 0x04   | 1    | `u8`   | `endReason`  | `0` aborted (match reset, or the emulator/process stopped mid-match — these two causes are not currently distinguished), `1` normal end. |
+
+Final per-port results (e.g. Smash's stocks-remaining placements) are not
+a universal concept across N64 titles and are **not** part of this event
+— see `MatchResult` (§5.4) for the `smash64` extension equivalent.
+
+## 5. `smash64` game-family extension events
+
+Present only when `FileHeader.gameFamily == "smash64"`. Covers Smash Remix
+today; the field set is written to also accommodate a hypothetical vanilla
+SSB64 recorder via `recorderSchemaVersion`-scoped field-appends (§3.2) —
+none of that is implemented yet, but the layering doesn't assume Remix
+specifically.
+
+### 5.0 Event Payloads — code `0x01`
+
+Always the first event in the decompressed stream. Declares the exact
+payload size (not including the 1-byte command code) of every other event
+type this file uses — the entire forward-compatibility mechanism a parser
+relies on to skip codes it doesn't recognize.
+
+| Offset | Size    | Type      | Field         | Notes |
+|-------:|--------:|-----------|---------------|-------|
+| 0x00   | 1       | `u8`      | `count`       | Number of `(code, size)` entries that follow. |
+| 0x01   | 3×count | see below | `entries`     | `count` repetitions of the 3-byte entry below. |
+
+Each entry:
+
+| Offset (rel.) | Size | Type  | Field  | Notes |
+|---------------:|-----:|-------|--------|-------|
+| +0x00          | 1    | `u8`  | `code` | The event command code this entry describes. |
+| +0x01          | 2    | `u16` | `size` | That event's payload size, in bytes. |
+
+A file with `gameFamily` empty declares only the three core codes
+(`MatchStart`, `InputFrame`, `MatchEnd`). A `smash64` file declares those
+three plus the five below. **A parser must always read an event's size
+from that file's own `EventPayloads` event, never hardcode it, and must
+always read `count` itself rather than assuming a fixed number of
+entries** — this is exactly why a reader that doesn't recognize a
+`gameFamily` (or an older reader facing a newer schema's appended fields)
+can still parse the rest of a file correctly.
+
+### 5.1 Match Settings — code `0x08`
+
+Written exactly once, immediately after `MatchStart`. Everything
+Smash-specific and static for the whole match. If a port's characters
+aren't yet spawned when this is captured (e.g. written during the
+pre-match countdown), that port's `characterId`/`costumeId`/`teamColor`/
+`portTeam`/`portHandicap`/`portCpuLevel` entries are left at `0` rather
+than the real value — a reader can't distinguish "genuinely 0" from "not
+available yet" for those alone.
+
+Payload size: **32 bytes.**
+
+| Offset | Size | Type    | Field                | Notes |
+|-------:|-----:|---------|-----------------------|-------|
+| 0x00   | 1    | `u8`    | `stageId`             | See §7.2. |
+| 0x01   | 1    | `u8`    | `gameType`            | `1` time, `2` stock, `3` both (Remix always forces stock). |
+| 0x02   | 1    | `u8`    | `stockCountSetting`   | 0-based (i.e. `2` means "3 stocks"). |
+| 0x03   | 1    | `u8`    | `timeLimitMinutes`    | `100` = infinite. |
+| 0x04   | 1    | `u8`    | `damageRatio`         | `50` = 50%, `200` = 200%. |
+| 0x05   | 1    | `u8`    | `itemFrequency`       | `0` none .. `5` high. |
+| 0x06   | 1    | `u8`    | `teamsEnabled`        | `0` off, `1` on. |
+| 0x07   | 1    | `u8`    | `handicapMode`        | `0` off, `1` on, `2` auto. |
+| 0x08   | 4    | `u8[4]` | `characterId`         | Per port 0-3. See §7.1. Meaningless for a port whose `MatchStart.slotType == 2` (empty). |
+| 0x0C   | 4    | `u8[4]` | `costumeId`           | Per port 0-3. |
+| 0x10   | 4    | `u8[4]` | `teamColor`           | Per port 0-3. |
+| 0x14   | 4    | `u8[4]` | `portTeam`            | Team number per port 0-3. |
+| 0x18   | 4    | `u8[4]` | `portHandicap`        | Per-port handicap value, meaningful only when `handicapMode != 0`. |
+| 0x1C   | 4    | `u8[4]` | `portCpuLevel`        | CPU difficulty per port; meaningless for a `human` port. |
+
+### 5.2 State Frame — code `0x04`
 
 State-side data, captured **after** that frame's physics/collision
 resolution — the resulting state. One event per seated port per frame,
-always immediately following that port's `PreFrameUpdate` in the stream.
+always immediately following that port's `InputFrame` in the stream.
+
+Named `StateFrame` (not `PostFrameUpdate`, version `4`'s name) for the
+same reason as `InputFrame` above — it's paired with the core input event
+by convention/ordering, not by a "Pre/Post" naming relationship baked into
+the format itself.
 
 Payload size: **50 bytes.**
 
-| Offset | Size | Type   | Field                | Notes                                                            |
-|-------:|-----:|--------|------------------------|---------------------------------------------------------------------|
-| 0x00   | 4    | `i32`  | `frame`                | Same frame counter as the paired `PreFrameUpdate`.                   |
-| 0x04   | 1    | `u8`   | `port`                 | `0`-`3`.                                                              |
-| 0x05   | 1    | `u8`   | `characterId`           | See §7.1.                                                             |
-| 0x06   | 2    | `u16`  | `actionStateId`         | See §7.3.                                                             |
-| 0x08   | 4    | `f32`  | `positionX`             | IEEE-754 single precision.                                            |
-| 0x0C   | 4    | `f32`  | `positionY`             |                                                                        |
-| 0x10   | 4    | `i32`  | `facingDirection`       | `1` = facing right, `-1` = facing left. (Integer in this game, not a float like Slippi's Melee-derived field.) |
-| 0x14   | 4    | `f32`  | `velocityX`             |                                                                        |
-| 0x18   | 4    | `f32`  | `velocityY`             |                                                                        |
-| 0x1C   | 4    | `u32`  | `damagePercent`         | Whole-number percent, as the game itself stores it (not a float).     |
-| 0x20   | 1    | `i8`   | `stocksRemaining`       | 0-based; negative once eliminated.                                    |
-| 0x21   | 1    | `u8`   | `jumpsRemaining`        | Schema v7+. `jumpsMax` (per-character, from `FTAttributes`) minus `jumps_used` (`playerStruct+0x148`, a `u8` that resets to `0` on landing). `0` through most of a grounded match is normal, not a sign of a broken read; Smash Remix can also force this to `0` without that many real jump inputs (e.g. certain up-specials write `jumps_used = jumps_max` directly). Named/interpreted as `jumpsUsed` through schema v6 - that read was at the wrong width (`u32` instead of `u8`, landing on padding on a word-swapped emulator without the byte-read address XOR) and read a constant `0` for an entire match, every port, regardless of real jump activity. **Schema v6 and earlier files' byte here is meaningless - it's that bug's output, not real data.** |
-| 0x22   | 1    | `u8`   | `groundedState`         | `0` grounded, `1` airborne.                                           |
+| Offset | Size | Type   | Field                | Notes |
+|-------:|-----:|--------|------------------------|-------|
+| 0x00   | 4    | `i32`  | `frame`                | Same frame counter as the paired `InputFrame`. |
+| 0x04   | 1    | `u8`   | `port`                 | `0`-`3`. |
+| 0x05   | 1    | `u8`   | `characterId`           | See §7.1. |
+| 0x06   | 2    | `u16`  | `actionStateId`         | See §7.3. |
+| 0x08   | 4    | `f32`  | `positionX`             | IEEE-754 single precision. |
+| 0x0C   | 4    | `f32`  | `positionY`             | |
+| 0x10   | 4    | `i32`  | `facingDirection`       | `1` = facing right, `-1` = facing left. |
+| 0x14   | 4    | `f32`  | `velocityX`             | |
+| 0x18   | 4    | `f32`  | `velocityY`             | |
+| 0x1C   | 4    | `u32`  | `damagePercent`         | Whole-number percent, as the game itself stores it (not a float). |
+| 0x20   | 1    | `i8`   | `stocksRemaining`       | 0-based; negative once eliminated. |
+| 0x21   | 1    | `u8`   | `jumpsRemaining`        | `jumpsMax` (per-character) minus `jumps_used`, which resets to `0` on landing. `0` through most of a grounded match is normal. |
+| 0x22   | 1    | `u8`   | `groundedState`         | `0` grounded, `1` airborne. |
 | 0x23   | 1    | `u8`   | `hurtboxState`          | `0x03` = intangible/invincible; see `ReplayMemory.cpp` for the full set observed. |
-| 0x24   | 2    | `u16`  | `hitstunCounter`        | Non-zero while in hitstun.                                            |
+| 0x24   | 2    | `u16`  | `hitstunCounter`        | Non-zero while in hitstun. |
 | 0x26   | 4    | `u32`  | `actionFrameCounter`    | Frame counter of the current action state (resets when the action state changes). |
-| 0x2A   | 4    | `u32`  | `comboHitCount`         | v1 field-append (§5). Native engine combo counter, not mod-added - tracked even with the in-game combo meter display off. Belongs to the *victim* (this port), not the attacker: hits taken in the current unbroken chain. `0` = no active chain, `1` = a single hit (not yet a "combo" by convention), `2+` = an actual combo. Zeroes the instant the chain breaks - Smash Remix extends what counts as "unbroken" to survive grabs/wall-bounces/tech-chases, which vanilla would reset. Source: smashremix `docs/ram-map.md` §13. |
-| 0x2E   | 4    | `u32`  | `comboDamage`           | v1 field-append (§5). Running damage dealt within the same chain as `comboHitCount`; zeroes at the same instant. |
+| 0x2A   | 4    | `u32`  | `comboHitCount`         | Belongs to the *victim* (this port), not the attacker: hits taken in the current unbroken chain. `0` = no active chain, `1` = a single hit, `2+` = an actual combo. |
+| 0x2E   | 4    | `u32`  | `comboDamage`           | Running damage dealt within the same chain as `comboHitCount`; zeroes at the same instant. |
 
-### 4.5 Game End — code `0x05`
+### 5.3 Item Update — code `0x06`
 
-Written exactly once, at the very end of a cleanly-finished recording
-session, immediately before the header's `streamLength` is patched. **A
-truncated file (crash, force-quit) has no `GameEnd` event at all** — its
-absence, together with `streamLength == 0`, is how a reader distinguishes
-an incomplete recording from a genuinely short match.
-
-Payload size: **5 bytes.**
-
-| Offset | Size | Type    | Field          | Notes                                                                 |
-|-------:|-----:|---------|-----------------|--------------------------------------------------------------------------|
-| 0x00   | 1    | `u8`    | `endReason`     | `0` aborted (match reset, or the emulator/process stopped mid-match — these two causes are not currently distinguished), `1` normal end. |
-| 0x01   | 4    | `i8[4]` | `placements`    | Final stocks remaining, per port 0-3. `-1` for any port that was never seated. |
-
-### 4.6 Item Update — code `0x06`
-
-**New in recorder schema v2** for `SmashRemix2.0.1` (§3.3); **the type field's
-meaning changed in schema v3** — a schema-v2 file's `ItemUpdate.kind` field
-does not exist (it was `typeId`, and that field's *value* was wrong — see
-below); a schema-v1 file has no `ItemUpdate` event at all. Both are new
-event types per §5's second mechanism, **not header `version` bumps** — an
-old parser that reads `EventPayloads`'s `count` field dynamically and skips
-codes it doesn't recognize parses a newer-schema file with no changes
-required.
-
-**Schema v2's `typeId` field was a bug, not just a gap — discard any data
-captured under schema v2.** It read the object's `+0x0C` offset as one
-32-bit value, following a Remix ASM comment that called it "projectile ID."
-Cross-checked against a real SSB64 decompilation
-([VetriTheRetri/ssb-decomp-re](https://github.com/VetriTheRetri/ssb-decomp-re)),
-`+0x0C` is actually four packed single bytes (`link_id`, `dl_link_id`,
-`frame_draw_last`, `obj_kind`) — reading it as a `u32` produces a large,
-constantly-changing value (the `frame_draw_last` byte alone guarantees
-that), never a stable type. See smashremix `docs/ram-map.md` §10.4 for the
-full story.
-
-Zero or more per frame — one per live Item or Weapon `GObj` (the engine's
-universal object base), following that frame's `PreFrameUpdate`/
-`PostFrameUpdate` pairs. Items and Weapons live on two **separate** fixed
-global `GObj` lists — `gGCCommonLinks[4]` (Item) and `gGCCommonLinks[5]`
-(Weapon), not one shared list filtered by `link_id`
-(`ReplayMemory::ReadItemObjects()` walks both). An earlier version of this
-recorder (schema v3 and below) only walked the Item list, so **no file
-recorded under schema v3 or earlier ever contains a real Weapon
-`ItemUpdate`**, even though the wire format already supported `linkId ==
-5` — see §5's v3→v4 note. `4` = **Item** (thrown/spawned items, stage
-hazard objects, and some fighter-held things like Link's pulled bomb), `5`
-= **Weapon** (a free-flying character special-move projectile: boomerang,
-fireball, charge shot, …).
-
-A **held** Item (e.g. Link's bomb while still in his hand, before it's
-thrown) is not emitted at all: while held, the engine re-parents the
-item's position data onto the holding fighter's hand-bone joint, so it
-stops being a world coordinate and reads as a meaningless local offset
-near `(0,0,0)` instead — "position still reads near `(0,0,0)`" is used as
-a proxy for "currently held" and such objects are skipped (schema v4+;
-skipped because there's nothing meaningful to report until the item is
-thrown/dropped, not because held items don't exist). **Not**
-`ITStruct::owner_gobj != NULL`, despite schema v4/v5's use of exactly that
-proxy: decomp-confirmed (`itMainSetFighterRelease()`) that `owner_gobj` is
-deliberately retained across a throw/drop for later damage/KO attribution
-and is only cleared by a separate, not-always-called function — it reads
-non-NULL for essentially an item's *entire* lifetime, held or not, so it
-never actually distinguished the two states. Schema v6 fixes this — see
-§5. Weapons are never held, so this doesn't apply to `linkId == 5`.
-Fighters and any other `GObj` kind that might appear on either list are
-also skipped, since the further pointer chase below only makes sense for
-Items/Weapons.
+Zero or more per frame — one per live Item or Weapon `GObj` currently not
+held by a fighter, following that frame's `InputFrame`/`StateFrame` pairs.
+Items and Weapons live on two separate `GObj` lists (`gGCCommonLinks[4]`
+Item, `gGCCommonLinks[5]` Weapon), not one shared list. A held item (e.g.
+Link's bomb while still in his hand) is not emitted: while held, its
+position reads as a meaningless local offset near `(0,0,0)` instead of a
+world coordinate, and that's used as the "currently held" proxy.
 
 Payload size: **25 bytes.**
 
-| Offset | Size | Type    | Field           | Notes                                                                 |
-|-------:|-----:|---------|------------------|--------------------------------------------------------------------------|
-| 0x00   | 4    | `i32`   | `frame`          | Same frame counter as that frame's `PreFrameUpdate`/`PostFrameUpdate`.    |
-| 0x04   | 4    | `u32`   | `objectAddress`  | The `GObj`'s own RDRAM address. **Not a semantic spawn ID** the engine assigns — just the closest available stable per-object identity, valid for as long as that object is alive. Two `ItemUpdate` events across different frames with the same `objectAddress` are very likely (not guaranteed) the same live object; the address can be reused once an object is freed. |
-| 0x08   | 1    | `u8`    | `linkId`         | `4` = Item, `5` = Weapon — which enum `kind` below means. See §7.6.       |
-| 0x09   | 4    | `i32`   | `kind`           | `ITKind` (`linkId == 4`) or `WPKind` (`linkId == 5`) — the real, named per-instance type, one further pointer hop past `linkId`: `GObj+0x84` → `ITStruct*`/`WPStruct*` → `+0x0C`. Full enums in §7.6. |
-| 0x0D   | 4    | `f32`   | `positionX`      | IEEE-754 single precision. World-space, via `GObj+0x74` → `DObj*` → `+0x1C`. |
-| 0x11   | 4    | `f32`   | `positionY`      | `DObj+0x20`.                                                              |
-| 0x15   | 4    | `f32`   | `positionZ`      | `DObj+0x24`. Position (X/Y/Z alike) is now **confirmed exactly** against the decomp — no longer "inferred by pattern" as earlier drafts of this doc said. |
+| Offset | Size | Type    | Field           | Notes |
+|-------:|-----:|---------|------------------|-------|
+| 0x00   | 4    | `i32`   | `frame`          | Same frame counter as that frame's `InputFrame`/`StateFrame`. |
+| 0x04   | 4    | `u32`   | `objectAddress`  | The `GObj`'s own RDRAM address — the closest available stable per-object identity, valid for as long as that object is alive. Not a semantic spawn ID; the address can be reused once an object is freed. |
+| 0x08   | 1    | `u8`    | `linkId`         | `4` = Item, `5` = Weapon — which enum `kind` below means. See §7.6. |
+| 0x09   | 4    | `i32`   | `kind`           | `ITKind` (`linkId == 4`) or `WPKind` (`linkId == 5`) — the real, named per-instance type. Full enums in §7.6. |
+| 0x0D   | 4    | `f32`   | `positionX`      | IEEE-754 single precision. World-space. |
+| 0x11   | 4    | `f32`   | `positionY`      | |
+| 0x15   | 4    | `f32`   | `positionZ`      | |
 
-Deliberately not captured (not yet mapped in memory — see §8): velocity,
-damage/knockback dealt, size (though for Samus's Charge Shot specifically,
-`kind`'s `WPStruct` exposes a discrete 0-7 `charge_size` level — not
-captured as its own field, since it's meaningful only for that one `kind`),
-owner/attacker port, and any per-object timer/expiration. A future schema
-version can append any of these as trailing fields (§5) once mapped,
-without breaking this version's readers.
+Deliberately not captured (not yet mapped in memory): velocity,
+damage/knockback dealt, size, owner/attacker port, and any per-object
+timer/expiration. A future schema version can append any of these as
+trailing fields (§6) once mapped, without breaking this version's readers.
 
-### 4.7 Stage Hazard Update — code `0x07`
+### 5.4 Stage Hazard Update — code `0x07`
 
-**New in recorder schema v3.** Zero or one per frame, following that
-frame's `ItemUpdate` events — written only when at least one tracked hazard
-is currently active, same sparse convention as `ItemUpdate` (never a
-zeroed/placeholder event for "nothing active"). Currently tracks exactly
-one hazard: Whispy Woods' wind on Dream Land. More hazards (Zebes' rising
-acid, Duel Zone's disappearing platforms, …) can claim more bits in
-`hazardFlags` later via the field-append mechanism (§5), without needing a
-new event type or breaking existing readers.
+Zero or one per frame, following that frame's `ItemUpdate` events —
+written only when at least one tracked hazard is currently active, same
+sparse convention as `ItemUpdate` (never a zeroed/placeholder event for
+"nothing active"). Currently tracks exactly one hazard: Whispy Woods' wind
+on Dream Land. More hazards (Zebes' rising acid, Duel Zone's disappearing
+platforms, …) can claim more bits in `hazardFlags` later via the
+field-append mechanism (§6), without needing a new event type.
 
 Payload size: **5 bytes.**
 
-| Offset | Size | Type  | Field         | Notes                                                                 |
-|-------:|-----:|-------|----------------|--------------------------------------------------------------------------|
-| 0x00   | 4    | `i32` | `frame`        | Same frame counter as that frame's `PreFrameUpdate`/`PostFrameUpdate`.    |
-| 0x04   | 1    | `u8`  | `hazardFlags`  | Bitmask. Bit `0x01`: Whispy Woods currently blowing (Dream Land only — the underlying memory this reads from is a per-stage union, so this flag is only ever set to `1` when `GameStart.stageId` is Dream Land; see smashremix `docs/ram-map.md` §10.3). Bit `0x02` (**new in schema v9**): wind direction — `0` = blowing left, `1` = blowing right; only meaningful (and only ever set) when bit `0x01` is also set (see smashremix `docs/ram-map.md` §10.3.1). |
+| Offset | Size | Type  | Field         | Notes |
+|-------:|-----:|-------|----------------|-------|
+| 0x00   | 4    | `i32` | `frame`        | Same frame counter as that frame's `InputFrame`/`StateFrame`. |
+| 0x04   | 1    | `u8`  | `hazardFlags`  | Bitmask. Bit `0x01`: Whispy Woods currently blowing (Dream Land only). Bit `0x02`: wind direction — `0` = blowing left, `1` = blowing right; only meaningful when bit `0x01` is also set. |
 
-### 4.8 Hitbox Update — code `0x08`
+### 5.5 Match Result — code `0x09`
 
-**New in recorder schema v5.** Zero or more per frame, one per currently
-*active* hitbox slot, following that frame's `StageHazardUpdate` event (if
-any) — sparse like `ItemUpdate`: a disabled slot (`attackState == 0`) is
-never emitted, never a zeroed/placeholder event. Fighters have 4
-simultaneous hitbox slots (`FTAttackColl`); each live Item or Weapon
-(§4.6) has up to 2 (`ITAttackColl`/`WPAttackColl`). Hitboxes are **spheres**
-— a world-space center plus a single radius, not a box — per smashremix
-`docs/ram-map.md` §14's intro.
+Written exactly once, as the last event in the stream — immediately after
+the core `MatchEnd` event (§4.3).
 
-This is deliberately verbose rather than deduplicated against action state:
-the plan is to record every active slot every frame for now, and — once
-it's confirmed that a character's hitbox geometry is reliably derivable
-from `(characterId, actionStateId, actionFrameCounter)` alone — stop
-recording it for that character and compute it instead. See §8.
+Payload size: **4 bytes.**
 
-**Confidence caveat:** Fighter hitbox fields (`ownerKind == 0`) are
-high-confidence — confirmed both via real Remix ASM call sites and the
-decomp, agreeing exactly. Item/Weapon hitbox fields (`ownerKind == 1` or
-`2`) have high-confidence field *order* (read directly from source) but
-their exact byte *offsets* are hand-derived, not compiler-verified — see
-smashremix `docs/ram-map.md` §14.5 for the full caveat, including why
-`MPCollData`'s 208-byte size is the largest single source of possible
-error.
+| Offset | Size | Type    | Field          | Notes |
+|-------:|-----:|---------|-----------------|-------|
+| 0x00   | 4    | `i8[4]` | `placements`    | Final stocks remaining, per port 0-3. `-1` for any port that was never seated. |
 
-Payload size: **55 bytes.**
+## 6. Versioning and forward compatibility
 
-| Offset | Size | Type  | Field              | Notes                                                                 |
-|-------:|-----:|-------|---------------------|--------------------------------------------------------------------------|
-| 0x00   | 4    | `i32` | `frame`              | Same frame counter as that frame's `PreFrameUpdate`/`PostFrameUpdate`.    |
-| 0x04   | 1    | `u8`  | `ownerKind`          | `0` = Fighter, `1` = Item, `2` = Weapon — which struct this hitbox came from, and how `ownerId` below is interpreted. |
-| 0x05   | 4    | `u32` | `ownerId`            | Fighter: the port (`0`-`3`), zero-extended. Item/Weapon: the owning `GObj`'s own RDRAM address — same identity as `ItemUpdate.objectAddress` (§4.6), so a `HitboxUpdate` can be correlated to that frame's `ItemUpdate` for the same live object. |
-| 0x09   | 1    | `u8`  | `slotIndex`          | Fighter: `0`-`3`. Item/Weapon: `0`-`1`.                                   |
-| 0x0A   | 1    | `u8`  | `attackState`        | `1` = fresh (became active this frame), `2` = transfer, `3` = interpolate. Never `0` — disabled slots aren't emitted at all. |
-| 0x0B   | 4    | `i32` | `damage`             |                                                                            |
-| 0x0F   | 4    | `f32` | `positionX`          | World-space, already transformed (`pos_curr`).                           |
-| 0x13   | 4    | `f32` | `positionY`          |                                                                            |
-| 0x17   | 4    | `f32` | `positionZ`          |                                                                            |
-| 0x1B   | 4    | `f32` | `size`               | Radius.                                                                   |
-| 0x1F   | 4    | `i32` | `angle`              | Knockback angle.                                                          |
-| 0x23   | 4    | `i32` | `knockbackScale`     |                                                                            |
-| 0x27   | 4    | `i32` | `knockbackWeight`    |                                                                            |
-| 0x2B   | 4    | `i32` | `knockbackBase`      |                                                                            |
-| 0x2F   | 4    | `i32` | `element`            |                                                                            |
-| 0x33   | 4    | `i32` | `shieldDamage`       |                                                                            |
-
-Deliberately not captured: attack group ID, which body-part joint a
-Fighter hitbox is bone-anchored to, `fgm`/motion-attack bitfield flags,
-`interact_mask` (Item/Weapon only — which object classes a hitbox can hit),
-priority (Item/Weapon only), and already-hit-target tracking
-(`attack_records`/`GMAttackRecord`, so a reader currently cannot tell
-whether two `HitboxUpdate`s on different frames already hit the same
-target or are two separate hits). A future schema version can append any
-of these (§5) once there's a concrete use for them.
-
-### 4.9 Hurtbox Update — code `0x09`
-
-**New in recorder schema v5.** One per fighter hurtbox slot (11 per seated
-port — `FTDamageColl`, one per body region), following that frame's
-`HitboxUpdate` events. **Unlike every other per-frame event in this
-format, this one is NOT sparse** — a seated port's 11 slots are (almost)
-always all present, since hurtboxes exist essentially continuously while a
-fighter is alive. A slot IS filtered out when `hitStatus == 0`
-(`nGMHitStatusNone`, decomp-confirmed) — the fighter-hurtbox init leaves
-that slot's whole record, including its otherwise-unrelated `joint`
-pointer, untouched/uninitialized whenever it's unused, so `hitStatus` is
-the only reliable "is this slot in use" signal (see schema `8`'s history
-entry below for the bug this caused before it was fixed). Fighter-only: items/weapons have at most
-a single *static*, per-item-type hurtbox template
-(`ITAttributes.damage_coll_offset`/`damage_coll_size`) with no live
-per-instance struct traced yet, so there is nothing per-frame to report
-for them.
-
-Same verbosity rationale as `HitboxUpdate` (§4.8) — record exhaustively
-now, prune later once shown to be derivable from action state alone. See
-§8.
-
-Payload size: **51 bytes.**
-
-| Offset | Size | Type  | Field         | Notes                                                                 |
-|-------:|-----:|-------|----------------|--------------------------------------------------------------------------|
-| 0x00   | 4    | `i32` | `frame`        | Same frame counter as that frame's `PreFrameUpdate`/`PostFrameUpdate`.    |
-| 0x04   | 1    | `u8`  | `port`         | `0`-`3`.                                                                  |
-| 0x05   | 1    | `u8`  | `slotIndex`    | `0`-`10`.                                                                 |
-| 0x06   | 4    | `i32` | `hitStatus`    | Per-bone Vulnerable/Invincible/Intangible. Raw value — the exact numeric mapping for this *per-bone* field isn't independently confirmed the way the whole-character convention is (`PostFrameUpdate.hurtboxState`, §4.4, `3` = intangible). |
-| 0x0A   | 4    | `i32` | `placement`    | `0` = low, `1` = middle, `2` = high.                                     |
-| 0x0E   | 1    | `u8`  | `isGrabbable`  | `0`/`1`.                                                                  |
-| 0x0F   | 4    | `f32` | `positionX`    | **Approximation, not the true hurtbox center** — the bone's own world-space joint position (its `DObj`'s translate). Does NOT apply `offsetX/Y/Z` below or the bone's rotation on top. |
-| 0x13   | 4    | `f32` | `positionY`    |                                                                            |
-| 0x17   | 4    | `f32` | `positionZ`    |                                                                            |
-| 0x1B   | 4    | `f32` | `offsetX`      | Authored, bone-relative, untransformed — the raw value that would need to be composed with the bone's rotation to get the true center.    |
-| 0x1F   | 4    | `f32` | `offsetY`      |                                                                            |
-| 0x23   | 4    | `f32` | `offsetZ`      |                                                                            |
-| 0x27   | 4    | `f32` | `sizeX`        | Anisotropic — a `Vec3f`, not a single radius like a hitbox's `size`.      |
-| 0x2B   | 4    | `f32` | `sizeY`        |                                                                            |
-| 0x2F   | 4    | `f32` | `sizeZ`        |                                                                            |
-
-Deliberately not captured: no per-hurtbox weak-point flag or damage
-multiplier exists in the underlying struct (`FTStruct.damage_mul` is a
-related but different, *whole-fighter* multiplier, not per-hurtbox) — see
-smashremix `docs/ram-map.md` §14.2.
-
-## 5. Versioning and forward compatibility
-
-Two independent mechanisms, matching §4.6 of the original design rationale:
+Two independent mechanisms:
 
 - **Field additions to an existing event:** always append new fields to the
   *end* of that event's payload, never insert in the middle. An old parser
   — which learned the event's size from that file's own `EventPayloads`
   event, which will correctly declare the *old*, smaller size for an old
   file — simply never reads the new trailing bytes. A new parser reading an
-  old file sees the old, smaller declared size in that file's own
-  `EventPayloads` event and correctly knows not to read fields that were
-  never written.
+  old file sees the old, smaller declared size and correctly knows not to
+  read fields that were never written.
 - **New event types:** an old parser encountering a command code it doesn't
   recognize looks up its declared size in `EventPayloads` and skips exactly
   that many bytes, then continues from the next event.
 
-`FileHeader.version` (currently `4`) is reserved for a breaking change to
-the *header* or the overall framing itself — not for anything the two
+`FileHeader.version` (currently `5`) is reserved for a breaking change to
+the header or the overall framing itself (e.g. the header layout, or the
+buffered/compressed structure of §2-§3) — not for anything the two
 mechanisms above already cover, and not for tracking which game/ROM
 produced a file or how that recorder's understanding of it has evolved
-either — that's `goodName`/`recorderSchemaVersion` (§3.3), a deliberately
-separate axis from the container format itself.
+either — that's `gameFamily`/`goodName`/`recorderSchemaVersion` (§3.2), a
+deliberately separate axis from the container format itself.
 
-**Compatibility note:** `version` jumped `1` → `2` (adding `goodName` and
-`recorderSchemaVersion`) → `3` (adding `recordedAtEpochSeconds`) → `4`
-(replacing `recordedAtEpochSeconds` with `recordedAtEpochMillis` and adding
-`recordedAtNanosOffset` — see below), each a breaking change to files
-already recorded under the prior version (they lack those fields entirely,
-or have them at a different meaning/size). `version 1` and `version 2`
-files are not expected to parse under this spec at all — their header
-layouts are missing fields entirely, not just narrower ones, so there's
-nothing valid for a reader to fall back to. **`version 3` is different:**
-a `version 3` file's `recordedAtEpochSeconds` trivially determines what
-`version 4` would have written (`* 1000`, with `recordedAtNanosOffset` a
-correct `0`, since that precision genuinely didn't exist yet) — a reader
-*may* choose to keep parsing `version 3` files on that basis rather than
-rejecting them outright. `rmgr-ts`'s own parser does exactly this (see its
-`MIN_READABLE_FORMAT_VERSION`). This project's own writer (`Replay.cpp`)
-never writes anything below the current `version` regardless - this is a
-reader-side choice only.
+**No version `4` (or earlier) file is expected to parse under this spec.**
+This is a from-scratch redesign, not a continuation of version `4`'s
+schema-history mechanism — see the note at the top of this document.
 
-**Version `4`** replaced `version 3`'s `recordedAtEpochSeconds` (`u64`,
-whole seconds) with `recordedAtEpochMillis` (`u64`, milliseconds) plus a new
-trailing `recordedAtNanosOffset` (`u32`) field — see §3.1. Motivation:
-second-resolution timestamps aren't enough to line up multiple `.rmgr`
-recordings from the same session (e.g. several matches played back to back,
-or multiple local recordings of the same netplay match) against each other
-or against other capture streams (video, `.krec`) with any real precision.
-The header grew from 88 to 92 bytes as a result — a genuine breaking change
-to the fixed-size header, not something the field-append mechanism above
-could cover, since that mechanism only applies to event *payloads*, not the
-header itself.
+## 7. Byte order and encoding
 
-**Recorder schema history, for `SmashRemix2.0.1`** (§3.3's separate,
-non-breaking axis): schema `1` is the original event set described above.
-Schema `2` added the `ItemUpdate` event (§4.6) — additive only, so a
-schema-`1`-aware parser correctly reads a schema-`2` file's other events and
-simply never sees `ItemUpdate`. **Schema `2`'s `ItemUpdate.typeId` field was
-wrong, not just incomplete** (§4.6) — reading `+0x0C` on the raw object as a
-32-bit value, when it's actually a packed byte. Schema `3` replaced it with
-correctly-derived `linkId`/`kind` fields (a different `ItemUpdate` payload
-size — 25 bytes, not 24 — so a parser that reads the size from
-`EventPayloads` as this spec requires handles the difference correctly) and
-added the `StageHazardUpdate` event (§4.7). **Any data captured under
-schema `2` should be discarded and re-recorded, not migrated** — its
-`typeId` values were never meaningful.
-
-Schema `4` fixed two bugs in `ReadItemObjects()` that changed *which*
-objects get emitted, not the `ItemUpdate` payload's byte layout (still 25
-bytes, same as schema `3`): (1) Weapons were never actually reachable —
-schema `3` and earlier only walked the Item list (`gGCCommonLinks[4]`), so
-despite `ItemUpdate.linkId` supporting `5` (Weapon) in the wire format, no
-file recorded before schema `4` contains a real Weapon event (fireballs,
-boomerang, charge shot, PK Fire/Thunder, …); (2) held Items (e.g. Link's
-bomb while still in his hand) were recorded with a meaningless, re-parented
-position (typically `(0,0,0)`) instead of being skipped — see §4.6. **Data
-captured under schema `3` and earlier undercounts real projectile activity
-(no Weapons, phantom held-item entries) but isn't corrupt the way schema
-`2` was** — it doesn't need discarding, just doesn't reflect Weapons at
-all.
-
-Schema `5` added the `HitboxUpdate` (§4.8) and `HurtboxUpdate` (§4.9)
-events — additive only, so a schema-`4`-aware parser correctly reads a
-schema-`5` file's other events and simply never sees these two. Both are
-deliberately verbose (every active hitbox slot, and *every* hurtbox slot
-every frame, not just active ones) rather than deduplicated against action
-state — the intent is to record exhaustively while the RAM mapping is
-still being validated against real gameplay, then, once it's confirmed
-that a character's hitbox/hurtbox geometry is reliably derivable from
-`(characterId, actionStateId, actionFrameCounter)` alone, stop recording
-it for that character (starting with the original 12, across both
-versions) and compute it instead in a future schema. See §8.
-
-Schema `6` fixed `ReadItemObjects()`'s "currently held" check, which
-schema `4`/`5` got wrong: it used `ITStruct::owner_gobj != NULL` as a
-proxy for "held," but decomp confirms (`itMainSetFighterRelease()`)
-`owner_gobj` is deliberately *retained* across a throw/drop for later
-damage/KO attribution — it's non-NULL for essentially an item's entire
-lifetime, not just while held, so that check silently skipped nearly every
-Item's flight, not just its brief held phase, for every schema `4`/`5`
-file. Fixed by switching to a position-based proxy (still reads near
-`(0,0,0)`, the hand-parented placeholder written while genuinely held —
-see §4.6) that actually flips at the real release moment. Byte layout
-unchanged — same class of fix as `3`→`4`. **Item `ItemUpdate` data from
-schema `4`/`5` is missing most or all of every thrown/dropped Item's real
-flight and should be re-recorded, not treated as complete** (Weapons are
-unaffected — this check never applied to `linkId == 5`).
-
-Schema `7` fixed `PostFrameUpdate.jumpsUsed`, which every prior schema got
-wrong: it was read as a `u32` at `playerStruct+0x148`, but the real field
-(decomp-confirmed) is a single `u8` there, with `+0x14A`-`0x14B` as padding
-— on a word-swapped emulator, a *byte* read needs its address XORed with
-`3` to land correctly, so the old `u32` read landed on that padding
-instead, reading a constant `0` for an entire match, every port, no matter
-how much jumping happened. Fixed the read width **and** switched what
-gets exported: this field is now `jumpsRemaining` (`jumpsMax`, chased from
-the per-character `FTAttributes`, minus the corrected `jumps_used`)
-instead of `jumpsUsed` directly — more directly useful, and the original
-goal. Same wire position/size (still a `u8`) — a pure "what this byte
-means" fix, not a layout change, same class as `5`→`6`. **Schema `6` and
-earlier files' byte here is meaningless — it's the constant-`0` bug's
-output, not real data.**
-
-Schema `8` fixed `ReadHurtboxes()`'s "is this slot in use" check, which
-schema `5`-`7` got wrong: it gated on `IsValidRdramPointer(joint)`, but
-decomp confirms (`ftmanager.c`'s fighter-hurtbox init) that an unused
-`FTDamageColl` slot leaves its `joint` field untouched — not `NULL`, not
-necessarily even outside the valid RDRAM window, just whatever garbage was
-in that memory before — while `hitStatus` is explicitly set to
-`nGMHitStatusNone` (`0`) for unused slots and a real
-Vulnerable/Invincible/Intangible value for used ones. Gating on the wrong
-field filtered out every slot, used or not, every frame — a real match
-with real hurtboxes the entire time produced **zero** `HurtboxUpdate`
-events. Fixed by checking `hitStatus != 0` first. Byte layout unchanged —
-same class of fix as `6`→`7`. **`HurtboxUpdate` data from schema `5`-`7`
-is empty, not incomplete, and should be re-recorded** (`HitboxUpdate` is a
-separate, independently-gated read and is not known to share this bug —
-see §8's note on it).
-
-Schema `9` adds `StageHazardUpdate.hazardFlags` bit `0x02`: Whispy Woods'
-wind *direction* (`0` = left, `1` = right), alongside the existing bit
-`0x01` (currently blowing) — see §4.7. Resolved via
-`grPupupuWhispyGetLR`/`grPupupuWhispySetWindPush` in the real decomp
-(smashremix `docs/ram-map.md` §10.3.1), a fixed `s8` global
-(`gGRCommonStruct + 0x2A`) holding the engine's already-decided direction
-for the current wind cycle — no recomputation needed, just a second byte
-read alongside the existing status read. Purely additive: the event's
-byte layout is unchanged (still a single `hazardFlags` byte), the same
-class of change as `1`→`2`'s new event type, just one bit narrower in
-scope. **Schema `8` and earlier files always have bit `0x02` unset (`0`)
-— indistinguishable from a genuine "blowing left" read — so don't infer
-direction from data recorded before schema `9`.**
-
-## 6. Byte order and encoding
-
-Everything in this file — the header and every event payload — is
-**little-endian**. There is no manual byte-swapping anywhere in the
-reference implementation: values are read directly from emulated memory via
-`DebugMemRead8/16/32` (which already normalize to host byte order) and
-written to disk as raw native-layout structs on little-endian host
-platforms.
+Everything in this file — the header and every (decompressed) event
+payload — is **little-endian**. Values are read directly from emulated
+memory via `DebugMemRead8/16/32` (which already normalize to host byte
+order) and written to disk as raw native-layout structs on little-endian
+host platforms.
 
 Floats are IEEE-754 single precision (32-bit), stored as the exact bit
 pattern the game itself holds in memory — reinterpret the 4 bytes as a
 `float`/`f32`, don't scale or convert.
 
-Strings (`playerNames` in `GameStart`) are fixed-width byte arrays,
-NUL-padded, **not necessarily NUL-terminated** if the name fills the full
-field width — always read up to the declared field width and trim trailing
-NULs, never scan for a terminator past the field boundary.
+Strings (`playerNames` in `MatchStart`, `goodName`/`gameFamily` in the
+header) are fixed-width byte arrays, NUL-padded, **not necessarily
+NUL-terminated** if the value fills the full field width — always read up
+to the declared field width and trim trailing NULs, never scan for a
+terminator past the field boundary.
 
-## 7. Reference tables
+## 8. Reference tables
 
-### 7.1 Character IDs
+### 8.1 Character IDs
 
 Valid range `0x00`-`0x60`.
 
@@ -780,7 +542,7 @@ Kirby, Pikachu, Jigglypuff, Ness} in that order · `0x1A` Giant DK ·
 `0x5B` Young Link · `0x5C` Goemon · `0x5D` Conker · `0x5E` Banjo ·
 `0x5F` Peach · `0x60` Crash.
 
-### 7.2 Stage IDs
+### 8.2 Stage IDs
 
 **Vanilla:** `0x00` Peach's Castle · `0x01` Sector Z · `0x02` Congo Jungle ·
 `0x03` Planet Zebes · `0x04` Hyrule Castle · `0x05` Yoshi's Island ·
@@ -790,12 +552,12 @@ Kirby, Pikachu, Jigglypuff, Ness} in that order · `0x1A` Giant DK ·
 `0x0F` Race to the Finish · `0x10` Final Destination.
 
 Remix adds a very large number of additional stages (`0x29` onward, into the
-`0xD0`+ range) not enumerated here — see the *Known limitations* note in §8.
+`0xD0`+ range) not enumerated here — see the *Known limitations* note in §9.
 
-### 7.3 Action state IDs
+### 8.3 Action state IDs
 
 `0x000`-`0x0DB` are shared across every character; `>= 0x0DC` is
-character-specific (special moves — see §8).
+character-specific (special moves — see §9).
 
 ```
 0x000 DeadD(KO bottom)   0x001 DeadS(KO side)     0x002 DeadU(KO top)
@@ -841,12 +603,12 @@ character-specific (special moves — see §8).
 Derived predicates a consumer may find useful: dead/being-KO'd =
 `actionStateId <= 0x004`; respawning = `actionStateId == 0x005` or
 `0x007`-`0x009`; in hitstun = `actionStateId` in `0x025`-`0x039` (or check
-`hitstunCounter` directly, §4.4); shielding = `actionStateId` in
+`hitstunCounter` directly, §5.2); shielding = `actionStateId` in
 `0x098`-`0x09B`; grabbed = `actionStateId` in `0x0AB`-`0x0BC`; attacking =
 `actionStateId >= 0x0BE`. Airborne state should come from `groundedState`
-(§4.4), not be inferred from `actionStateId` alone.
+(§5.2), not be inferred from `actionStateId` alone.
 
-### 7.4 Controller button bits (`PreFrameUpdate.buttons`)
+### 8.4 Controller button bits (`InputFrame.buttons`)
 
 ```
 0x8000 A       0x0400 D-Down   0x0020 L
@@ -856,23 +618,22 @@ Derived predicates a consumer may find useful: dead/being-KO'd =
 0x0800 D-Up                    0x0001 C-Right
 ```
 
-### 7.5 `game_status` (internal, not directly exposed as an event field)
+### 8.5 `game_status` (internal, not directly exposed as an event field)
 
-Governs the recorder's own state machine (not written to the file directly,
-but explains the `frame` counter's start point and `GameEnd.endReason`):
-`0` pre-match countdown, `1` ongoing (this is the only state that produces
-`PreFrameUpdate`/`PostFrameUpdate` events, and `frame == 0` is the first
-frame this state is observed), `2` paused, `5` ended.
+Governs the recorder's own state machine (not written to the file
+directly, but explains the `frame` counter's start point and
+`MatchEnd.endReason`): `0` pre-match countdown, `1` ongoing (this is the
+only state that produces `InputFrame`/`StateFrame` events, and `frame ==
+0` is the first frame this state is observed), `2` paused, `5` ended.
 
-### 7.6 `ItemUpdate.linkId` and `.kind` (schema v3+)
+### 8.6 `ItemUpdate.linkId` and `.kind` (`smash64` family)
 
 `linkId` (`ItemUpdate` offset `0x08`) is `4` (Item) or `5` (Weapon) — this
-recorder never emits any other value (§4.6). It selects which of the two
-enums below `kind` is a value from.
+recorder never emits any other value. It selects which of the two enums
+below `kind` is a value from.
 
 **`WPKind`** (`linkId == 5` — free-flying character special-move
-projectiles), confirmed against the real SSB64 decompilation
-([VetriTheRetri/ssb-decomp-re](https://github.com/VetriTheRetri/ssb-decomp-re)):
+projectiles):
 
 | Value | Name | | Value | Name |
 |---:|---|---|---:|---|
@@ -893,18 +654,11 @@ projectiles), confirmed against the real SSB64 decompilation
 | `0x0E` | PKThunderHead | | | |
 | `0x0F` | PKThunderTrail | | | |
 
-`0x1F` is `nWPKindMonsterEnd` — Remix's own mod-added weapon IDs
-(`src/Projectile.asm`, e.g. Banjo's egg, Sonic's spring) continue numbering
-from there, per smashremix `docs/ram-map.md` §14.
+`0x1F` is `nWPKindMonsterEnd` — Remix's own mod-added weapon IDs continue
+numbering from there.
 
 **`ITKind`** (`linkId == 4` — thrown/spawned items, stage hazard objects,
-and some fighter-held things like Link's pulled bomb). Two values are
-confirmed directly against the decomp (`Bomb = 0x15`, matching Link's bomb;
-`PKFirePillar = 0x14`, matching Ness's PK Fire pillar); the rest of this
-table is `Hazards.standard`/`stage`/`pokemon` from Smash Remix's own
-`src/Hazards.asm`, which the decomp cross-check confirms uses the *same*
-numbering (only the offset this spec originally read it from — §4.6 — was
-wrong, not this enum):
+and some fighter-held things like Link's pulled bomb):
 
 | Value | Name | | Value | Name | | Value | Name |
 |---:|---|---|---:|---|---|---:|---|
@@ -926,97 +680,68 @@ wrong, not this enum):
 
 Two entries repeat a name at a different value (`Bumper` at both `0x10` and
 `0x17`; `Chansey` at both `0x1B` and `0x27`) — that's the source enum's own
-structure (a `standard`/`stage`/`pokemon` grouping with some overlap), not a
-transcription error here. Remix's `BOWSER_BOMB` is a custom out-of-range
-value (`0x011A`) specific to one stage hazard, not part of the normal
-`0x00`-`0x2C` span.
+structure, not a transcription error. Remix's `BOWSER_BOMB` is a custom
+out-of-range value (`0x011A`) specific to one stage hazard, not part of the
+normal `0x00`-`0x2C` span.
 
-### 7.7 `StageHazardUpdate.hazardFlags` bits (schema v3+)
+### 8.7 `StageHazardUpdate.hazardFlags` bits (`smash64` family)
 
 | Bit | Meaning |
 |---:|---|
-| `0x01` | Whispy Woods is currently blowing (Dream Land only — see §4.7). |
+| `0x01` | Whispy Woods is currently blowing (Dream Land only — see §5.4). |
+| `0x02` | Wind direction: `0` = blowing left, `1` = blowing right. Only meaningful when bit `0x01` is also set. |
 
 All other bits are currently always `0`, reserved for hazards not yet
 tracked (Zebes' rising acid, Duel Zone's disappearing platforms, …).
 
-## 8. Known limitations / not yet implemented
+## 9. Known limitations / not yet implemented
 
-These are deliberate v1 scope cuts, not oversights — later format versions
-can add any of them as new event types or appended fields per §5, without
-breaking existing files or parsers:
-
+- **Hitbox/hurtbox tracking has been removed entirely.** An earlier
+  version of this format recorded per-frame hitbox/hurtbox geometry; it
+  never worked reliably (a real match with confirmed hits/KOs recorded
+  zero hitbox events even after fixing the known bugs in the read path)
+  and has been dropped rather than carried forward as dead weight. A
+  future design can reintroduce this from scratch if there's a concrete
+  need.
 - **Item/weapon tracking has no velocity, damage, owner/attacker port, or
-  expiration data.** `ItemUpdate` (§4.6) records a named `kind` (§7.6) and
+  expiration data.** `ItemUpdate` (§5.3) records a named `kind` (§8.6) and
   position for every live, non-held Item/Weapon object, but none of those
   additional fields have been mapped in memory yet.
-- **Stage hazard tracking covers exactly one hazard.** Schema v3's
-  `StageHazardUpdate` (§4.7) currently only tracks Whispy Woods' wind on
-  Dream Land — other built-in hazards (Zebes' acid, Duel Zone's platforms,
-  …) are known to be resolvable the same way (smashremix `docs/ram-map.md`
-  §10.5) but haven't been added yet.
-- **No RNG/desync-detection event.** No `FrameStart`-equivalent event (RNG
-  seed, internal scene frame counter); no known Smash Remix RNG seed address
+- **Stage hazard tracking covers exactly one hazard.** `StageHazardUpdate`
+  (§5.4) currently only tracks Whispy Woods' wind on Dream Land.
+- **No RNG/desync-detection event.** No known Smash Remix RNG seed address
   has been identified.
 - **No aggregate damage-dealt/taken breakdown or incoming-damage-this-hit
-  field**, even though the emulator exposes them — deferred as not
-  essential for a first version. (A hitbox's own `shieldDamage` *attribute*
-  is captured per-slot in `HitboxUpdate`, §4.8 — this is about a different,
-  still-missing per-victim aggregate.)
-- **Hitbox/hurtbox tracking (§4.8/§4.9) is opt-in and off by default** (the
-  Settings dialog's "Include hitbox and hurtbox data" checkbox /
-  `SettingsID::GameStats_RecordHitboxData`) precisely because of the
-  verbosity below - a typical user gets small files unless they explicitly
-  turn it on. **It's also deliberately temporary, not a final design.** It records every active hitbox slot and
-  every hurtbox slot, every frame, with no deduplication against action
-  state — the plan is to keep doing that only until it's shown that a
-  character's geometry is reliably derivable from `(characterId,
-  actionStateId, actionFrameCounter)` alone (starting with the original 12
-  characters, both versions), at which point recording can stop for that
-  character and a lookup/formula can replace it in a future schema. Also:
-  no already-hit-target tracking (`attack_records`/`GMAttackRecord`) is
-  captured, so two `HitboxUpdate`s can't currently be told apart as "same
-  hit, still active" vs. "a new hit"; Item/Weapon hitbox byte offsets are
-  hand-derived, not compiler-verified (§4.8's own caveat); and items have
-  no live per-instance hurtbox data, only a static per-type template not
-  currently read at all.
-- **`HitboxUpdate` (§4.8) is still unverified against a real capture with
-  known combat.** Schema `8` fixed the *hurtbox* side's wrong "in use" gate
-  (see §5), but a real match with confirmed hits/KOs recorded zero
-  `HitboxUpdate` events even after that fix — `PS_ATTACK_COLL_BASE`/
-  `PS_ATTACK_COLL_STRIDE`/`FTAC_ATTACK_STATE` (§4.8) have been independently
-  re-derived from the decomp and confirmed correct, so the offsets
-  themselves aren't the suspect. Leading candidates: the recorder samples
-  `attack_state` at a point in the frame after collision processing has
-  already reset it back to `0` for that frame, or `s_RecordHitboxData`
-  isn't actually `true` at the moment `ReadHitboxes()` runs despite the
-  setting being on. Needs a live diagnostic (raw-value logging at a known
-  mid-combat frame) to distinguish the two - not yet done.
-- **`GameEnd.endReason` cannot currently distinguish time-out from
-  stock-out** — both collapse to `1` ("normal end"); only "aborted vs. not"
-  is currently derivable from available memory.
+  field**, even though the emulator exposes them.
+- **`MatchEnd.endReason` cannot currently distinguish time-out from
+  stock-out** — both collapse to `1` ("normal end").
 - **Character-specific action states (`>= 0x0DC`) have no shared table** —
-  meaning is entirely per-character and would need to be derived
-  empirically per character if finer-grained special-move detection is
-  wanted.
-- **Remix-specific stage IDs (`0x29`+) are not enumerated** in §7.2 — would
-  need re-deriving from the mod's assembly source.
-- **No ROM-identity check.** The recorder does not verify the loaded ROM is
-  actually Smash Remix before recording; enabling the feature on a
-  different game will produce a `.rmgr` file with garbage bytes (it does not
-  crash — the pointer-validity checks in `ReplayMemory.cpp` cause it to stay
-  in "waiting for a match" indefinitely rather than write nonsense, in the
-  overwhelming majority of cases, but this is not a guarantee).
+  meaning is entirely per-character.
+- **Remix-specific stage IDs (`0x29`+) are not enumerated** in §8.2.
+- **No ROM-identity check for the extension layer.** Nothing currently
+  verifies the loaded ROM matches `gameFamily`'s expectations beyond
+  `goodName` comparison; a mismatch would produce an extension layer full
+  of garbage bytes rather than falling back to core-only recording. This
+  is a correctness gap to close during implementation, not an accepted
+  limitation of the design itself.
+- **Only one `gameFamily` (`smash64`) is actually defined.** The layering
+  in §2.1 is designed to support additional families (e.g. a future Mario
+  Kart 64 family) without touching `smash64`'s definitions, but no second
+  family exists yet.
 
-## 9. Reference implementation
+## 10. Reference implementation
 
-- **Writer:** `Source/RMG-Core/Replay.cpp` / `Source/RMG-Core/Replay.hpp`
-  (C++, streamed, single writer instance per emulation session).
+**Not yet implemented as of this document.** The design is finalized (see
+`docs/superpowers/specs/2026-09-04-rmgr-v2-design.md`); the code below
+still implements format version `4`:
+
+- **Writer:** `Source/RMG-Core/Replay.cpp` / `Source/RMG-Core/Replay.hpp`.
 - **Memory reader:** `Source/RMG-Core/ReplayMemory.cpp` /
-  `Source/RMG-Core/ReplayMemory.hpp` (the N64 RAM pointer-chase that feeds
-  the writer above; not part of the file format itself, but the source of
-  truth for every field's semantics).
-- **TypeScript reader/writer + tests:** [`rmgr-ts/`](../rmgr-ts/) at the
-  repository root — a standalone package (no dependency on the C++ build)
-  intended to be extracted into its own repository. See
-  [`rmgr-ts/README.md`](../rmgr-ts/README.md) for its API.
+  `Source/RMG-Core/ReplayMemory.hpp`.
+- **TypeScript reader/writer + tests:** [`rmgr-ts`](https://github.com/hopskipnfall/rmgr-ts),
+  its own repository (extracted from this one).
+
+Implementing this spec requires coordinated changes across `RMG-K`
+(writer), `rmgr-ts` (reader/types), and `rmgr-viewer` (consumer of
+`rmgr-ts`) — see the design doc's §7 for the specific open items each
+repo needs to address.
