@@ -99,84 +99,6 @@ struct ItemObject
     float    positionZ; // confirmed exactly via the decomp - see ram-map.md section 10.4.1
 };
 
-// One currently-active hitbox slot - a fighter's own attack (`FTAttackColl`,
-// 4 slots/fighter), or an item's/weapon's attack (`ITAttackColl`/
-// `WPAttackColl`, 2 slots each). See ReadHitboxes() below and smashremix
-// docs/ram-map.md section 14. Only active slots (attackState != 0) are ever
-// returned. Hitboxes are spheres (a world-space center + one radius), not
-// boxes - see ram-map.md section 14's intro.
-//
-// CAUTION: unlike `FTAttackColl`/`FTDamageColl` (high confidence - confirmed
-// via real Remix ASM call sites *and* the decomp, agreeing exactly),
-// `ITAttackColl`/`WPAttackColl`'s field order is high-confidence (read
-// directly from source) but their exact byte offsets - and
-// `ITStruct`/`WPStruct`'s own `attack_coll` offset - are hand-derived, not
-// compiler-verified (ram-map.md section 14.5). An Item/Weapon hitbox here
-// could be off if that derivation has a mistake; a Fighter hitbox is much
-// more trustworthy.
-struct HitboxObject
-{
-    // 0 = Fighter, 1 = Item, 2 = Weapon - which struct this came from, and
-    // how ownerId below should be interpreted.
-    uint8_t  ownerKind;
-    // Fighter: the port (0-3), zero-extended. Item/Weapon: the owning
-    // GObj's own RDRAM address - the same identity as
-    // ItemObject::objectAddress, so a HitboxObject can be correlated to
-    // that frame's ItemObject for the same live object.
-    uint32_t ownerId;
-    uint8_t  slotIndex; // Fighter: 0-3. Item/Weapon: 0-1.
-    // 1 = fresh (became active this frame), 2 = transfer, 3 = interpolate.
-    // Never 0 (disabled) - those slots aren't returned at all.
-    uint8_t  attackState;
-    int32_t  damage;
-    float    positionX; // world-space, already transformed (`pos_curr`)
-    float    positionY;
-    float    positionZ;
-    float    size;       // radius
-    int32_t  angle;      // knockback angle
-    int32_t  knockbackScale;
-    int32_t  knockbackWeight;
-    int32_t  knockbackBase;
-    int32_t  element;
-    int32_t  shieldDamage;
-};
-
-// One hurtbox slot on a fighter's body (`FTDamageColl`, 11 slots/fighter,
-// one per body region). See ReadHurtboxes() below and smashremix
-// docs/ram-map.md section 14.2. Fighter-only: items/weapons have at most a
-// single *static*, per-type hurtbox template (`ITAttributes.damage_coll_*`)
-// with no live per-instance struct traced yet, so there's nothing
-// per-frame to report for them.
-struct HurtboxObject
-{
-    uint8_t port;      // 0-3
-    uint8_t slotIndex; // 0-10
-    // Per-bone Vulnerable/Invincible/Intangible. The exact numeric mapping
-    // for this *per-bone* field isn't independently confirmed the way the
-    // whole-character convention is (PortPlayerState::hurtboxState, `3` =
-    // intangible) - stored as the raw value read.
-    int32_t hitStatus;
-    int32_t placement; // 0 = low, 1 = middle, 2 = high
-    bool    isGrabbable;
-    // Approximation, NOT the true hurtbox center: this is the bone's own
-    // world-space joint position (its DObj's translate) - it does not
-    // apply offsetX/Y/Z or the bone's rotation on top. See
-    // ReadHurtboxes()'s doc comment for why a fuller transform isn't done.
-    float positionX;
-    float positionY;
-    float positionZ;
-    float offsetX; // authored, bone-relative, untransformed
-    float offsetY;
-    float offsetZ;
-    // Anisotropic (Vec3f, unlike a hitbox's single radius) - and, per the
-    // decomp's fighter-hurtbox init, stored PRE-HALVED (size.{x,y,z} *= 0.5F
-    // there): these are half-extents, not full extents. Double these for
-    // the real box dimensions rather than using them directly.
-    float sizeX;
-    float sizeY;
-    float sizeZ;
-};
-
 // Live stage-hazard state. Currently just Whispy Woods' wind on Dream Land
 // - see ReadStageHazards() below. More hazards (Zebes' acid, Duel Zone's
 // platforms, ...) can be added here later the same way, per smashremix
@@ -244,22 +166,6 @@ PortPlayerState ReadPortPlayerState(uint32_t matchInfoPtr, int port);
 // list can never hang recording - it doesn't specifically detect/dedupe a
 // cycle, just guarantees termination.
 std::vector<ItemObject> ReadItemObjects(void);
-
-// Reads every currently-active hitbox: 4 fighter slots per seated port
-// (`FTAttackColl`) plus 2 slots per live Item/Weapon GObj
-// (`ITAttackColl`/`WPAttackColl`) - see HitboxObject's doc comment for the
-// confidence caveat on the Item/Weapon offsets. `matchInfoPtr` must come
-// from a valid ReadMatchInfo() result. A slot with `attackState == 0`
-// (disabled) is never returned - empty if nothing is currently attacking.
-std::vector<HitboxObject> ReadHitboxes(uint32_t matchInfoPtr);
-
-// Reads all 11 hurtbox slots (`FTDamageColl`) for each seated port -
-// Fighter-only, see HurtboxObject's doc comment. `matchInfoPtr` must come
-// from a valid ReadMatchInfo() result. A port with no resolvable player
-// struct (not currently seated in a live match) contributes no entries; a
-// slot whose joint pointer doesn't resolve is skipped defensively rather
-// than returning garbage position data.
-std::vector<HurtboxObject> ReadHurtboxes(uint32_t matchInfoPtr);
 
 // Reads live stage-hazard state for the given stage. `stageId` comes from
 // MatchInfo::stageId - the live per-frame hazard fields live in a

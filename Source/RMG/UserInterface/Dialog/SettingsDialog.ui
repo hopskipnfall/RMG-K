@@ -3228,16 +3228,6 @@
                </widget>
               </item>
               <item>
-               <widget class="QCheckBox" name="kailleraReplayHitboxesCheckBox">
-                <property name="text">
-                 <string>Include hitbox and hurtbox data (debug)</string>
-                </property>
-                <property name="toolTip">
-                 <string>Also records every active hitbox and all 11 hurtbox slots per fighter, every frame - much larger .rmgr files than everything else in the format combined. Off by default so other users get small files; only useful for hitbox/hurtbox research right now. Applies whenever replay recording itself is active for a match - this default, a per-session override (netplay), or a headless replay export - not just when "Enable replay recording (.rmgr) by default" above is checked.</string>
-                </property>
-               </widget>
-              </item>
-              <item>
                <widget class="QLabel" name="kailleraRecordsFolderLabel">
                 <property name="text">
                  <string>Records folder</string>

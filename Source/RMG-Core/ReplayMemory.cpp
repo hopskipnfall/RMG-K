@@ -147,96 +147,6 @@ bool IsHeldItemPosition(float x, float y, float z)
 // of reads rather than looping until something crashes.
 constexpr int ITEM_LIST_MAX_OBJECTS = 32;
 
-// Fighter hitboxes (FTAttackColl) and hurtboxes (FTDamageColl) - see
-// smashremix docs/ram-map.md section 14.1/14.2. High confidence: confirmed
-// both via real Remix ASM call sites and the decomp, agreeing exactly.
-constexpr uint32_t PS_ATTACK_COLL_BASE   = 0x294;
-constexpr uint32_t PS_ATTACK_COLL_STRIDE = 0xC4;
-constexpr int       FT_ATTACK_COLL_SLOTS  = 4;
-constexpr uint32_t FTAC_ATTACK_STATE     = 0x00; // s32: 0 disabled, 1 fresh, 2 transfer, 3 interpolate
-constexpr uint32_t FTAC_DAMAGE           = 0x0C; // s32
-constexpr uint32_t FTAC_ELEMENT          = 0x10; // s32
-constexpr uint32_t FTAC_SIZE             = 0x24; // f32 - radius
-constexpr uint32_t FTAC_ANGLE            = 0x28; // s32
-constexpr uint32_t FTAC_KB_SCALE         = 0x2C; // s32
-constexpr uint32_t FTAC_KB_WEIGHT        = 0x30; // s32
-constexpr uint32_t FTAC_KB_BASE          = 0x34; // s32
-constexpr uint32_t FTAC_SHIELD_DAMAGE    = 0x38; // s32
-constexpr uint32_t FTAC_POS_CURR         = 0x44; // f32[3] - world-space, already transformed
-
-constexpr uint32_t PS_DAMAGE_COLL_BASE   = 0x5BC;
-constexpr uint32_t PS_DAMAGE_COLL_STRIDE = 0x2C;
-constexpr int       FT_DAMAGE_COLL_SLOTS  = 11;
-constexpr uint32_t FTDC_HITSTATUS        = 0x00; // s32, per-bone Vulnerable/Invincible/Intangible
-constexpr uint32_t FTDC_JOINT_PTR        = 0x08; // -> DObj (bone's own world-space transform - same DObj shape as GOBJ_OBJ_PTR points to)
-constexpr uint32_t FTDC_PLACEMENT        = 0x0C; // s32: 0 low, 1 middle, 2 high
-constexpr uint32_t FTDC_IS_GRABBABLE     = 0x10; // sb32, read as a full word
-constexpr uint32_t FTDC_OFFSET           = 0x14; // f32[3] - authored, bone-relative, untransformed
-constexpr uint32_t FTDC_SIZE             = 0x20; // f32[3] - anisotropic, unlike a hitbox's single radius
-
-// Item/weapon hitboxes (ITAttackColl/WPAttackColl) - smashremix
-// docs/ram-map.md section 14.3/14.4. CAUTION (ram-map.md section 14.5):
-// field order here is high-confidence (read directly from source), but
-// these exact byte offsets - and ITStruct/WPStruct's own attack_coll offset
-// below - are hand-derived, not compiler-verified, unlike FTAttackColl/
-// FTDamageColl above. `MPCollData` (208 bytes, embedded in both structs
-// ahead of attack_coll) is the biggest single source of potential error.
-constexpr uint32_t IT_STRUCT_ATTACK_COLL = 0x10C;
-constexpr uint32_t WP_STRUCT_ATTACK_COLL = 0x100;
-constexpr int       ATTACK_COLL_SLOTS     = 2; // ITEM_ATKCOLL_NUM_MAX / WEAPON_ATKCOLL_NUM_MAX
-// ITAttackPos/WPAttackPos - identical 0x60-byte layout for both, and unlike
-// the offsets above, this exact size IS directly confirmed (decomp field
-// names literally encode their own byte offsets - see ram-map.md 14.3).
-constexpr uint32_t ATTACK_POS_STRIDE = 0x60;
-constexpr uint32_t ATTACK_POS_CURR   = 0x00; // f32[3], within one ATTACK_POS_STRIDE slot
-
-struct AttackCollLayout
-{
-    uint32_t attackState;
-    uint32_t damage;
-    uint32_t element;
-    uint32_t size;
-    uint32_t angle;
-    uint32_t knockbackScale;
-    uint32_t knockbackWeight;
-    uint32_t knockbackBase;
-    uint32_t shieldDamage;
-    uint32_t attackPos; // base of the ITAttackPos[2]/WPAttackPos[2] array, relative to attack_coll
-};
-
-constexpr AttackCollLayout kItAttackCollLayout{
-    /* attackState     */ 0x00,
-    /* damage          */ 0x04,
-    /* element         */ 0x10,
-    /* size            */ 0x2C,
-    /* angle           */ 0x30,
-    /* knockbackScale  */ 0x34,
-    /* knockbackWeight */ 0x38,
-    /* knockbackBase   */ 0x3C,
-    /* shieldDamage    */ 0x40,
-    /* attackPos       */ 0x5C,
-};
-
-// Same shape as ITAttackColl but no `throw_mul` field (just `stale`) and two
-// extra bitfield flags, which shifts everything after `element` down 4
-// bytes relative to the item layout above.
-constexpr AttackCollLayout kWpAttackCollLayout{
-    /* attackState     */ 0x00,
-    /* damage          */ 0x04,
-    /* element         */ 0x0C,
-    /* size            */ 0x28,
-    /* angle           */ 0x2C,
-    /* knockbackScale  */ 0x30,
-    /* knockbackWeight */ 0x34,
-    /* knockbackBase   */ 0x38,
-    /* shieldDamage    */ 0x3C,
-    /* attackPos       */ 0x58,
-};
-
-constexpr uint8_t HITBOX_OWNER_FIGHTER = 0;
-constexpr uint8_t HITBOX_OWNER_ITEM    = 1;
-constexpr uint8_t HITBOX_OWNER_WEAPON  = 2;
-
 // Stage hazards. See smashremix docs/ram-map.md section 10.3 (is Whispy
 // blowing) and 10.3.1 (which direction) - Dream Land's live hazard state
 // lives in a fixed global that is a *union* shared by every "common
@@ -268,10 +178,7 @@ float ReadFloat(uint32_t address)
 // (defensively skipping anything else, per that list's documented
 // guarantee). `userData` is that GObj's ITStruct*/WPStruct* pointer
 // (GOBJ_USER_DATA_PTR), NOT validated as a real RDRAM pointer here - callers
-// that dereference it must check IsValidRdramPointer() themselves. Shared by
-// ReadItemObjects() and ReadHitboxes() so the list-walk/cap/link_id-check
-// logic itself isn't duplicated between "what object is this" and "does it
-// have an active hitbox" concerns.
+// that dereference it must check IsValidRdramPointer() themselves.
 template <typename Visitor>
 void WalkGObjLinkList(uint8_t linkId, Visitor&& visitor)
 {
@@ -295,11 +202,11 @@ void WalkGObjLinkList(uint8_t linkId, Visitor&& visitor)
 }
 
 // Chases matchStruct+0x58 -> playerObject+0x84 -> playerStruct - the same
-// two-hop pattern ReadPortPlayerState() and the hitbox/hurtbox readers all
-// need. Returns 0 if the first hop (matchStruct+0x58) isn't a valid
-// pointer; otherwise returns the second hop's raw value as-is, WITHOUT
-// validating it - every caller here already calls IsValidRdramPointer() on
-// the result immediately, so re-checking here would just be redundant.
+// two-hop pattern ReadPortPlayerState() needs. Returns 0 if the first hop
+// (matchStruct+0x58) isn't a valid pointer; otherwise returns the second
+// hop's raw value as-is, WITHOUT validating it - the caller already calls
+// IsValidRdramPointer() on the result immediately, so re-checking here
+// would just be redundant.
 uint32_t ResolvePlayerStruct(uint32_t matchInfoPtr, int port)
 {
     const uint32_t base = matchInfoPtr + MI_PORT_STRUCT_BASE +
@@ -312,55 +219,6 @@ uint32_t ResolvePlayerStruct(uint32_t matchInfoPtr, int port)
     }
 
     return m64p::Core.DebugMemRead32(playerObject + PLAYER_OBJECT_TO_STRUCT);
-}
-
-// Walks every live Item or Weapon GObj (per `linkId`) and appends one
-// HitboxObject for each of its ATTACK_COLL_SLOTS slots whose attackState !=
-// 0 (disabled slots are never returned). `structAttackCollOffset` is
-// IT_STRUCT_ATTACK_COLL or WP_STRUCT_ATTACK_COLL; `layout` is
-// kItAttackCollLayout or kWpAttackCollLayout, matching.
-void ReadGObjListHitboxes(uint8_t linkId, uint8_t ownerKind, uint32_t structAttackCollOffset,
-    const AttackCollLayout& layout, std::vector<ReplayMemory::HitboxObject>& hitboxes)
-{
-    WalkGObjLinkList(linkId, [&](uint32_t objectAddress, uint32_t userData)
-    {
-        if (!IsValidRdramPointer(userData))
-        {
-            return;
-        }
-        const uint32_t attackColl = userData + structAttackCollOffset;
-
-        for (int slot = 0; slot < ATTACK_COLL_SLOTS; slot++)
-        {
-            const int32_t attackState =
-                static_cast<int32_t>(m64p::Core.DebugMemRead32(attackColl + layout.attackState));
-            if (attackState == 0)
-            {
-                continue;
-            }
-
-            const uint32_t posBase = attackColl + layout.attackPos +
-                static_cast<uint32_t>(slot) * ATTACK_POS_STRIDE + ATTACK_POS_CURR;
-
-            ReplayMemory::HitboxObject hitbox{};
-            hitbox.ownerKind       = ownerKind;
-            hitbox.ownerId         = objectAddress;
-            hitbox.slotIndex       = static_cast<uint8_t>(slot);
-            hitbox.attackState     = static_cast<uint8_t>(attackState);
-            hitbox.damage          = static_cast<int32_t>(m64p::Core.DebugMemRead32(attackColl + layout.damage));
-            hitbox.positionX       = ReadFloat(posBase + 0x00);
-            hitbox.positionY       = ReadFloat(posBase + 0x04);
-            hitbox.positionZ       = ReadFloat(posBase + 0x08);
-            hitbox.size            = ReadFloat(attackColl + layout.size);
-            hitbox.angle           = static_cast<int32_t>(m64p::Core.DebugMemRead32(attackColl + layout.angle));
-            hitbox.knockbackScale  = static_cast<int32_t>(m64p::Core.DebugMemRead32(attackColl + layout.knockbackScale));
-            hitbox.knockbackWeight = static_cast<int32_t>(m64p::Core.DebugMemRead32(attackColl + layout.knockbackWeight));
-            hitbox.knockbackBase   = static_cast<int32_t>(m64p::Core.DebugMemRead32(attackColl + layout.knockbackBase));
-            hitbox.element         = static_cast<int32_t>(m64p::Core.DebugMemRead32(attackColl + layout.element));
-            hitbox.shieldDamage    = static_cast<int32_t>(m64p::Core.DebugMemRead32(attackColl + layout.shieldDamage));
-            hitboxes.push_back(hitbox);
-        }
-    });
 }
 } // namespace
 
@@ -523,118 +381,6 @@ std::vector<ItemObject> ReadItemObjects(void)
     collectNonHeld(GOBJ_LINK_ID_WEAPON);
 
     return objects;
-}
-
-std::vector<HitboxObject> ReadHitboxes(uint32_t matchInfoPtr)
-{
-    std::vector<HitboxObject> hitboxes;
-
-    for (int port = 0; port < 4; port++)
-    {
-        const uint32_t playerStruct = ResolvePlayerStruct(matchInfoPtr, port);
-        if (!IsValidRdramPointer(playerStruct))
-        {
-            continue;
-        }
-
-        for (int slot = 0; slot < FT_ATTACK_COLL_SLOTS; slot++)
-        {
-            const uint32_t slotBase =
-                playerStruct + PS_ATTACK_COLL_BASE + static_cast<uint32_t>(slot) * PS_ATTACK_COLL_STRIDE;
-            const int32_t attackState =
-                static_cast<int32_t>(m64p::Core.DebugMemRead32(slotBase + FTAC_ATTACK_STATE));
-            if (attackState == 0)
-            {
-                continue;
-            }
-
-            HitboxObject hitbox{};
-            hitbox.ownerKind       = HITBOX_OWNER_FIGHTER;
-            hitbox.ownerId         = static_cast<uint32_t>(port);
-            hitbox.slotIndex       = static_cast<uint8_t>(slot);
-            hitbox.attackState     = static_cast<uint8_t>(attackState);
-            hitbox.damage          = static_cast<int32_t>(m64p::Core.DebugMemRead32(slotBase + FTAC_DAMAGE));
-            hitbox.positionX       = ReadFloat(slotBase + FTAC_POS_CURR + 0x00);
-            hitbox.positionY       = ReadFloat(slotBase + FTAC_POS_CURR + 0x04);
-            hitbox.positionZ       = ReadFloat(slotBase + FTAC_POS_CURR + 0x08);
-            hitbox.size            = ReadFloat(slotBase + FTAC_SIZE);
-            hitbox.angle           = static_cast<int32_t>(m64p::Core.DebugMemRead32(slotBase + FTAC_ANGLE));
-            hitbox.knockbackScale  = static_cast<int32_t>(m64p::Core.DebugMemRead32(slotBase + FTAC_KB_SCALE));
-            hitbox.knockbackWeight = static_cast<int32_t>(m64p::Core.DebugMemRead32(slotBase + FTAC_KB_WEIGHT));
-            hitbox.knockbackBase   = static_cast<int32_t>(m64p::Core.DebugMemRead32(slotBase + FTAC_KB_BASE));
-            hitbox.element         = static_cast<int32_t>(m64p::Core.DebugMemRead32(slotBase + FTAC_ELEMENT));
-            hitbox.shieldDamage    = static_cast<int32_t>(m64p::Core.DebugMemRead32(slotBase + FTAC_SHIELD_DAMAGE));
-            hitboxes.push_back(hitbox);
-        }
-    }
-
-    ReadGObjListHitboxes(GOBJ_LINK_ID_ITEM, HITBOX_OWNER_ITEM, IT_STRUCT_ATTACK_COLL, kItAttackCollLayout, hitboxes);
-    ReadGObjListHitboxes(GOBJ_LINK_ID_WEAPON, HITBOX_OWNER_WEAPON, WP_STRUCT_ATTACK_COLL, kWpAttackCollLayout, hitboxes);
-
-    return hitboxes;
-}
-
-std::vector<HurtboxObject> ReadHurtboxes(uint32_t matchInfoPtr)
-{
-    std::vector<HurtboxObject> hurtboxes;
-
-    for (int port = 0; port < 4; port++)
-    {
-        const uint32_t playerStruct = ResolvePlayerStruct(matchInfoPtr, port);
-        if (!IsValidRdramPointer(playerStruct))
-        {
-            continue;
-        }
-
-        for (int slot = 0; slot < FT_DAMAGE_COLL_SLOTS; slot++)
-        {
-            const uint32_t slotBase =
-                playerStruct + PS_DAMAGE_COLL_BASE + static_cast<uint32_t>(slot) * PS_DAMAGE_COLL_STRIDE;
-
-            // hitStatus, not joint's pointer validity, is the decomp-
-            // confirmed "is this slot in use" signal (ftmanager.c): an
-            // unused slot's hitstatus is explicitly set to nGMHitStatusNone
-            // (0), but its joint field is left untouched from whatever was
-            // in that memory before - not NULL, not necessarily even
-            // outside the valid RDRAM range, just meaningless. Gating on
-            // IsValidRdramPointer(joint) instead filtered out every slot,
-            // used or not, every frame - see docs/RMGR_SPEC.md section 5.
-            const int32_t hitStatus = static_cast<int32_t>(m64p::Core.DebugMemRead32(slotBase + FTDC_HITSTATUS));
-            if (hitStatus == 0)
-            {
-                continue;
-            }
-
-            const uint32_t joint = m64p::Core.DebugMemRead32(slotBase + FTDC_JOINT_PTR);
-            if (!IsValidRdramPointer(joint))
-            {
-                continue;
-            }
-
-            HurtboxObject hurtbox{};
-            hurtbox.port        = static_cast<uint8_t>(port);
-            hurtbox.slotIndex   = static_cast<uint8_t>(slot);
-            hurtbox.hitStatus   = hitStatus;
-            hurtbox.placement   = static_cast<int32_t>(m64p::Core.DebugMemRead32(slotBase + FTDC_PLACEMENT));
-            hurtbox.isGrabbable = m64p::Core.DebugMemRead32(slotBase + FTDC_IS_GRABBABLE) != 0;
-
-            hurtbox.positionX = ReadFloat(joint + DOBJ_POSITION_X);
-            hurtbox.positionY = ReadFloat(joint + DOBJ_POSITION_Y);
-            hurtbox.positionZ = ReadFloat(joint + DOBJ_POSITION_Z);
-
-            hurtbox.offsetX = ReadFloat(slotBase + FTDC_OFFSET + 0x00);
-            hurtbox.offsetY = ReadFloat(slotBase + FTDC_OFFSET + 0x04);
-            hurtbox.offsetZ = ReadFloat(slotBase + FTDC_OFFSET + 0x08);
-
-            hurtbox.sizeX = ReadFloat(slotBase + FTDC_SIZE + 0x00);
-            hurtbox.sizeY = ReadFloat(slotBase + FTDC_SIZE + 0x04);
-            hurtbox.sizeZ = ReadFloat(slotBase + FTDC_SIZE + 0x08);
-
-            hurtboxes.push_back(hurtbox);
-        }
-    }
-
-    return hurtboxes;
 }
 
 StageHazards ReadStageHazards(uint8_t stageId)

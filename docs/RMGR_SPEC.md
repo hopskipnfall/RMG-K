@@ -3,11 +3,9 @@
 **Status:** format version `5`. This is the first time the `.rmgr` format
 has been formally specified — this document did not exist before this
 branch, and it has not yet been shared with the upstream RMG-K
-maintainers. **Not yet implemented** — `Source/RMG-Core/Replay.cpp` /
-`Source/RMG-Core/ReplayMemory.cpp` on this fork still implement an
-earlier, unspecified, in-development revision of the format (internally
-numbered up to `4`) that predates this document; this spec describes the
-target format going forward. See
+maintainers. **The writer (`Source/RMG-Core/Replay.cpp` /
+`Source/RMG-Core/ReplayMemory.cpp`) implements this version.** The reader
+side (`rmgr-ts`, `rmgr-viewer`) has not been updated yet — see §10. See
 `docs/superpowers/specs/2026-09-04-rmgr-v2-design.md` for the design
 rationale.
 
@@ -813,18 +811,14 @@ tracked (Zebes' rising acid, Duel Zone's disappearing platforms, …).
 
 ## 10. Reference implementation
 
-**Not yet implemented as of this document.** The design is finalized (see
-`docs/superpowers/specs/2026-09-04-rmgr-v2-design.md`); the code below
-still implements the earlier, unspecified, in-development revision this
-spec replaces:
-
-- **Writer:** `Source/RMG-Core/Replay.cpp` / `Source/RMG-Core/Replay.hpp`.
-- **Memory reader:** `Source/RMG-Core/ReplayMemory.cpp` /
-  `Source/RMG-Core/ReplayMemory.hpp`.
+- **Writer:** `Source/RMG-Core/Replay.cpp` / `Source/RMG-Core/Replay.hpp` -
+  implements this version (`5`). Memory reading:
+  `Source/RMG-Core/ReplayMemory.cpp` / `Source/RMG-Core/ReplayMemory.hpp`.
 - **TypeScript reader/writer + tests:** [`rmgr-ts`](https://github.com/hopskipnfall/rmgr-ts),
-  its own repository (extracted from this one).
+  its own repository (extracted from this one). **Not yet updated for this
+  version** - still reads the pre-this-document, unspecified in-development
+  layout. `rmgr-viewer` (consumer of `rmgr-ts`) is therefore also not yet
+  able to read files this writer produces.
 
-Implementing this spec requires coordinated changes across `RMG-K`
-(writer), `rmgr-ts` (reader/types), and `rmgr-viewer` (consumer of
-`rmgr-ts`) — see the design doc's §7 for the specific open items each
-repo needs to address.
+The reader-side work (`rmgr-ts`, then `rmgr-viewer`) is tracked separately -
+see the design doc's §7 for the specific items each still needs.

@@ -851,16 +851,12 @@ void SettingsDialog::load64DDSettings(void)
 #ifdef RMGK_GAME_STATS
     this->kailleraReplayByDefaultCheckBox->setChecked(
         CoreSettingsGetBoolValue(SettingsID::GameStats_ReplayEnabled));
-    this->kailleraReplayHitboxesCheckBox->setChecked(
-        CoreSettingsGetBoolValue(SettingsID::GameStats_RecordHitboxData));
 #else
     this->kailleraReplayByDefaultCheckBox->setChecked(false);
     this->kailleraReplayByDefaultCheckBox->setEnabled(false);
     this->kailleraReplayByDefaultCheckBox->setToolTip(
         "This build was compiled without GAME_STATS support (-DGAME_STATS=ON), "
         "so replay recording is unavailable.");
-    this->kailleraReplayHitboxesCheckBox->setChecked(false);
-    this->kailleraReplayHitboxesCheckBox->setEnabled(false);
 #endif
     this->kailleraPortSpinBox->setValue(kailleraPort);
     this->kailleraRecordsDirectoryLineEdit->setProperty("rawPath", recordsDirectoryRaw);
@@ -1131,8 +1127,6 @@ void SettingsDialog::loadDefault64DDSettings(void)
 #ifdef RMGK_GAME_STATS
     this->kailleraReplayByDefaultCheckBox->setChecked(
         CoreSettingsGetDefaultBoolValue(SettingsID::GameStats_ReplayEnabled));
-    this->kailleraReplayHitboxesCheckBox->setChecked(
-        CoreSettingsGetDefaultBoolValue(SettingsID::GameStats_RecordHitboxData));
 #endif
     this->kailleraPortSpinBox->setValue(kailleraPort);
     this->kailleraRecordsDirectoryLineEdit->setProperty("rawPath", recordsDirectoryRaw);
@@ -1430,7 +1424,6 @@ void SettingsDialog::save64DDSettings(void)
     CoreSettingsSetValue(SettingsID::Kaillera_RecordingEnabled, this->kailleraRecordByDefaultCheckBox->isChecked());
 #ifdef RMGK_GAME_STATS
     CoreSettingsSetValue(SettingsID::GameStats_ReplayEnabled, this->kailleraReplayByDefaultCheckBox->isChecked());
-    CoreSettingsSetValue(SettingsID::GameStats_RecordHitboxData, this->kailleraReplayHitboxesCheckBox->isChecked());
 #endif
     CoreSettingsSetValue(SettingsID::Kaillera_Port, this->kailleraPortSpinBox->value());
     CoreSettingsSetValue(SettingsID::Kaillera_RecordsDirectory, recordsDirectory);

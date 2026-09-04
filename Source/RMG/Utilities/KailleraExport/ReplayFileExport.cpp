@@ -36,10 +36,10 @@ static constexpr const char* kExportVerboseOption = "export-verbose";
 
 // This feature's memory offsets (ReplayMemory.cpp, in RMG-Core) were only
 // ever derived/verified against Smash Remix 2.0.1 - same restriction as the
-// live-recording path (see Replay.cpp's IsSupportedGame()). Checked here
-// too, against the krec's own stored game name, so a mismatched recording
-// fails fast with a clear reason instead of spinning up a whole headless
-// emulator to produce nothing.
+// live-recording path (see Replay.cpp's DetermineGameFamily()). Checked
+// here too, against the krec's own stored game name, so a mismatched
+// recording fails fast with a clear reason instead of spinning up a whole
+// headless emulator to produce nothing.
 static constexpr const char* kSupportedGoodName = "SmashRemix2.0.1";
 
 static void printExportError(const std::string& message)

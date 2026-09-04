@@ -113,9 +113,6 @@ void SetPlayerNamesOverride(const std::array<std::string, 4>& names);
 // derive that specific match's recordedAtEpochMillis. A null
 // frameIndexProvider is treated as "0 frames elapsed" (i.e. every match
 // gets krecBaseEpochSeconds itself, converted to milliseconds).
-// recordedAtNanosOffset is always written as 0 for matches recorded via
-// this override - there's no sub-millisecond information to derive it
-// from.
 //
 // Cleared at OnEmulationStop(), same as the two overrides above - a launch
 // path that never calls this always falls through to time(nullptr), and a

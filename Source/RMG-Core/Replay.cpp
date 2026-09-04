@@ -17,6 +17,8 @@
 #include "kailleraclient.h"
 #endif
 
+#include <zlib.h>
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -35,92 +37,81 @@ namespace
 {
 #pragma pack(push, 1)
 
+// v5, ground-up rewrite - see docs/RMGR_SPEC.md. Breaking change from
+// everything recorded before this document existed: no migration path, none
+// planned. `version` keeps incrementing (this fork's prior in-development
+// numbering reached 4) rather than resetting to 1, purely so a reader that
+// only understands the old, unspecified layout sees an unfamiliar number and
+// correctly refuses to parse, instead of the value colliding with an
+// unrelated earlier meaning.
 struct FileHeader
 {
-    char     magic[4];     // "RMGR"
-    uint8_t  version;      // 4 - container/framing format only, see docs/RMGR_SPEC.md section 5
-    uint8_t  reserved[3];  // zero
-    uint32_t streamLength; // 0 while recording, patched to the real value at close
-    // v2: which game produced this file, and which revision of this
-    // recorder's understanding of that game's memory layout wrote it -
-    // distinct axes, since a bugfix to an offset (or a newly-tracked field)
-    // for the SAME goodName needs its own version bump even though the
-    // container format itself hasn't changed. recorderSchemaVersion is its
-    // own counter per goodName, not a global one - "SmashRemix2.0.1 schema
-    // v3" and "SmashRemix2.0.2 schema v1" are unrelated numbering spaces.
-    char     goodName[64];           // NUL-padded; not necessarily NUL-terminated if it fills the field. UTF-8.
-    uint32_t recorderSchemaVersion;  // see IsSupportedGame()/kRecorderSchemaVersion below
-    // v3/v4: wall-clock time this recording started, independent of the
-    // filename (which is derived from local time - see BuildFileName() -
-    // and can't be trusted to round-trip through arbitrary filesystems/
-    // renames the way this field can). v4 replaced v3's whole-seconds
-    // recordedAtEpochSeconds with recordedAtEpochMillis - see OpenNewFile()
-    // and docs/RMGR_SPEC.md section 5.
-    uint64_t recordedAtEpochMillis;  // milliseconds since the Unix epoch (UTC)
-    // v4: nanosecond offset within recordedAtEpochMillis's millisecond, for
-    // callers with a clock source finer than millisecond resolution - see
-    // OpenNewFile(). 0 when the value being written wasn't read from a
-    // clock directly (e.g. the .krec-derived override path).
-    uint32_t recordedAtNanosOffset;
+    char     magic[4];        // "RMGR"
+    uint8_t  version;         // 5
+    uint8_t  reserved[3];     // zero
+    // Which game-family extension event set (below) applies - a coarser,
+    // slower-growing identity than goodName. Empty (all zero) if the loaded
+    // ROM isn't recognized: the file is still a fully valid core-only
+    // recording in that case, just with no extension events. See
+    // docs/RMGR_SPEC.md section 2.1/3.2.
+    char     gameFamily[16];
+    // Exact ROM build identity (mupen64plus-core's own ROM database string) -
+    // distinct from gameFamily: two different goodNames can share one family
+    // (e.g. a future vanilla-SSB64 recorder alongside Smash Remix, both
+    // "smash64"), each with its own recorderSchemaVersion numbering space.
+    char     goodName[64];
+    uint32_t recorderSchemaVersion; // see kRecorderSchemaVersion below; 0 when gameFamily is empty
+    uint64_t recordedAtEpochMillis; // milliseconds since the Unix epoch (UTC)
+    // Byte length of the event stream after decompression - lets a reader
+    // preallocate its output buffer instead of growing it dynamically.
+    uint32_t uncompressedLength;
+    // Byte length of the deflate-compressed block immediately following this
+    // header. Always correct on disk: the whole match is buffered in memory
+    // and compressed once, at match end (see s_EventBuffer below), so there
+    // is no "0 until finalized, patched via seek" convention to speak of -
+    // and, as an accepted trade-off, a crash or force-quit mid-match now
+    // produces no file at all rather than a truncated one.
+    uint32_t compressedLength;
 };
-static_assert(sizeof(FileHeader) == 92, "FileHeader must be 92 bytes");
+static_assert(sizeof(FileHeader) == 108, "FileHeader must be 108 bytes");
 
 enum class EventCode : uint8_t
 {
     EventPayloads = 0x01,
-    GameStart     = 0x02,
-    PreFrame      = 0x03,
-    PostFrame     = 0x04,
-    GameEnd       = 0x05,
-    // v2/v3 (docs/RMGR_SPEC.md section 5, new event types - not a header
-    // version bump): one per live Item/Weapon GObj, per frame. See
-    // ItemUpdateEvent below.
+    // Core (always present, any recognized-or-not N64 ROM):
+    MatchStart = 0x02,
+    InputFrame = 0x03,
+    MatchEnd   = 0x05,
+    // smash64 game-family extension (present only when gameFamily ==
+    // "smash64" - see IsSmash64() below):
+    StateFrame        = 0x04,
     ItemUpdate        = 0x06,
-    // v3: emitted only on frames where at least one tracked stage hazard is
-    // active. See StageHazardUpdateEvent below.
     StageHazardUpdate = 0x07,
-    // v5: one per currently-active hitbox slot, per frame. See
-    // HitboxUpdateEvent below.
-    HitboxUpdate      = 0x08,
-    // v5: one per fighter hurtbox slot, per seated port, per frame. See
-    // HurtboxUpdateEvent below.
-    HurtboxUpdate     = 0x09,
+    MatchSettings     = 0x08,
+    MatchResult       = 0x09,
 };
 
-struct GameStartPortInfo
+// Core event, code 0x02. Written exactly once, immediately after
+// EventPayloads. Player display names are sourced from netplay room
+// metadata (RMG-K's own slot-indexed name table), never from any in-game
+// name tag - for an offline match, or a port with no assigned name, the
+// corresponding playerNames entry is all zero bytes. Game-family-specific
+// match settings (stage, character, stock count, damage ratio, items,
+// teams, handicap, CPU difficulty, ...) are NOT part of this event - see
+// MatchSettingsEvent below.
+struct MatchStartEvent
 {
-    uint8_t slotType; // 0 human, 1 CPU, 2 empty
-    uint8_t characterId;
-    uint8_t costumeId;
-    uint8_t teamColor;
+    char    playerNames[4][32]; // NUL-padded; not necessarily NUL-terminated if it fills the field. UTF-8.
+    uint8_t slotType[4];        // 0 human, 1 CPU, 2 empty - per port 0-3
 };
-static_assert(sizeof(GameStartPortInfo) == 4, "GameStartPortInfo must be 4 bytes");
+static_assert(sizeof(MatchStartEvent) == 132, "MatchStartEvent must be 132 bytes");
 
-struct GameStartEvent
-{
-    uint8_t           stageId;
-    uint8_t           gameType;
-    uint8_t           stockCountSetting;
-    uint8_t           timeLimitMinutes;
-    uint8_t           damageRatio;
-    uint8_t           itemFrequency;
-    GameStartPortInfo ports[4];
-    char              playerNames[4][32];
-    // v1 field-append (docs/RMGR_SPEC.md section 5): everything above this
-    // line is the original 150-byte v1 layout, untouched. New fields are
-    // appended here, never inserted earlier, so an old parser reading a
-    // new file still sees the original layout intact at its original
-    // offsets and just skips these trailing bytes via the size EventPayloads
-    // declares for this event.
-    uint8_t           teamsEnabled;    // 0 off, 1 on
-    uint8_t           handicapMode;    // 0 off, 1 on, 2 auto
-    uint8_t           portTeam[4];     // team number per port, index = port
-    uint8_t           portHandicap[4]; // per-port handicap value (meaningful when handicapMode != 0)
-    uint8_t           portCpuLevel[4]; // CPU difficulty per port (meaningless for human ports)
-};
-static_assert(sizeof(GameStartEvent) == 164, "GameStartEvent must be 164 bytes");
-
-struct PreFrameEvent
+// Core event, code 0x03. Input-side data, captured before the game
+// processes that frame's inputs. One event per seated port per frame. Uses
+// the game's already-processed button/stick values, the one input
+// representation available uniformly for both human and CPU-controlled
+// ports.
+struct InputFrameEvent
 {
     int32_t  frame;
     uint8_t  port;
@@ -128,82 +119,99 @@ struct PreFrameEvent
     int8_t   stickX;
     int8_t   stickY;
 };
-static_assert(sizeof(PreFrameEvent) == 9, "PreFrameEvent must be 9 bytes");
+static_assert(sizeof(InputFrameEvent) == 9, "InputFrameEvent must be 9 bytes");
 
-struct PostFrameEvent
+// Core event, code 0x05. Written exactly once, as the last event in the
+// stream. Final per-port results (e.g. smash64's stocks-remaining
+// placements) aren't a universal concept across N64 titles and are NOT part
+// of this event - see MatchResultEvent below.
+struct MatchEndEvent
 {
-    int32_t  frame;
+    int32_t finalFrame; // last frame value seen in any InputFrame event this match
+    uint8_t endReason;  // 0 aborted (match-was-reset or process/emulation stopped mid-match), 1 normal end
+};
+static_assert(sizeof(MatchEndEvent) == 5, "MatchEndEvent must be 5 bytes");
+
+// smash64 extension event, code 0x08. Written exactly once, immediately
+// after MatchStart - the game-family-specific counterpart split out of what
+// used to be one combined GameStart event. Everything here is
+// Smash-specific and static for the whole match.
+struct MatchSettingsEvent
+{
+    uint8_t stageId;
+    uint8_t gameType;          // 1 time, 2 stock, 3 both (Remix always forces stock)
+    uint8_t stockCountSetting; // 0-based (i.e. 2 means "3 stocks")
+    uint8_t timeLimitMinutes;  // 100 = infinite
+    uint8_t damageRatio;       // 50 = 50%, 200 = 200%
+    uint8_t itemFrequency;     // 0 none .. 5 high
+    uint8_t teamsEnabled;      // 0 off, 1 on
+    uint8_t handicapMode;      // 0 off, 1 on, 2 auto
+    uint8_t characterId[4];    // per port 0-3
+    uint8_t costumeId[4];
+    uint8_t teamColor[4];
+    uint8_t portTeam[4];       // team number per port
+    uint8_t portHandicap[4];   // meaningful only when handicapMode != 0
+    uint8_t portCpuLevel[4];   // meaningless for a human port
+};
+static_assert(sizeof(MatchSettingsEvent) == 32, "MatchSettingsEvent must be 32 bytes");
+
+// smash64 extension event, code 0x04. State-side data, captured after that
+// frame's physics/collision resolution - the resulting state. One event per
+// seated port per frame, always immediately following that port's
+// InputFrame in the stream.
+struct StateFrameEvent
+{
+    int32_t  frame; // same frame counter as the paired InputFrame
     uint8_t  port;
     uint8_t  characterId;
     uint16_t actionStateId;
     float    positionX;
     float    positionY;
-    int32_t  facingDirection;
+    int32_t  facingDirection; // 1 right, -1 left
     float    velocityX;
     float    velocityY;
     uint32_t damagePercent;
-    int8_t   stocksRemaining;
-    // Named/interpreted as jumpsUsed through schema v6 - that read a
-    // constant 0 all game (wrong width AND wrong emulator byte-swizzle for
-    // a sub-word read, see ReplayMemory::ReadPortPlayerState()). Schema v7
-    // fixes the read and switches this to jumps *remaining* instead
-    // (jumpsMax - jumpsUsed) - more directly useful, and what this project
-    // wanted to export in the first place. Same wire position/size as
-    // before - a pure "what this byte means" fix, not a layout change.
+    int8_t   stocksRemaining; // 0-based; negative once eliminated
+    // jumpsMax (per-character, from FTAttributes) minus jumps_used
+    // (playerStruct+0x148, a u8 that resets to 0 on landing). 0 through
+    // most of a grounded match is normal; Remix can also force this to 0
+    // without that many real jump inputs (e.g. certain up-specials).
     uint8_t  jumpsRemaining;
-    uint8_t  groundedState;
-    uint8_t  hurtboxState;
+    uint8_t  groundedState; // 0 grounded, 1 airborne
+    uint8_t  hurtboxState;  // 0x03 = intangible/invincible; see ReplayMemory.cpp
     uint16_t hitstunCounter;
     uint32_t actionFrameCounter;
-    // v1 field-append (docs/RMGR_SPEC.md section 5): everything above this
-    // line is the original 42-byte v1 layout, untouched.
-    //
-    // Native engine combo tracking, not mod-added - tracked with the combo
-    // meter display toggle off too, and Smash Remix additionally keeps the
-    // chain alive across grabs/wall-bounces/tech-chases where vanilla would
-    // reset it (see smashremix docs/ram-map.md section 13). Belongs to the
-    // victim, not the attacker: how many hits THIS port has taken in its
-    // current unbroken chain. 0 = no active chain, 1 = a single hit (not
-    // yet a "combo" by convention), 2+ = an actual combo. Both zero the
-    // instant the chain breaks - so a reader can count "neutral hits taken
-    // this stock" by counting comboHitCount's 0->nonzero transitions.
+    // Native engine combo tracking, not mod-added. Belongs to the victim
+    // (this port), not the attacker: hits taken in the current unbroken
+    // chain. 0 = no active chain, 1 = a single hit, 2+ = an actual combo.
+    // Both zero the instant the chain breaks.
     uint32_t comboHitCount;
     uint32_t comboDamage;
 };
-static_assert(sizeof(PostFrameEvent) == 50, "PostFrameEvent must be 50 bytes");
+static_assert(sizeof(StateFrameEvent) == 50, "StateFrameEvent must be 50 bytes");
 
-struct GameEndEvent
-{
-    uint8_t endReason; // 0 aborted (match-was-reset or process/emulation stopped mid-match), 1 normal end
-    int8_t  placements[4]; // final stocks remaining per port, -1 if never seated
-};
-static_assert(sizeof(GameEndEvent) == 5, "GameEndEvent must be 5 bytes");
-
-// v2 new event type (docs/RMGR_SPEC.md section 5): one per live Item or
-// Weapon GObj (ReplayMemory::ItemObject), per frame - zero or more of these
-// follow each frame's Pre/Post-Frame pairs. "Weapon" is a free-flying
-// character special-move projectile (boomerang, fireball, ...); "Item"
-// covers thrown/spawned items and hazard objects, including some
-// fighter-held things like Link's pulled bomb. See
-// ReplayMemory::ItemObject's own doc comment and
-// smashremix docs/ram-map.md section 10.4.
+// smash64 extension event, code 0x06. Zero or more per frame - one per live
+// Item or Weapon GObj (ReplayMemory::ItemObject) currently not held by a
+// fighter, following that frame's InputFrame/StateFrame pairs. "Weapon" is
+// a free-flying character special-move projectile (boomerang, fireball,
+// ...); "Item" covers thrown/spawned items and hazard objects, including
+// some fighter-held things like Link's pulled bomb.
 struct ItemUpdateEvent
 {
-    int32_t  frame;         // same numbering as Pre/PostFrame
+    int32_t  frame;         // same numbering as InputFrame/StateFrame
     uint32_t objectAddress; // the object's own RDRAM address - not a semantic spawn ID, see ReplayMemory::ItemObject
-    uint8_t  linkId;        // 4 = Item, 5 = Weapon - which enum `kind` below means (docs/RMGR_SPEC.md section 7.6)
+    uint8_t  linkId;        // 4 = Item, 5 = Weapon - which enum `kind` below means (docs/RMGR_SPEC.md section 8.6)
     int32_t  kind;          // ITKind (linkId == 4) or WPKind (linkId == 5)
     float    positionX;
     float    positionY;
-    float    positionZ; // confirmed exactly via the decomp - see docs/RMGR_SPEC.md section 4.6
+    float    positionZ;
 };
 static_assert(sizeof(ItemUpdateEvent) == 25, "ItemUpdateEvent must be 25 bytes");
 
-// v3: currently just Whispy Woods' wind on Dream Land - only emitted on a
-// frame where at least one bit is set (never a placeholder event with
-// hazardFlags == 0), same sparse-event convention as ItemUpdate. More
-// hazards can set more bits later via the field-append mechanism (section
-// 5) without needing a new event type.
+// smash64 extension event, code 0x07. Zero or one per frame, following that
+// frame's ItemUpdate events - written only when at least one tracked hazard
+// is currently active, same sparse convention as ItemUpdate. Currently
+// tracks exactly one hazard: Whispy Woods' wind on Dream Land.
 struct StageHazardUpdateEvent
 {
     int32_t frame;
@@ -217,98 +225,51 @@ static_assert(sizeof(StageHazardUpdateEvent) == 5, "StageHazardUpdateEvent must 
 constexpr uint8_t kHazardFlagWhispyBlowing      = 0x01;
 constexpr uint8_t kHazardFlagWhispyBlowingRight = 0x02;
 
-// v5 new event type: one per currently-active hitbox slot (a fighter's own
-// attack, or an item's/weapon's), per frame - zero or more of these follow
-// that frame's ItemUpdate/StageHazardUpdate events, same sparse convention
-// (a disabled slot is never emitted). See ReplayMemory::HitboxObject's own
-// doc comment for the confidence caveat on Item/Weapon offsets, and
-// docs/RMGR_SPEC.md section 4.8.
-//
-// This is deliberately verbose (every active slot, every frame) rather than
-// deduplicated - the plan is to record exhaustively for now and, once
-// hitbox/hurtbox geometry is shown to be reliably derivable from
-// (characterId, actionStateId, actionFrameCounter) alone for a given
-// character, stop recording it for that character and compute it instead.
-struct HitboxUpdateEvent
+// smash64 extension event, code 0x09. Written exactly once, immediately
+// after the core MatchEnd event - the game-family-specific counterpart
+// split out of what used to be one combined GameEnd event, since "stocks
+// remaining" is a Smash concept, not a universal one.
+struct MatchResultEvent
 {
-    int32_t  frame;
-    uint8_t  ownerKind;   // 0 = Fighter, 1 = Item, 2 = Weapon - see ReplayMemory::HitboxObject
-    uint32_t ownerId;     // Fighter: port (0-3). Item/Weapon: GObj address, correlates with that frame's ItemUpdate.objectAddress
-    uint8_t  slotIndex;   // Fighter: 0-3. Item/Weapon: 0-1.
-    uint8_t  attackState; // 1 fresh, 2 transfer, 3 interpolate - never 0 (disabled slots aren't emitted)
-    int32_t  damage;
-    float    positionX;   // world-space, already transformed
-    float    positionY;
-    float    positionZ;
-    float    size;        // radius - hitboxes are spheres, not boxes
-    int32_t  angle;
-    int32_t  knockbackScale;
-    int32_t  knockbackWeight;
-    int32_t  knockbackBase;
-    int32_t  element;
-    int32_t  shieldDamage;
+    int8_t placements[4]; // final stocks remaining per port, -1 if never seated
 };
-static_assert(sizeof(HitboxUpdateEvent) == 55, "HitboxUpdateEvent must be 55 bytes");
-
-// v5 new event type: one per fighter hurtbox slot (11 per seated port), per
-// frame - see ReplayMemory::HurtboxObject's own doc comment, including the
-// approximation noted for positionX/Y/Z, and docs/RMGR_SPEC.md section 4.9.
-// Unlike ItemUpdate/HitboxUpdate this isn't sparse - a seated port's 11
-// slots are (almost) always all present, since hurtboxes exist essentially
-// continuously while a fighter is alive. See HitboxUpdateEvent's doc
-// comment above for why this verbosity is intentional for now.
-struct HurtboxUpdateEvent
-{
-    int32_t  frame;
-    uint8_t  port;
-    uint8_t  slotIndex;   // 0-10
-    int32_t  hitStatus;   // per-bone Vulnerable/Invincible/Intangible - raw value, see ReplayMemory::HurtboxObject
-    int32_t  placement;   // 0 low, 1 middle, 2 high
-    uint8_t  isGrabbable;
-    float    positionX;   // APPROXIMATION - the bone's own joint position, not the true transformed hurtbox center
-    float    positionY;
-    float    positionZ;
-    float    offsetX;     // authored, bone-relative, untransformed
-    float    offsetY;
-    float    offsetZ;
-    // Anisotropic (Vec3f, not a single radius like a hitbox) - and, per the
-    // decomp's fighter-hurtbox init, stored PRE-HALVED (size.{x,y,z} *= 0.5F
-    // there): these are half-extents, not full extents. A consumer that
-    // wants the real box dimensions needs to double these, not use them
-    // directly as width/height/depth.
-    float    sizeX;
-    float    sizeY;
-    float    sizeZ;
-};
-static_assert(sizeof(HurtboxUpdateEvent) == 51, "HurtboxUpdateEvent must be 51 bytes");
+static_assert(sizeof(MatchResultEvent) == 4, "MatchResultEvent must be 4 bytes");
 
 #pragma pack(pop)
 
 enum class State
 {
     Idle,            // feature disabled for this emulation session
-    WaitingForMatch, // enabled, no file open, watching for a VS match to start
-    Recording,       // file open, writing Pre/Post-Frame events every frame
+    WaitingForMatch, // enabled, no match currently being recorded, watching for one to start
+    Recording,       // buffering Input/StateFrame events every frame for the in-progress match
 };
 
-State         s_State = State::Idle;
-std::ofstream s_File;
-int32_t       s_FrameNumber = 0;
-uint32_t      s_StreamBytesWritten = 0;
-// Set once per session in OnEmulationStart() from
-// SettingsID::GameStats_RecordHitboxData (off by default) - gates
-// HitboxUpdate/HurtboxUpdate in RecordFrame() only; every other event type
-// is unaffected. See that setting's own doc comment in Settings.hpp for why
-// this exists as a separate opt-in from GameStats_ReplayEnabled itself.
-bool s_RecordHitboxData = false;
+State                s_State = State::Idle;
+int32_t              s_FrameNumber = 0;
+// Everything for the in-progress match accumulates here instead of being
+// streamed to disk incrementally - see docs/RMGR_SPEC.md section 2 for the
+// buffered/compressed-once rationale and its accepted crash-safety
+// trade-off. Cleared in OpenNewFile(); written out (compressed, once) in
+// FinalizeFile().
+std::vector<uint8_t> s_EventBuffer;
+bool                 s_HasPendingRecording = false; // true between a successful OpenNewFile() and the matching FinalizeFile()
+std::filesystem::path s_PendingOutputPath;
+// Whether the loaded ROM's game family is recognized for THIS pending
+// recording - gates every smash64 extension event (StateFrame/ItemUpdate/
+// StageHazardUpdate/MatchSettings/MatchResult); the core events (MatchStart/
+// InputFrame/MatchEnd) are written unconditionally. Cached at OpenNewFile()
+// time rather than re-checked every frame, since the loaded ROM can't change
+// mid-session.
+bool                 s_FamilyRecognized = false;
+FileHeader           s_PendingHeader{};
 
-// Guards s_State/s_File (and, transitively, everything the helpers below
-// touch). OnFrame() runs on the emulation thread while OnEmulationStop()
-// is always called from the UI thread (via CoreStopEmulation() and, for
-// paths that don't reach that, MainWindow::on_Emulation_Finished), so
-// without this a quit-mid-match can have both threads touching s_File at
-// once. Locked at the top of each of the 3 public entry points; every
-// static helper here is only ever reached through one of those.
+// Guards all of the above (and, transitively, everything the helpers below
+// touch). OnFrame() runs on the emulation thread while OnEmulationStop() is
+// always called from the UI thread (via CoreStopEmulation() and, for paths
+// that don't reach that, MainWindow::on_Emulation_Finished), so without this
+// a quit-mid-match can have both threads touching shared state at once.
+// Locked at the top of each of the 3 public entry points; every static
+// helper here is only ever reached through one of those.
 std::mutex s_Mutex;
 
 // Per-launch override for OnEmulationStart(), set via Replay::SetEnabledOverride().
@@ -346,112 +307,56 @@ uint64_t                      s_RecordedAtBaseEpochSeconds = 0;
 Replay::FrameIndexProvider    s_RecordedAtFrameIndexProvider = nullptr;
 
 // This feature's memory offsets were only ever derived/verified against
-// Smash Remix 2.0.1 (see docs/RMGR_SPEC.md); recording against any other
-// ROM would pointer-chase addresses that mean nothing there. GoodName
-// comes from mupen64plus-core's own ROM database (CoreRomSettings::GoodName,
-// via CoreGetCurrentRomSettings()) - for a ROM/hack absent from that
-// database it degrades to a filename-derived value, so this exact-match
-// check can only ever be as reliable as that database entry.
-//
-// Single hardcoded game for now, not a per-GoodName profile table - that's
-// a bigger refactor for when a second GoodName actually needs supporting
-// (see docs/RMGR_SPEC.md section 3 for the reasoning).
-constexpr const char* kSupportedGoodName = "SmashRemix2.0.1";
+// Smash Remix 2.0.1 (see docs/RMGR_SPEC.md); recording its extension events
+// against any other ROM would pointer-chase addresses that mean nothing
+// there. GoodName comes from mupen64plus-core's own ROM database
+// (CoreRomSettings::GoodName, via CoreGetCurrentRomSettings()) - for a
+// ROM/hack absent from that database it degrades to a filename-derived
+// value, so this exact-match check can only ever be as reliable as that
+// database entry.
+constexpr const char* kSmashRemixGoodName = "SmashRemix2.0.1";
+constexpr const char* kSmash64Family      = "smash64";
 
-// Bump whenever this recorder's interpretation of kSupportedGoodName's
-// memory layout changes in a way that affects what gets written - not just
-// when a field is newly appended (which the per-event EventPayloads
-// declared-size mechanism, docs/RMGR_SPEC.md section 5, already handles on
-// its own), but also e.g. a bugfix to an existing field's offset that
-// silently changes recorded *values* without changing any event's byte
-// size. This is its own counter per goodName; a different goodName starts
-// its own numbering from 1, unrelated to this one.
+// Bump whenever this recorder's interpretation of a goodName's memory
+// layout changes in a way that affects what an smash64-family reader gets -
+// not just when a field is newly appended (which the per-event
+// EventPayloads declared-size mechanism, docs/RMGR_SPEC.md section 6,
+// already handles on its own), but also e.g. a bugfix to an existing
+// field's offset that silently changes recorded *values* without changing
+// any event's byte size. This is its own counter per goodName - see
+// docs/RMGR_SPEC.md section 3.2.
 //
-// v1 -> v2: added the ItemUpdate event (docs/RMGR_SPEC.md section 5/4.6) -
-// a wholly new capability rather than a field append, but still exactly the
-// kind of "recorded output changed" this counter exists to track.
-// v2 -> v3: ItemUpdate's type field was wrong in v2 - +0x0C on the raw GObj
-// is a packed byte (link_id), not a 32-bit type ID; the real type needs a
-// further pointer chase through ITStruct/WPStruct. v2 files' ItemUpdate
-// data should be treated as garbage, not just "coarser." Also added
-// StageHazardUpdate (Whispy Woods' wind on Dream Land).
-// v3 -> v4: ReadItemObjects() was walking only the Item list
-// (gGCCommonLinks[4]) - Weapons (fireballs, boomerang, charge shot, PK
-// Fire/Thunder, ...) live on a separate list (gGCCommonLinks[5]) that was
-// never actually reached, so no v3 file ever contains a real Weapon
-// ItemUpdate despite the wire format supporting linkId == 5. Also, held
-// Items (e.g. Link's bomb while still in his hand) were being recorded with
-// a meaningless re-parented position (typically (0,0,0)) instead of being
-// skipped. Byte layout is unchanged from v3 - this is a pure "which objects
-// get emitted" fix, same class of change as the v2->v3 bump. See
-// ReplayMemory::ReadItemObjects()'s doc comment.
-// v4 -> v5: added HitboxUpdate and HurtboxUpdate (docs/RMGR_SPEC.md section
-// 5/4.8/4.9) - deliberately verbose (every active hitbox slot and every
-// hurtbox slot, every frame) for now, to exhaustively capture real data
-// before it's known whether hitbox/hurtbox geometry can be derived purely
-// from (characterId, actionStateId, actionFrameCounter) instead. Expect
-// this to shrink again in a future schema once that's confirmed per
-// character.
-// v5 -> v6: ReadItemObjects()'s "currently held" check was wrong -
-// decomp-confirmed (itMainSetFighterRelease()) that ITStruct::owner_gobj is
-// deliberately retained across a throw/drop for later damage/KO
-// attribution, not cleared on release, so `owner_gobj != NULL` was
-// non-NULL for essentially an item's *entire* lifetime and silently
-// swallowed every thrown/dropped Item for its whole flight - not just the
-// brief hand-held window it was meant to skip. Replaced with a position-
-// based proxy (still reads near (0,0,0), the hand-parented placeholder)
-// that actually flips at the release moment. v4/v5 files' Item ItemUpdate
-// data (Weapons unaffected - this check never applied to them) is missing
-// most or all of every thrown/dropped Item's flight, not just its held
-// phase - re-record rather than treat as complete. Byte layout unchanged,
-// same class of change as v3->v4. See ReplayMemory::IsHeldItemPosition()'s
-// doc comment.
-// v6 -> v7: PostFrameUpdate.jumpsUsed was read at the wrong width - a u32
-// read at playerStruct+0x148, where the real field (decomp-confirmed) is a
-// single byte (u8); +0x14A-0x14B is padding. On a word-swapped emulator, a
-// *byte* read needs its address XORed with 3 to land correctly - without
-// that, this landed on the padding instead, reading a constant 0 for an
-// entire match, every port, no matter how much jumping happened. Fixed the
-// read width AND switched what gets exported: this field is now
-// jumpsRemaining (jumpsMax, chased from the per-character FTAttributes,
-// minus the corrected jumpsUsed) instead of jumpsUsed directly - more
-// directly useful, and what this project wanted from the start. Same wire
-// position/size (still a u8) - a pure "what this byte means" fix, not a
-// layout change. v6 and earlier files' jumpsUsed byte should be treated as
-// meaningless (it's the constant-0 bug's output, not real data) rather
-// than reinterpreted as anything.
-// v7 -> v8: ReplayMemory::ReadHurtboxes()'s "is this slot in use" check was
-// wrong - decomp-confirmed (ftmanager.c's fighter-hurtbox init) that an
-// unused FTDamageColl slot leaves its `joint` field untouched (not NULL,
-// not necessarily even outside the valid RDRAM range - just whatever was
-// in that memory before), while `hitstatus` is explicitly set to
-// nGMHitStatusNone (0) for unused slots and Normal/Invincible/Intangible
-// for used ones. Gating on IsValidRdramPointer(joint) instead of
-// `hitstatus != 0` filtered out every slot, used or not, every frame - a
-// real match with real hurtboxes the whole time produced zero
-// HurtboxUpdate events. Fixed by gating on hitStatus first. Byte layout
-// unchanged, same class of fix as v5->v6/v6->v7. **v7 and earlier files'
-// HurtboxUpdate data is empty/missing, not incomplete** - re-record rather
-// than treat as a real "no hurtboxes this match" result.
-//
-// v9 adds StageHazardUpdate.hazardFlags bit 1: Whispy's wind direction
-// (0 = left, 1 = right), only meaningful/only ever set alongside bit 0
-// (currently blowing) - see docs/RMGR_SPEC.md section 4.7 and smashremix
-// docs/ram-map.md section 10.3.1. Byte layout unchanged (still a single
-// hazardFlags byte) - purely new meaning for a previously-always-0 bit,
-// same class of additive change as v1->v2's ItemUpdate. v8 and earlier
-// files' bit 1 is always 0 - indistinguishable from a real "blowing left"
-// read, so don't infer direction from data recorded before v9.
-constexpr uint32_t kRecorderSchemaVersion = 9;
+// Starts fresh at 1 for this container rewrite: every memory-offset fix
+// this recorder previously accumulated (schema 2 through 9 under the old,
+// unspecified container layout - see git history for that trail) is already
+// reflected as correct in ReplayMemory.cpp today. There's nothing left to
+// carry forward; the old numbering tracked a struct layout (GameStart/
+// PostFrameUpdate) that no longer exists.
+constexpr uint32_t kRecorderSchemaVersion = 1;
 
-bool IsSupportedGame(void)
+// Whether the currently-loaded ROM is a recognized smash64-family build.
+// Only Smash Remix 2.0.1 is recognized today - see kSmashRemixGoodName's
+// doc comment. Returns "" (not recognized - the recording, if any, stays
+// core-only) or kSmash64Family.
+//
+// NOTE: this only decides whether the smash64 EXTENSION layer gets written.
+// The recording *trigger* itself (OnFrame()'s state machine below) still
+// depends entirely on ReplayMemory::IsInVsMatchScreen()/ReadMatchInfo(),
+// which are themselves Smash-specific memory reads - there is currently no
+// game-agnostic "a match is happening, here are this port's inputs" source
+// wired into this recorder (RMG-K's PIF-level controller sync, used
+// elsewhere for Kaillera netplay, would be the natural one). In practice
+// this means core-only recording for an unrecognized game isn't reachable
+// yet even though the wire format (docs/RMGR_SPEC.md section 2.1) already
+// supports it - a real gap to close in a follow-up, not something this pass
+// claims to have finished.
+std::string DetermineGameFamily(const CoreRomSettings& romSettings)
 {
-    CoreRomSettings romSettings;
-    if (!CoreGetCurrentRomSettings(romSettings))
+    if (romSettings.GoodName == kSmashRemixGoodName)
     {
-        return false;
+        return kSmash64Family;
     }
-    return romSettings.GoodName == kSupportedGoodName;
+    return "";
 }
 
 // Copies as much of `s` as fits into `dest` (size `destSize`), NUL-padding
@@ -462,55 +367,97 @@ void WriteFixedString(char* dest, size_t destSize, const std::string& s)
     std::memcpy(dest, s.data(), std::min(s.size(), destSize));
 }
 
+// Appends one event (code byte + payload) to the in-memory buffer for the
+// match currently being recorded - nothing touches disk until
+// FinalizeFile() compresses and writes the whole thing out at once.
 template <typename T>
 void WriteEvent(EventCode code, const T& payload)
 {
     uint8_t codeByte = static_cast<uint8_t>(code);
-    s_File.write(reinterpret_cast<const char*>(&codeByte), sizeof(codeByte));
-    s_File.write(reinterpret_cast<const char*>(&payload), sizeof(payload));
-    s_StreamBytesWritten += static_cast<uint32_t>(sizeof(codeByte) + sizeof(payload));
+    const size_t offset = s_EventBuffer.size();
+    s_EventBuffer.resize(offset + sizeof(codeByte) + sizeof(payload));
+    std::memcpy(s_EventBuffer.data() + offset, &codeByte, sizeof(codeByte));
+    std::memcpy(s_EventBuffer.data() + offset + sizeof(codeByte), &payload, sizeof(payload));
 }
 
 // The Event Payloads event (0x01) is always first: it declares the exact
-// payload size of every other event code this file uses, so a future
-// parser reading an unfamiliar/old-version file can skip unknown or
-// resized events instead of breaking. See handoff doc section 4.2/4.6.
-void WriteEventPayloadsEvent(void)
+// payload size of every other event code THIS file uses, so a parser
+// reading an unfamiliar/old-version file can skip unknown or resized events
+// instead of breaking. Declares only the 3 core codes for a core-only
+// (unrecognized game) recording; declares all 8 for a smash64 recording -
+// see docs/RMGR_SPEC.md section 5.0.
+void WriteEventPayloadsEvent(bool familyRecognized)
 {
     struct EventSize
     {
         EventCode code;
         uint16_t  size;
     };
-    static const EventSize sizes[] = {
-        {EventCode::GameStart,  static_cast<uint16_t>(sizeof(GameStartEvent))},
-        {EventCode::PreFrame,   static_cast<uint16_t>(sizeof(PreFrameEvent))},
-        {EventCode::PostFrame,  static_cast<uint16_t>(sizeof(PostFrameEvent))},
-        {EventCode::GameEnd,    static_cast<uint16_t>(sizeof(GameEndEvent))},
-        // v2/v3/v5 additions (docs/RMGR_SPEC.md section 5) - an old parser
-        // that reads `count` dynamically and skips codes it doesn't
-        // recognize (exactly what this declared-size mechanism exists for)
-        // still parses a file with these extra entries correctly.
+    static const EventSize coreSizes[] = {
+        {EventCode::MatchStart, static_cast<uint16_t>(sizeof(MatchStartEvent))},
+        {EventCode::InputFrame, static_cast<uint16_t>(sizeof(InputFrameEvent))},
+        {EventCode::MatchEnd,   static_cast<uint16_t>(sizeof(MatchEndEvent))},
+    };
+    static const EventSize smash64Sizes[] = {
+        {EventCode::StateFrame,        static_cast<uint16_t>(sizeof(StateFrameEvent))},
         {EventCode::ItemUpdate,        static_cast<uint16_t>(sizeof(ItemUpdateEvent))},
         {EventCode::StageHazardUpdate, static_cast<uint16_t>(sizeof(StageHazardUpdateEvent))},
-        {EventCode::HitboxUpdate,      static_cast<uint16_t>(sizeof(HitboxUpdateEvent))},
-        {EventCode::HurtboxUpdate,     static_cast<uint16_t>(sizeof(HurtboxUpdateEvent))},
+        {EventCode::MatchSettings,     static_cast<uint16_t>(sizeof(MatchSettingsEvent))},
+        {EventCode::MatchResult,       static_cast<uint16_t>(sizeof(MatchResultEvent))},
     };
 
-    uint8_t codeByte = static_cast<uint8_t>(EventCode::EventPayloads);
-    uint8_t count = static_cast<uint8_t>(sizeof(sizes) / sizeof(sizes[0]));
-    s_File.write(reinterpret_cast<const char*>(&codeByte), sizeof(codeByte));
-    s_File.write(reinterpret_cast<const char*>(&count), sizeof(count));
-    s_StreamBytesWritten += sizeof(codeByte) + sizeof(count);
+    const uint8_t count = static_cast<uint8_t>(
+        (sizeof(coreSizes) / sizeof(coreSizes[0])) +
+        (familyRecognized ? (sizeof(smash64Sizes) / sizeof(smash64Sizes[0])) : 0));
 
-    for (const EventSize& entry : sizes)
+    const uint8_t codeByte = static_cast<uint8_t>(EventCode::EventPayloads);
+    size_t offset = s_EventBuffer.size();
+    s_EventBuffer.resize(offset + sizeof(codeByte) + sizeof(count));
+    std::memcpy(s_EventBuffer.data() + offset, &codeByte, sizeof(codeByte));
+    std::memcpy(s_EventBuffer.data() + offset + sizeof(codeByte), &count, sizeof(count));
+
+    auto appendEntries = [](const EventSize* entries, size_t entryCount)
     {
-        uint8_t  entryCode = static_cast<uint8_t>(entry.code);
-        uint16_t entrySize = entry.size;
-        s_File.write(reinterpret_cast<const char*>(&entryCode), sizeof(entryCode));
-        s_File.write(reinterpret_cast<const char*>(&entrySize), sizeof(entrySize));
-        s_StreamBytesWritten += sizeof(entryCode) + sizeof(entrySize);
+        for (size_t i = 0; i < entryCount; i++)
+        {
+            uint8_t  entryCode = static_cast<uint8_t>(entries[i].code);
+            uint16_t entrySize = entries[i].size;
+            const size_t entryOffset = s_EventBuffer.size();
+            s_EventBuffer.resize(entryOffset + sizeof(entryCode) + sizeof(entrySize));
+            std::memcpy(s_EventBuffer.data() + entryOffset, &entryCode, sizeof(entryCode));
+            std::memcpy(s_EventBuffer.data() + entryOffset + sizeof(entryCode), &entrySize, sizeof(entrySize));
+        }
+    };
+
+    appendEntries(coreSizes, sizeof(coreSizes) / sizeof(coreSizes[0]));
+    if (familyRecognized)
+    {
+        appendEntries(smash64Sizes, sizeof(smash64Sizes) / sizeof(smash64Sizes[0]));
     }
+}
+
+// zlib deflate, max compression level - see docs/RMGR_SPEC.md section 3.4.
+// Compression only ever runs once per match, at FinalizeFile() time, not
+// per-frame, so the cost of the highest level is a non-issue. Returns an
+// empty vector on failure (extremely unlikely - compressBound() already
+// sizes the destination generously); the caller must check for that and
+// skip writing a file rather than write a bogus one.
+std::vector<uint8_t> DeflateCompress(const std::vector<uint8_t>& input)
+{
+    uLongf boundLen = compressBound(static_cast<uLong>(input.size()));
+    std::vector<uint8_t> output(boundLen);
+    uLongf actualLen = boundLen;
+
+    const Bytef* sourcePtr = input.empty() ? nullptr : reinterpret_cast<const Bytef*>(input.data());
+    int result = compress2(output.data(), &actualLen, sourcePtr,
+        static_cast<uLong>(input.size()), Z_BEST_COMPRESSION);
+    if (result != Z_OK)
+    {
+        return {};
+    }
+
+    output.resize(actualLen);
+    return output;
 }
 
 std::string SanitizeForFilename(const std::string& input)
@@ -528,14 +475,14 @@ std::string SanitizeForFilename(const std::string& input)
 }
 
 // Loosely mirrors n02_client.cpp's "<date>-Player1-Player2.krec" convention
-// (section 3.1 of the handoff doc) - player-name suffix and 24-char cap the
-// same, but YYYYMMDD-HHMMSS (4-digit year, dashed) rather than krec's
-// compact YYMMDDHHMMSS, for a name that reads as a timestamp at a glance.
-// `now` is passed in (rather than this function calling time(nullptr)
-// itself) so the caller can derive it from the exact same instant it
-// writes into the file's own recordedAtEpochMillis header field - the
-// filename and the header should never disagree about when the recording
-// started, even though the filename itself is only second-resolution.
+// - player-name suffix and 24-char cap the same, but YYYYMMDD-HHMMSS
+// (4-digit year, dashed) rather than krec's compact YYMMDDHHMMSS, for a
+// name that reads as a timestamp at a glance. `now` is passed in (rather
+// than this function calling time(nullptr) itself) so the caller can derive
+// it from the exact same instant it writes into the file's own
+// recordedAtEpochMillis header field - the filename and the header should
+// never disagree about when the recording started, even though the
+// filename itself is only second-resolution.
 std::string BuildFileName(time_t now)
 {
     tm localNow{};
@@ -598,26 +545,24 @@ std::filesystem::path FindCollisionFreePath(const std::filesystem::path& desired
     return desiredPath;
 }
 
-// Returns true if the file was opened and the header/GameStart event were
-// written successfully; false if the caller should not transition into the
-// Recording state (e.g. open() failed).
+// Resets per-match state and buffers the header/MatchStart(/MatchSettings)
+// events in memory - nothing touches disk here. Returns true if recording
+// should proceed (the caller transitions to State::Recording); false if the
+// caller should stay in WaitingForMatch and retry next frame (e.g. the
+// output directory couldn't be created).
 bool OpenNewFile(const ReplayMemory::MatchInfo& matchInfo)
 {
-    // Reset regardless of whether the open below succeeds, so a failed
-    // open never leaves stale counts around for the next attempt.
     s_FrameNumber = 0;
-    s_StreamBytesWritten = 0;
+    s_EventBuffer.clear();
+    s_HasPendingRecording = false;
 
     // Default: live recording, stamped with wall-clock "now" - read from
-    // system_clock (not time(nullptr)) so recordedAtEpochMillis/
-    // recordedAtNanosOffset below get real sub-second precision. Headless
+    // system_clock (not time(nullptr)) for millisecond precision. Headless
     // .krec export overrides this (see SetRecordedAtBaseOverride's doc
     // comment) so the file reflects the match's *original* recording time
     // rather than when the headless replay (which can run at up to 2000%
-    // speed) happened to reach it - that path has no sub-millisecond
-    // information to offer, so recordedAtNanosOffset is always 0 for it.
+    // speed) happened to reach it.
     std::chrono::system_clock::time_point nowTimePoint;
-    uint32_t                              nowNanosOffset = 0;
     if (s_HasRecordedAtBaseOverride)
     {
         const int elapsedFrames = s_RecordedAtFrameIndexProvider != nullptr ? s_RecordedAtFrameIndexProvider() : 0;
@@ -634,15 +579,13 @@ bool OpenNewFile(const ReplayMemory::MatchInfo& matchInfo)
     else
     {
         nowTimePoint = std::chrono::system_clock::now();
-        const auto sinceEpoch = nowTimePoint.time_since_epoch();
-        nowNanosOffset = static_cast<uint32_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(sinceEpoch).count() % 1'000'000);
     }
     const uint64_t nowEpochMillis = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(nowTimePoint.time_since_epoch()).count());
     // BuildFileName()'s date part is still just local wall-clock seconds -
-    // see docs/RMGR_SPEC.md section 3.4.
+    // see docs/RMGR_SPEC.md section 3.3.
     const time_t now = static_cast<time_t>(nowEpochMillis / 1000);
+
     std::filesystem::path path;
     if (s_HasOutputPathOverride)
     {
@@ -659,7 +602,6 @@ bool OpenNewFile(const ReplayMemory::MatchInfo& matchInfo)
         const std::filesystem::path numberedPath = base.parent_path() /
             (base.stem().string() + "-" + std::to_string(s_OverrideMatchNumber) + base.extension().string());
         path = FindCollisionFreePath(numberedPath);
-        std::filesystem::create_directories(path.parent_path());
     }
     else
     {
@@ -667,74 +609,49 @@ bool OpenNewFile(const ReplayMemory::MatchInfo& matchInfo)
         // own "records" directory convention (Source/n02/n02_client.cpp)
         // exactly, so .rmgr files land next to .krec files at the top level
         // instead of being nested under the per-platform user-data directory.
-        std::filesystem::path directory("replays");
-        std::filesystem::create_directories(directory);
-        path = FindCollisionFreePath(directory / BuildFileName(now));
+        path = FindCollisionFreePath(std::filesystem::path("replays") / BuildFileName(now));
     }
 
-    s_File.open(path, std::ios::binary | std::ios::trunc);
-    if (!s_File.is_open())
+    std::error_code createDirErrorCode;
+    std::filesystem::create_directories(path.parent_path(), createDirErrorCode);
+    if (createDirErrorCode)
     {
         if (s_HasOutputPathOverride)
         {
             s_OverrideMatchNumber--; // undo - see the increment above, this attempt never happened
         }
         CoreAddCallbackMessage(CoreDebugMessageType::Warning,
-            "Replay: failed to open " + path.string() + " for recording");
+            "Replay: failed to create directory for " + path.string() + " - not recording");
         return false;
     }
+    s_PendingOutputPath = path;
 
-    CoreAddCallbackMessage(CoreDebugMessageType::Info,
-        "Replay: recording to " + path.string());
-
-    FileHeader header{};
-    std::memcpy(header.magic, "RMGR", 4);
-    header.version = 4;
-    header.streamLength = 0;
-    // Reaching here already implies IsSupportedGame() was true (see
-    // OnEmulationStart()), so this is just re-fetching the same value to
-    // write it out - the loaded ROM can't change mid-session.
+    // Reaching here already implies replay recording is enabled (see
+    // OnEmulationStart()) - this is just re-fetching the loaded ROM's
+    // identity to decide whether the smash64 extension layer applies. The
+    // loaded ROM can't change mid-session.
     CoreRomSettings romSettings;
     CoreGetCurrentRomSettings(romSettings);
-    WriteFixedString(header.goodName, sizeof(header.goodName), romSettings.GoodName);
-    header.recorderSchemaVersion = kRecorderSchemaVersion;
-    header.recordedAtEpochMillis = nowEpochMillis;
-    header.recordedAtNanosOffset = nowNanosOffset;
-    s_File.write(reinterpret_cast<const char*>(&header), sizeof(header));
+    const std::string gameFamily = DetermineGameFamily(romSettings);
+    s_FamilyRecognized = !gameFamily.empty();
 
-    WriteEventPayloadsEvent();
+    s_PendingHeader = FileHeader{};
+    std::memcpy(s_PendingHeader.magic, "RMGR", 4);
+    s_PendingHeader.version = 5;
+    WriteFixedString(s_PendingHeader.gameFamily, sizeof(s_PendingHeader.gameFamily), gameFamily);
+    WriteFixedString(s_PendingHeader.goodName, sizeof(s_PendingHeader.goodName), romSettings.GoodName);
+    s_PendingHeader.recorderSchemaVersion = s_FamilyRecognized ? kRecorderSchemaVersion : 0;
+    s_PendingHeader.recordedAtEpochMillis = nowEpochMillis;
+    // uncompressedLength/compressedLength are filled in by FinalizeFile()
+    // once the whole match's events are known.
 
-    GameStartEvent startEvent{};
-    startEvent.stageId           = matchInfo.stageId;
-    startEvent.gameType          = matchInfo.gameType;
-    startEvent.stockCountSetting = matchInfo.stockCountSetting;
-    startEvent.timeLimitMinutes  = matchInfo.timeLimitMinutes;
-    startEvent.damageRatio       = matchInfo.damageRatio;
-    startEvent.itemFrequency     = matchInfo.itemFrequency;
-    startEvent.teamsEnabled      = matchInfo.teamsEnabled ? 1 : 0;
-    startEvent.handicapMode      = matchInfo.handicapMode;
+    WriteEventPayloadsEvent(s_FamilyRecognized);
 
+    MatchStartEvent startEvent{};
     for (int port = 0; port < 4; port++)
     {
         ReplayMemory::PortMatchInfo portInfo = ReplayMemory::ReadPortMatchInfo(matchInfo.matchInfoPtr, port);
-        startEvent.ports[port].slotType    = portInfo.slotType;
-        startEvent.ports[port].characterId = portInfo.characterId;
-        startEvent.ports[port].costumeId   = portInfo.costumeId;
-        startEvent.ports[port].teamColor   = portInfo.teamColor;
-
-        // team/handicap/cpuLevel need the player-object/player-struct chase,
-        // which can be unpopulated if the file opened during the pre-match
-        // countdown (game_status == 0) before characters have spawned.
-        // Left at their zero-initialized default in that case - same
-        // tolerant "not currently available" handling as everywhere else
-        // in this file, not a crash.
-        ReplayMemory::PortPlayerState playerState = ReplayMemory::ReadPortPlayerState(matchInfo.matchInfoPtr, port);
-        if (playerState.valid)
-        {
-            startEvent.portTeam[port]     = playerState.team;
-            startEvent.portHandicap[port] = playerState.handicap;
-            startEvent.portCpuLevel[port] = playerState.cpuLevel;
-        }
+        startEvent.slotType[port] = portInfo.slotType;
     }
 
 #ifdef RMGK_HAVE_P2P_TRANSPORT
@@ -754,32 +671,109 @@ bool OpenNewFile(const ReplayMemory::MatchInfo& matchInfo)
     }
 #endif
 
-    WriteEvent(EventCode::GameStart, startEvent);
+    WriteEvent(EventCode::MatchStart, startEvent);
 
+    if (s_FamilyRecognized)
+    {
+        MatchSettingsEvent settingsEvent{};
+        settingsEvent.stageId           = matchInfo.stageId;
+        settingsEvent.gameType          = matchInfo.gameType;
+        settingsEvent.stockCountSetting = matchInfo.stockCountSetting;
+        settingsEvent.timeLimitMinutes  = matchInfo.timeLimitMinutes;
+        settingsEvent.damageRatio       = matchInfo.damageRatio;
+        settingsEvent.itemFrequency     = matchInfo.itemFrequency;
+        settingsEvent.teamsEnabled      = matchInfo.teamsEnabled ? 1 : 0;
+        settingsEvent.handicapMode      = matchInfo.handicapMode;
+
+        for (int port = 0; port < 4; port++)
+        {
+            ReplayMemory::PortMatchInfo portInfo = ReplayMemory::ReadPortMatchInfo(matchInfo.matchInfoPtr, port);
+            settingsEvent.characterId[port] = portInfo.characterId;
+            settingsEvent.costumeId[port]   = portInfo.costumeId;
+            settingsEvent.teamColor[port]   = portInfo.teamColor;
+
+            // team/handicap/cpuLevel need the player-object/player-struct
+            // chase, which can be unpopulated if the file opened during the
+            // pre-match countdown (game_status == 0) before characters have
+            // spawned. Left at their zero-initialized default in that case.
+            ReplayMemory::PortPlayerState playerState = ReplayMemory::ReadPortPlayerState(matchInfo.matchInfoPtr, port);
+            if (playerState.valid)
+            {
+                settingsEvent.portTeam[port]     = playerState.team;
+                settingsEvent.portHandicap[port] = playerState.handicap;
+                settingsEvent.portCpuLevel[port] = playerState.cpuLevel;
+            }
+        }
+
+        WriteEvent(EventCode::MatchSettings, settingsEvent);
+    }
+
+    s_HasPendingRecording = true;
+    CoreAddCallbackMessage(CoreDebugMessageType::Info,
+        "Replay: recording match, will write to " + s_PendingOutputPath.string() + " once it ends");
     return true;
 }
 
 void FinalizeFile(uint8_t endReason, const ReplayMemory::MatchInfo& matchInfo)
 {
-    if (!s_File.is_open())
+    if (!s_HasPendingRecording)
     {
         return;
     }
 
-    GameEndEvent endEvent{};
-    endEvent.endReason = endReason;
-    for (int port = 0; port < 4; port++)
-    {
-        ReplayMemory::PortMatchInfo portInfo = ReplayMemory::ReadPortMatchInfo(matchInfo.matchInfoPtr, port);
-        endEvent.placements[port] = portInfo.seated ? portInfo.stocksRemaining : -1;
-    }
-    WriteEvent(EventCode::GameEnd, endEvent);
+    MatchEndEvent endEvent{};
+    endEvent.finalFrame = s_FrameNumber > 0 ? (s_FrameNumber - 1) : 0;
+    endEvent.endReason  = endReason;
+    WriteEvent(EventCode::MatchEnd, endEvent);
 
-    s_File.flush();
-    s_File.seekp(offsetof(FileHeader, streamLength));
-    uint32_t length = s_StreamBytesWritten;
-    s_File.write(reinterpret_cast<const char*>(&length), sizeof(length));
-    s_File.close();
+    if (s_FamilyRecognized)
+    {
+        MatchResultEvent resultEvent{};
+        for (int port = 0; port < 4; port++)
+        {
+            ReplayMemory::PortMatchInfo portInfo = ReplayMemory::ReadPortMatchInfo(matchInfo.matchInfoPtr, port);
+            resultEvent.placements[port] = portInfo.seated ? portInfo.stocksRemaining : -1;
+        }
+        WriteEvent(EventCode::MatchResult, resultEvent);
+    }
+
+    const std::vector<uint8_t> compressed = DeflateCompress(s_EventBuffer);
+    if (compressed.empty() && !s_EventBuffer.empty())
+    {
+        CoreAddCallbackMessage(CoreDebugMessageType::Warning,
+            "Replay: failed to compress recorded match data - not writing " + s_PendingOutputPath.string());
+        s_HasPendingRecording = false;
+        s_EventBuffer.clear();
+        return;
+    }
+
+    s_PendingHeader.uncompressedLength = static_cast<uint32_t>(s_EventBuffer.size());
+    s_PendingHeader.compressedLength   = static_cast<uint32_t>(compressed.size());
+
+    std::ofstream file(s_PendingOutputPath, std::ios::binary | std::ios::trunc);
+    if (!file.is_open())
+    {
+        CoreAddCallbackMessage(CoreDebugMessageType::Warning,
+            "Replay: failed to open " + s_PendingOutputPath.string() + " for writing");
+        s_HasPendingRecording = false;
+        s_EventBuffer.clear();
+        return;
+    }
+
+    file.write(reinterpret_cast<const char*>(&s_PendingHeader), sizeof(s_PendingHeader));
+    if (!compressed.empty())
+    {
+        file.write(reinterpret_cast<const char*>(compressed.data()), static_cast<std::streamsize>(compressed.size()));
+    }
+    file.close();
+
+    CoreAddCallbackMessage(CoreDebugMessageType::Info,
+        "Replay: wrote " + s_PendingOutputPath.string() + " (" +
+        std::to_string(compressed.size()) + " bytes compressed, " +
+        std::to_string(s_EventBuffer.size()) + " bytes uncompressed)");
+
+    s_HasPendingRecording = false;
+    s_EventBuffer.clear();
 }
 
 void RecordFrame(const ReplayMemory::MatchInfo& matchInfo)
@@ -798,152 +792,82 @@ void RecordFrame(const ReplayMemory::MatchInfo& matchInfo)
             continue;
         }
 
-        PreFrameEvent pre{};
-        pre.frame   = s_FrameNumber;
-        pre.port    = static_cast<uint8_t>(port);
-        pre.buttons = state.processedButtons;
-        pre.stickX  = state.stickX;
-        pre.stickY  = state.stickY;
-        WriteEvent(EventCode::PreFrame, pre);
+        InputFrameEvent input{};
+        input.frame   = s_FrameNumber;
+        input.port    = static_cast<uint8_t>(port);
+        input.buttons = state.processedButtons;
+        input.stickX  = state.stickX;
+        input.stickY  = state.stickY;
+        WriteEvent(EventCode::InputFrame, input);
 
-        PostFrameEvent post{};
-        post.frame           = s_FrameNumber;
-        post.port             = static_cast<uint8_t>(port);
-        post.characterId       = state.characterId;
-        post.actionStateId      = state.actionStateId;
-        post.positionX           = state.positionX;
-        post.positionY            = state.positionY;
-        post.facingDirection       = state.facingDirection;
-        post.velocityX              = state.velocityX;
-        post.velocityY               = state.velocityY;
-        post.damagePercent            = state.damagePercent;
-        post.stocksRemaining           = portInfo.stocksRemaining;
-        // Clamped rather than a raw cast: state.jumpsRemaining is signed
-        // and defaults to 0 if the FTAttributes pointer chase ever fails,
-        // but could in principle read momentarily negative mid-transition -
-        // wrapping that to a large uint8_t via a raw cast would be actively
-        // misleading, not just imprecise.
-        post.jumpsRemaining             = static_cast<uint8_t>(std::max(0, state.jumpsRemaining));
-        post.groundedState               = state.groundedState;
-        post.hurtboxState                 = state.hurtboxState;
-        post.hitstunCounter                = state.hitstunCounter;
-        post.actionFrameCounter             = state.actionFrameCounter;
-        post.comboHitCount                   = portInfo.comboHitCount;
-        post.comboDamage                      = portInfo.comboDamage;
-        WriteEvent(EventCode::PostFrame, post);
-    }
-
-    // One ItemUpdate per currently-live Item/Weapon GObj (see
-    // docs/RMGR_SPEC.md section 4.6) - after every seated port's Pre/Post-
-    // Frame pair, same as the per-port events above. Zero events written
-    // when the list is empty this frame - never a zeroed/placeholder event,
-    // same convention as an unseated port.
-    for (const ReplayMemory::ItemObject& item : ReplayMemory::ReadItemObjects())
-    {
-        ItemUpdateEvent itemEvent{};
-        itemEvent.frame         = s_FrameNumber;
-        itemEvent.objectAddress = item.objectAddress;
-        itemEvent.linkId        = item.linkId;
-        itemEvent.kind          = item.kind;
-        itemEvent.positionX     = item.positionX;
-        itemEvent.positionY     = item.positionY;
-        itemEvent.positionZ     = item.positionZ;
-        WriteEvent(EventCode::ItemUpdate, itemEvent);
-    }
-
-    // StageHazardUpdate - only written when at least one tracked hazard is
-    // active, same sparse convention as ItemUpdate above.
-    const ReplayMemory::StageHazards hazards = ReplayMemory::ReadStageHazards(matchInfo.stageId);
-    uint8_t hazardFlags = 0;
-    if (hazards.whispyBlowing)
-    {
-        hazardFlags |= kHazardFlagWhispyBlowing;
-        if (hazards.whispyBlowingRight)
+        if (s_FamilyRecognized)
         {
-            hazardFlags |= kHazardFlagWhispyBlowingRight;
+            StateFrameEvent stateFrame{};
+            stateFrame.frame             = s_FrameNumber;
+            stateFrame.port              = static_cast<uint8_t>(port);
+            stateFrame.characterId       = state.characterId;
+            stateFrame.actionStateId     = state.actionStateId;
+            stateFrame.positionX         = state.positionX;
+            stateFrame.positionY         = state.positionY;
+            stateFrame.facingDirection   = state.facingDirection;
+            stateFrame.velocityX         = state.velocityX;
+            stateFrame.velocityY         = state.velocityY;
+            stateFrame.damagePercent     = state.damagePercent;
+            stateFrame.stocksRemaining   = portInfo.stocksRemaining;
+            // Clamped rather than a raw cast: state.jumpsRemaining is signed
+            // and defaults to 0 if the FTAttributes pointer chase ever
+            // fails, but could in principle read momentarily negative
+            // mid-transition - wrapping that to a large uint8_t via a raw
+            // cast would be actively misleading, not just imprecise.
+            stateFrame.jumpsRemaining    = static_cast<uint8_t>(std::max(0, state.jumpsRemaining));
+            stateFrame.groundedState     = state.groundedState;
+            stateFrame.hurtboxState      = state.hurtboxState;
+            stateFrame.hitstunCounter    = state.hitstunCounter;
+            stateFrame.actionFrameCounter = state.actionFrameCounter;
+            stateFrame.comboHitCount     = portInfo.comboHitCount;
+            stateFrame.comboDamage       = portInfo.comboDamage;
+            WriteEvent(EventCode::StateFrame, stateFrame);
         }
     }
-    if (hazardFlags != 0)
-    {
-        StageHazardUpdateEvent hazardEvent{};
-        hazardEvent.frame       = s_FrameNumber;
-        hazardEvent.hazardFlags = hazardFlags;
-        WriteEvent(EventCode::StageHazardUpdate, hazardEvent);
-    }
 
-    // HitboxUpdate/HurtboxUpdate - gated behind
-    // SettingsID::GameStats_RecordHitboxData (off by default): both are
-    // deliberately verbose (every active hitbox slot, and literally every
-    // hurtbox slot, every frame - see HurtboxUpdateEvent's own doc comment)
-    // and dominate a .rmgr file's size when on. Skipping the read entirely
-    // when off, not just the write, since ReplayMemory::ReadHitboxes()/
-    // ReadHurtboxes() aren't free (multiple pointer chases per port/slot).
-    if (s_RecordHitboxData)
+    if (s_FamilyRecognized)
     {
-        const std::vector<ReplayMemory::HitboxObject> hitboxObjects = ReplayMemory::ReadHitboxes(matchInfo.matchInfoPtr);
-        const std::vector<ReplayMemory::HurtboxObject> hurtboxObjects = ReplayMemory::ReadHurtboxes(matchInfo.matchInfoPtr);
-
-        // Diagnostic: both reads have come back empty for an entire real
-        // match on every test so far despite s_RecordHitboxData being true
-        // (see the log line in OnEmulationStart()) - see docs/RMGR_SPEC.md
-        // section 8's HitboxUpdate note. Logged every 5 seconds, not every
-        // frame, to stay readable; remove once the root cause is confirmed
-        // and fixed.
-        if ((s_FrameNumber % 300) == 0)
+        // One ItemUpdate per currently-live Item/Weapon GObj - after every
+        // seated port's InputFrame/StateFrame pair, same as the per-port
+        // events above. Zero events written when the list is empty this
+        // frame - never a zeroed/placeholder event, same convention as an
+        // unseated port.
+        for (const ReplayMemory::ItemObject& item : ReplayMemory::ReadItemObjects())
         {
-            CoreAddCallbackMessage(CoreDebugMessageType::Info,
-                "Replay: hitbox/hurtbox diagnostic - frame " + std::to_string(s_FrameNumber) +
-                ": " + std::to_string(hitboxObjects.size()) + " active hitbox(es), " +
-                std::to_string(hurtboxObjects.size()) + " hurtbox(es) found");
+            ItemUpdateEvent itemEvent{};
+            itemEvent.frame         = s_FrameNumber;
+            itemEvent.objectAddress = item.objectAddress;
+            itemEvent.linkId        = item.linkId;
+            itemEvent.kind          = item.kind;
+            itemEvent.positionX     = item.positionX;
+            itemEvent.positionY     = item.positionY;
+            itemEvent.positionZ     = item.positionZ;
+            WriteEvent(EventCode::ItemUpdate, itemEvent);
         }
 
-        // HitboxUpdate - one per currently-active hitbox slot (see
-        // docs/RMGR_SPEC.md section 4.8). Sparse like ItemUpdate: a
-        // disabled slot is never written.
-        for (const ReplayMemory::HitboxObject& hitbox : hitboxObjects)
+        // StageHazardUpdate - only written when at least one tracked hazard
+        // is active, same sparse convention as ItemUpdate above.
+        const ReplayMemory::StageHazards hazards = ReplayMemory::ReadStageHazards(matchInfo.stageId);
+        uint8_t hazardFlags = 0;
+        if (hazards.whispyBlowing)
         {
-            HitboxUpdateEvent hitboxEvent{};
-            hitboxEvent.frame           = s_FrameNumber;
-            hitboxEvent.ownerKind       = hitbox.ownerKind;
-            hitboxEvent.ownerId         = hitbox.ownerId;
-            hitboxEvent.slotIndex       = hitbox.slotIndex;
-            hitboxEvent.attackState     = hitbox.attackState;
-            hitboxEvent.damage          = hitbox.damage;
-            hitboxEvent.positionX       = hitbox.positionX;
-            hitboxEvent.positionY       = hitbox.positionY;
-            hitboxEvent.positionZ       = hitbox.positionZ;
-            hitboxEvent.size            = hitbox.size;
-            hitboxEvent.angle           = hitbox.angle;
-            hitboxEvent.knockbackScale  = hitbox.knockbackScale;
-            hitboxEvent.knockbackWeight = hitbox.knockbackWeight;
-            hitboxEvent.knockbackBase   = hitbox.knockbackBase;
-            hitboxEvent.element         = hitbox.element;
-            hitboxEvent.shieldDamage    = hitbox.shieldDamage;
-            WriteEvent(EventCode::HitboxUpdate, hitboxEvent);
+            hazardFlags |= kHazardFlagWhispyBlowing;
+            if (hazards.whispyBlowingRight)
+            {
+                hazardFlags |= kHazardFlagWhispyBlowingRight;
+            }
         }
-
-        // HurtboxUpdate - one per fighter hurtbox slot, per seated port
-        // (see docs/RMGR_SPEC.md section 4.9). NOT sparse like the events
-        // above - see HurtboxUpdateEvent's own doc comment for why.
-        for (const ReplayMemory::HurtboxObject& hurtbox : hurtboxObjects)
+        if (hazardFlags != 0)
         {
-            HurtboxUpdateEvent hurtboxEvent{};
-            hurtboxEvent.frame       = s_FrameNumber;
-            hurtboxEvent.port        = hurtbox.port;
-            hurtboxEvent.slotIndex   = hurtbox.slotIndex;
-            hurtboxEvent.hitStatus   = hurtbox.hitStatus;
-            hurtboxEvent.placement   = hurtbox.placement;
-            hurtboxEvent.isGrabbable = hurtbox.isGrabbable ? 1 : 0;
-            hurtboxEvent.positionX   = hurtbox.positionX;
-            hurtboxEvent.positionY   = hurtbox.positionY;
-            hurtboxEvent.positionZ   = hurtbox.positionZ;
-            hurtboxEvent.offsetX     = hurtbox.offsetX;
-            hurtboxEvent.offsetY     = hurtbox.offsetY;
-            hurtboxEvent.offsetZ     = hurtbox.offsetZ;
-            hurtboxEvent.sizeX       = hurtbox.sizeX;
-            hurtboxEvent.sizeY       = hurtbox.sizeY;
-            hurtboxEvent.sizeZ       = hurtbox.sizeZ;
-            WriteEvent(EventCode::HurtboxUpdate, hurtboxEvent);
+            StageHazardUpdateEvent hazardEvent{};
+            hazardEvent.frame       = s_FrameNumber;
+            hazardEvent.hazardFlags = hazardFlags;
+            WriteEvent(EventCode::StageHazardUpdate, hazardEvent);
         }
     }
 
@@ -957,16 +881,13 @@ CORE_EXPORT void OnEmulationStart(void)
 {
     std::lock_guard<std::mutex> lock(s_Mutex);
 
-    // Defensively handle a leftover open file from an abnormal prior
-    // session end (e.g. OnEmulationStop() never ran on that session).
-    // open()'ing an already-open ofstream just sets failbit and leaves
-    // the old stream open/is_open()==true, which would otherwise silently
-    // disable recording for the rest of the process.
-    if (s_File.is_open())
-    {
-        s_File.close();
-        s_File.clear();
-    }
+    // Defensively drop any leftover buffered-but-unwritten recording from
+    // an abnormal prior session end (e.g. OnEmulationStop() never ran on
+    // that session) - matches this project's accepted "a crash mid-match
+    // loses the recording" trade-off (docs/RMGR_SPEC.md section 2) rather
+    // than trying to resurrect it here.
+    s_HasPendingRecording = false;
+    s_EventBuffer.clear();
 
     bool enabled;
     if (s_HasOverride)
@@ -979,43 +900,30 @@ CORE_EXPORT void OnEmulationStart(void)
         enabled = CoreSettingsGetBoolValue(SettingsID::GameStats_ReplayEnabled);
     }
 
-    if (enabled && !IsSupportedGame())
+    // NOTE: this is a coarser gate than the format itself supports - see
+    // DetermineGameFamily()'s doc comment for why core-only recording of an
+    // unrecognized game isn't actually reachable yet (the recording
+    // trigger below is itself a Smash-specific memory read). Once that gap
+    // is closed, this early-out should only skip the extension layer, not
+    // recording entirely.
+    if (enabled)
     {
-        // Every offset in ReplayMemory.cpp was only ever derived/verified
-        // against Smash Remix 2.0.1 - recording against anything else would
-        // pointer-chase addresses that mean nothing there. Log this
-        // specifically rather than silently doing nothing, since "the
-        // checkbox was on but nothing happened" is otherwise indistinguishable
-        // from "never reached a VS match".
-        CoreAddCallbackMessage(CoreDebugMessageType::Info,
-            "Replay: enabled, but the loaded ROM isn't Smash Remix 2.0.1 - not recording");
-        enabled = false;
+        CoreRomSettings romSettings;
+        if (!CoreGetCurrentRomSettings(romSettings) || DetermineGameFamily(romSettings).empty())
+        {
+            CoreAddCallbackMessage(CoreDebugMessageType::Info,
+                "Replay: enabled, but the loaded ROM isn't a recognized game - not recording");
+            enabled = false;
+        }
     }
-
-    // Only meaningful when replay recording itself is enabled - no override
-    // mechanism needed for this one (unlike `enabled` above), so this is a
-    // plain per-session settings read.
-    s_RecordHitboxData = enabled && CoreSettingsGetBoolValue(SettingsID::GameStats_RecordHitboxData);
 
     s_State = enabled ? State::WaitingForMatch : State::Idle;
     if (enabled)
     {
-        // Diagnostic: hitbox/hurtbox recording has produced zero events on
-        // every real test so far despite the setting being checked and the
-        // gating logic (RecordFrame()'s `if (s_RecordHitboxData)`) reading
-        // correctly in review - see docs/RMGR_SPEC.md section 8's
-        // HitboxUpdate note. This makes it visible in RMG-K's own log
-        // whether the flag actually ends up true for a given session,
-        // without needing an external memory debugger.
-        CoreAddCallbackMessage(CoreDebugMessageType::Info,
-            s_RecordHitboxData
-                ? "Replay: hitbox/hurtbox recording is ON for this session"
-                : "Replay: hitbox/hurtbox recording is OFF for this session (checkbox unchecked, or setting didn't save)");
         CoreAddCallbackMessage(CoreDebugMessageType::Info,
             "Replay: enabled, watching for a match to start");
     }
     s_FrameNumber = 0;
-    s_StreamBytesWritten = 0;
 }
 
 CORE_EXPORT void SetEnabledOverride(bool enabled)

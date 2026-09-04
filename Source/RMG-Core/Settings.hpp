@@ -561,11 +561,6 @@ enum class SettingsID
 
     // Game Stats / Replay Settings
     GameStats_ReplayEnabled,
-    // Off by default: HitboxUpdate/HurtboxUpdate (schema v5+) are recorded
-    // every frame, every active hitbox slot AND all 11 hurtbox slots per
-    // seated port - much larger files than the rest of the format combined.
-    // See docs/RMGR_SPEC.md section 4.8/4.9/8.
-    GameStats_RecordHitboxData,
 
     // Internal Settings (not persisted to config file)
     Internal_InputPluginSwitchRequested,

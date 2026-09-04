@@ -11,6 +11,11 @@ if (WIN32)
     pkg_check_modules(ICONV REQUIRED iconv)
 endif(WIN32)
 
+# Used directly by Replay.cpp (.rmgr event-stream compression, see
+# docs/RMGR_SPEC.md section 3.4) - not just pulled in transitively via
+# minizip, which only exercises zlib through its own zip API.
+find_package(ZLIB REQUIRED)
+
 if (NOT PORTABLE_INSTALL)
     include(GNUInstallDirs)
 endif(NOT PORTABLE_INSTALL)
@@ -90,6 +95,7 @@ endif(WIN32)
 target_link_libraries(RMG-Core PRIVATE
     ${MINIZIP_LIBRARIES}
     lzma
+    ZLIB::ZLIB
 )
 
 if (NETPLAY)
