@@ -41,14 +41,11 @@ typedef SOCKET Socket;
 typedef int SockLen;
 typedef SOCKADDR_STORAGE AddressStorage;
 
-// Named to avoid colliding with the CRT's own write()/read() declarations
-// (mingw's io.h), which take a plain file descriptor rather than a SOCKET
-// and conflict when both are visible in this translation unit.
-static int SDLNet_PlatformWrite(SOCKET s, const void *buf, size_t count) {
+static int SocketWrite(SOCKET s, const void *buf, size_t count) {
     return send(s, (const char *)buf, (int) count, 0);
 }
 
-static int SDLNet_PlatformRead(SOCKET s, char *buf, size_t count) {
+static int SocketRead(SOCKET s, char *buf, size_t count) {
     WSABUF wsabuf;
     wsabuf.buf = buf;
     wsabuf.len = (ULONG) count;
@@ -60,9 +57,6 @@ static int SDLNet_PlatformRead(SOCKET s, char *buf, size_t count) {
     }
     return (int)count_received;
 }
-
-#define write SDLNet_PlatformWrite
-#define read SDLNet_PlatformRead
 
 // WSAPoll doesn't exist on Windows before Vista, and isn't reliable before some version of Windows 10,
 //  so for now we just fake it with select().
