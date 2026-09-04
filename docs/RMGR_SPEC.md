@@ -781,8 +781,18 @@ tracked (Zebes' rising acid, Duel Zone's disappearing platforms, …).
   additional fields have been mapped in memory yet.
 - **Stage hazard tracking covers exactly one hazard.** `StageHazardUpdate`
   (§5.4) currently only tracks Whispy Woods' wind on Dream Land.
-- **No RNG/desync-detection event.** No known Smash Remix RNG seed address
-  has been identified.
+- **No RNG seed is recorded.** No known Smash Remix RNG seed address has
+  been identified yet, so any RNG-dependent outcome (item spawn rolls,
+  certain move variance, …) is not currently reproducible from a `.rmgr`
+  file alone — see the determinism caveat in §1.
+- **Most of Smash Remix's own settings/mutators aren't captured yet.**
+  `MatchSettings` (§5.1) covers the original SSB64 settings plus a small
+  set of Remix additions (teams, handicap, CPU level, item frequency);
+  Remix has added considerably more match-configuration options since
+  those fields were last extended, and none of the newer ones are mapped
+  to memory or captured here yet. This is a mapping gap to close via
+  ordinary field-appends (§6) as each setting gets identified, not a
+  structural limitation of `MatchSettings` itself.
 - **No aggregate damage-dealt/taken breakdown or incoming-damage-this-hit
   field**, even though the emulator exposes them.
 - **`MatchEnd.endReason` cannot currently distinguish time-out from
