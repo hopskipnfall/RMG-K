@@ -1,26 +1,32 @@
 # RMG-K Replay File Format (`.rmgr`) — Specification
 
-**Status:** format version `5`, design finalized on the
-`feature/replay-file-format` branch. **Not yet implemented** — this
-document describes the target format; `Source/RMG-Core/Replay.cpp` /
-`Source/RMG-Core/ReplayMemory.cpp` still implement format version `4` as of
-this writing. See `docs/superpowers/specs/2026-09-04-rmgr-v2-design.md` for
-the design rationale behind this rewrite.
+**Status:** format version `5`. This is the first time the `.rmgr` format
+has been formally specified — this document did not exist before this
+branch, and it has not yet been shared with the upstream RMG-K
+maintainers. **Not yet implemented** — `Source/RMG-Core/Replay.cpp` /
+`Source/RMG-Core/ReplayMemory.cpp` on this fork still implement an
+earlier, unspecified, in-development revision of the format (internally
+numbered up to `4`) that predates this document; this spec describes the
+target format going forward. See
+`docs/superpowers/specs/2026-09-04-rmgr-v2-design.md` for the design
+rationale.
 
-**Total break from version `4`.** Every version-`4` file becomes
-unreadable under this spec — there is no migration path and none is
-planned. `version` continues incrementing (`4` → `5`) rather than
-resetting, specifically so a reader that only understands `4` sees an
-unfamiliar number and correctly refuses to parse, rather than the value
-colliding with some earlier, unrelated meaning.
+`version` starts at `5`, not `1`: this fork already produced real files
+under that earlier in-development numbering while this format was being
+prototyped, and starting past it avoids a reader mistaking one of those
+for a valid file under this spec. There is no migration path from
+anything recorded before this document, and none is planned.
 
 ## 1. Overview
 
 A `.rmgr` file is a self-contained binary recording of one N64 match. It
 is designed for two distinct consumers:
 
-1. **Deterministic replay** — the recorded controller inputs are enough to
-   re-simulate the match from scratch.
+1. **Best-effort deterministic replay** — the recorded controller inputs
+   are enough to re-simulate the match's player-driven events from
+   scratch, but this is not full frame-perfect determinism: no RNG seed is
+   captured (§9), so any RNG-dependent outcome (item spawn rolls, certain
+   move variance, …) can diverge from the original match on replay.
 2. **Direct analysis** — recorded game state (position, damage, stocks,
    action state, …) is enough to build stats, visualizations, or search
    tooling *without* re-running the emulator at all.
@@ -53,17 +59,18 @@ attempting to be console-agnostic) — see §2 for how it generalizes across
 
 ## 2. Design goals
 
-- **Buffered, then written once.** Unlike version `4` (which streamed
-  events to disk incrementally, one write per event, specifically so a
-  crash mid-match left a usable truncated file), this format buffers the
-  entire match's events in memory as it plays and writes the file in a
-  single pass — header, then the compressed event-stream blob — only once
-  the match ends. Every header field (including both length fields) is
-  known before the first byte is written; there is no seek-back-and-patch
-  step. **Trade-off, accepted deliberately:** a crash or force-quit
-  mid-match now produces no file at all, not a truncated one. A match's
-  event data is at most a few MB, so holding it in RAM for a match's
-  duration is not a real memory concern.
+- **Buffered, then written once.** The recorder buffers the entire match's
+  events in memory as it plays and writes the file in a single pass —
+  header, then the compressed event-stream blob — only once the match
+  ends. Every header field (including both length fields) is known before
+  the first byte is written; there is no seek-back-and-patch step.
+  **Trade-off, accepted deliberately:** a crash or force-quit mid-match
+  produces no file at all, not a truncated one (a rejected alternative
+  design streamed events to disk incrementally specifically to avoid this,
+  at the cost of the seek-and-patch mechanics that made compression
+  awkward — see the design doc). A match's event data is at most a few MB,
+  so holding it in RAM for a match's duration is not a real memory
+  concern.
 - **Self-describing, forward-compatible event stream, no schema compiler.**
   Every event is a 1-byte command code followed by a payload whose size was
   declared up front by the very first event in the stream (`EventPayloads`,
@@ -71,15 +78,14 @@ attempting to be console-agnostic) — see §2 for how it generalizes across
   correctly and keep reading — the file can grow new event types or new
   trailing fields on existing events without breaking old parsers, and an
   old file's smaller payload sizes are exactly as valid to a new parser.
-  This mechanism is unchanged from version `4` and is already game-agnostic
-  — what's new in this version is *which* events exist and which layer
-  (§2.1) each belongs to, not the mechanism itself.
+  This mechanism is already game-agnostic on its own — what's new to this
+  spec is *which* events exist and which layer (§2.1) each belongs to, not
+  the mechanism itself.
 - **Core vs. game-family-extension event layering.** See §2.1.
-- **No FlatBuffers, no UBJSON, no schema-compiler toolchain.** Same
-  rationale as version `4`: FlatBuffers' benefits don't survive being
-  wrapped per-event in a growing append-only stream, and this format skips
-  the JSON-like-wrapper problem entirely by not having one — the
-  decompressed stream *is* the binary event data.
+- **No FlatBuffers, no UBJSON, no schema-compiler toolchain.** FlatBuffers'
+  benefits don't survive being wrapped per-event in a growing append-only
+  stream, and this format skips the JSON-like-wrapper problem entirely by
+  not having one — the decompressed stream *is* the binary event data.
 - **Little-endian**, matching the host platforms this project targets.
   All multi-byte integer and float fields in this document are
   little-endian unless stated otherwise.
@@ -122,7 +128,7 @@ string.
 
 ```
 +----------------+----------------------------------------+
-| File Header    | 112 bytes, fixed, uncompressed          |
+| File Header    | 108 bytes, fixed, uncompressed          |
 +----------------+----------------------------------------+
 | Event Stream   | deflate-compressed block, decompresses  |
 | (compressed)   | to the sequence of events described in  |
@@ -135,20 +141,19 @@ of any kind. The header is followed immediately by exactly
 `compressedLength` (§3.1) bytes of deflate-compressed data — nothing
 before it, nothing after it, no framing around the compressed block itself.
 
-### 3.1 File header (112 bytes)
+### 3.1 File header (108 bytes)
 
 | Offset | Size | Type       | Field                    | Notes |
 |-------:|-----:|------------|---------------------------|-------|
 | 0x00   | 4    | `char[4]`  | `magic`                   | Always the ASCII bytes `R`, `M`, `G`, `R` (no NUL). |
-| 0x04   | 1    | `u8`       | `version`                 | Format version. `5` for everything described here. Continues incrementing from version `4`'s files rather than resetting — see the note at the top of this document. |
+| 0x04   | 1    | `u8`       | `version`                 | Format version. `5` for everything described here — starts past `1` rather than at it; see the note at the top of this document for why. |
 | 0x05   | 3    | `u8[3]`    | `reserved`                | Always zero. Reserved for future header fields. |
 | 0x08   | 16   | `char[16]` | `gameFamily`              | NUL-padded ASCII identifier for which game-family extension event set (§2.1, §4) applies, e.g. `"smash64"`. **All-zero** (empty) if the loaded ROM's game family isn't recognized by this recorder — the file is still a fully valid core-only recording in that case, just with no extension events. Truncated if longer than 16 bytes (no defined family name is expected to need that much room). |
 | 0x18   | 64   | `char[64]` | `goodName`                | The recorded ROM's `GoodName` (mupen64plus-core's ROM database identity string), UTF-8, NUL-padded — not necessarily NUL-terminated if it fills the field. Truncated if longer than 64 bytes. All-zero if the ROM database has no identity for the loaded ROM. |
 | 0x58   | 4    | `u32`      | `recorderSchemaVersion`   | This recorder's revision of its own understanding of `goodName`'s memory layout — see §3.3. `0` when `gameFamily` is empty (no extension schema applies to an unrecognized game). |
-| 0x5C   | 8    | `u64`      | `recordedAtEpochMillis`   | Wall-clock time the recording started, **milliseconds** since the Unix epoch (UTC) — from `std::chrono::system_clock`. Independent of the filename's timestamp (§3.5), though the recorder writes the same instant to both (truncated to whole seconds there). |
-| 0x64   | 4    | `u32`      | `recordedAtNanosOffset`   | Nanosecond offset *within* `recordedAtEpochMillis`'s millisecond — i.e. `recordedAtEpochMillis * 1_000_000 + recordedAtNanosOffset` is the full-precision epoch time in nanoseconds. Range `0`-`999999`. Best-effort: written as `0` whenever the value being written doesn't come from a clock read directly (see §3.5's headless-export path) — readers should treat `0` as "no sub-millisecond precision available," not literally "exactly on the millisecond boundary." |
-| 0x68   | 4    | `u32`      | `uncompressedLength`      | Byte length of the event stream *after* decompression. Lets a reader preallocate its decompression output buffer instead of growing it dynamically. |
-| 0x6C   | 4    | `u32`      | `compressedLength`        | Byte length of the deflate-compressed block immediately following the header — i.e. `header_size (112) + compressedLength` is the total file size. Always correct on disk: because the whole match is buffered before anything is written (§2), there is no "0 until finalized" convention like version `4` had, and no truncated-but-valid file is possible — see §2's buffering trade-off. |
+| 0x5C   | 8    | `u64`      | `recordedAtEpochMillis`   | Wall-clock time the recording started, **milliseconds** since the Unix epoch (UTC) — from `std::chrono::system_clock`. Independent of the filename's timestamp (§3.3), though the recorder writes the same instant to both (truncated to whole seconds there). |
+| 0x64   | 4    | `u32`      | `uncompressedLength`      | Byte length of the event stream *after* decompression. Lets a reader preallocate its decompression output buffer instead of growing it dynamically. |
+| 0x68   | 4    | `u32`      | `compressedLength`        | Byte length of the deflate-compressed block immediately following the header — i.e. `header_size (108) + compressedLength` is the total file size. Always correct on disk: because the whole match is buffered before anything is written (§2), there is no "0 until finalized" convention, and no truncated-but-valid file is possible — see §2's buffering trade-off. |
 
 ### 3.2 `goodName`, `gameFamily`, and `recorderSchemaVersion` — three independent axes
 
@@ -218,9 +223,8 @@ above still applies on top.
 
 For this headless export path, `recordedAtEpochMillis` is derived from the
 source `.krec`'s own recording-start timestamp plus elapsed frames
-converted to milliseconds under a constant-60fps assumption — unchanged
-from version `4`'s approach; see `Replay::SetRecordedAtBaseOverride()`.
-`recordedAtNanosOffset` is always `0` for this path.
+converted to milliseconds under a constant-60fps assumption; see
+`Replay::SetRecordedAtBaseOverride()`.
 
 ### 3.4 Compression
 
@@ -279,9 +283,9 @@ already-processed button/stick values, which is the one input
 representation available uniformly for **both** human and CPU-controlled
 ports.
 
-Named `InputFrame` (not `PreFrameUpdate`, version `4`'s name) since this
-event has no game-family-specific counterpart to be "pre-" relative to —
-it's the entire core per-frame input record, full stop.
+Named `InputFrame` rather than "Pre-Frame" since this event has no
+game-family-specific counterpart to be "pre-" relative to — it's the
+entire core per-frame input record, full stop.
 
 Payload size: **9 bytes.**
 
@@ -379,10 +383,9 @@ State-side data, captured **after** that frame's physics/collision
 resolution — the resulting state. One event per seated port per frame,
 always immediately following that port's `InputFrame` in the stream.
 
-Named `StateFrame` (not `PostFrameUpdate`, version `4`'s name) for the
-same reason as `InputFrame` above — it's paired with the core input event
-by convention/ordering, not by a "Pre/Post" naming relationship baked into
-the format itself.
+Named `StateFrame` for the same reason as `InputFrame` above — it's paired
+with the core input event by convention/ordering, not by a "Pre/Post"
+naming relationship baked into the format itself.
 
 Payload size: **50 bytes.**
 
@@ -485,9 +488,10 @@ produced a file or how that recorder's understanding of it has evolved
 either — that's `gameFamily`/`goodName`/`recorderSchemaVersion` (§3.2), a
 deliberately separate axis from the container format itself.
 
-**No version `4` (or earlier) file is expected to parse under this spec.**
-This is a from-scratch redesign, not a continuation of version `4`'s
-schema-history mechanism — see the note at the top of this document.
+**No file recorded before this document existed is expected to parse
+under this spec.** This is a from-scratch design, not a continuation of
+any prior schema-history mechanism — see the note at the top of this
+document.
 
 ## 7. Byte order and encoding
 
@@ -513,43 +517,85 @@ terminator past the field boundary.
 
 Valid range `0x00`-`0x60`.
 
-**Vanilla (`0x00`-`0x1C`):** `0x00` Mario · `0x01` Fox · `0x02` Donkey Kong ·
-`0x03` Samus · `0x04` Luigi · `0x05` Link · `0x06` Yoshi ·
-`0x07` Captain Falcon · `0x08` Kirby · `0x09` Pikachu · `0x0A` Jigglypuff ·
-`0x0B` Ness · `0x0C` Master Hand · `0x0D` Metal Mario ·
-`0x0E`-`0x19` Polygon {Mario, Fox, DK, Samus, Luigi, Link, Yoshi, Falcon,
-Kirby, Pikachu, Jigglypuff, Ness} in that order · `0x1A` Giant DK ·
-`0x1B` Random · `0x1C` unused.
+**Vanilla (`0x00`-`0x1C`):**
 
-**Remix fighters (`0x1D`-`0x4C`):** `0x1D` Falco · `0x1E` Ganondorf ·
-`0x1F` Young Link · `0x20` Dr. Mario · `0x21` Wario · `0x22` Dark Samus ·
-`0x23` Link (EU) · `0x24` Samus (JP) · `0x25` Ness (JP) · `0x26` Lucas ·
-`0x27` Link (JP) · `0x28` Falcon (JP) · `0x29` Fox (JP) · `0x2A` Mario (JP) ·
-`0x2B` Luigi (JP) · `0x2C` DK (JP) · `0x2D` Pikachu (EU) ·
-`0x2E` Jigglypuff (JP) · `0x2F` Jigglypuff (EU) · `0x30` Kirby (JP) ·
-`0x31` Yoshi (JP) · `0x32` Pikachu (JP) · `0x33` Samus (EU) · `0x34` Bowser ·
-`0x35` Giga Bowser · `0x36` Piano · `0x37` Wolf · `0x38` Conker ·
-`0x39` Mewtwo · `0x3A` Marth · `0x3B` Sonic · `0x3C` Sandbag ·
-`0x3D` Super Sonic · `0x3E` Sheik · `0x3F` Marina · `0x40` King Dedede ·
-`0x41` Goemon · `0x42` Peppy · `0x43` Slippy · `0x44` Banjo ·
-`0x45` Metal Luigi · `0x46` Ebisumaru · `0x47` Dragon King · `0x48` Crash ·
-`0x49` Peach · `0x4A` Roy · `0x4B` Dr. Luigi · `0x4C` Lanky Kong.
+| Value | Name | | Value | Name |
+|---:|---|---|---:|---|
+| `0x00` | Mario | | `0x0E` | Polygon Mario |
+| `0x01` | Fox | | `0x0F` | Polygon Fox |
+| `0x02` | Donkey Kong | | `0x10` | Polygon Donkey Kong |
+| `0x03` | Samus | | `0x11` | Polygon Samus |
+| `0x04` | Luigi | | `0x12` | Polygon Luigi |
+| `0x05` | Link | | `0x13` | Polygon Link |
+| `0x06` | Yoshi | | `0x14` | Polygon Yoshi |
+| `0x07` | Captain Falcon | | `0x15` | Polygon Captain Falcon |
+| `0x08` | Kirby | | `0x16` | Polygon Kirby |
+| `0x09` | Pikachu | | `0x17` | Polygon Pikachu |
+| `0x0A` | Jigglypuff | | `0x18` | Polygon Jigglypuff |
+| `0x0B` | Ness | | `0x19` | Polygon Ness |
+| `0x0C` | Master Hand | | `0x1A` | Giant DK |
+| `0x0D` | Metal Mario | | `0x1B` | Random |
+| | | | `0x1C` | (unused) |
 
-**Remix polygons (`0x4D`-`0x60`):** `0x4D` Wario · `0x4E` Lucas ·
-`0x4F` Bowser · `0x50` Wolf · `0x51` Dr. Mario · `0x52` Sonic ·
-`0x53` Sheik · `0x54` Marina · `0x55` Falco · `0x56` Ganondorf ·
-`0x57` Dark Samus · `0x58` Marth · `0x59` Mewtwo · `0x5A` Dedede ·
-`0x5B` Young Link · `0x5C` Goemon · `0x5D` Conker · `0x5E` Banjo ·
-`0x5F` Peach · `0x60` Crash.
+**Remix fighters (`0x1D`-`0x4C`):**
+
+| Value | Name | | Value | Name |
+|---:|---|---|---:|---|
+| `0x1D` | Falco | | `0x35` | Giga Bowser |
+| `0x1E` | Ganondorf | | `0x36` | Piano |
+| `0x1F` | Young Link | | `0x37` | Wolf |
+| `0x20` | Dr. Mario | | `0x38` | Conker |
+| `0x21` | Wario | | `0x39` | Mewtwo |
+| `0x22` | Dark Samus | | `0x3A` | Marth |
+| `0x23` | Link (EU) | | `0x3B` | Sonic |
+| `0x24` | Samus (JP) | | `0x3C` | Sandbag |
+| `0x25` | Ness (JP) | | `0x3D` | Super Sonic |
+| `0x26` | Lucas | | `0x3E` | Sheik |
+| `0x27` | Link (JP) | | `0x3F` | Marina |
+| `0x28` | Falcon (JP) | | `0x40` | King Dedede |
+| `0x29` | Fox (JP) | | `0x41` | Goemon |
+| `0x2A` | Mario (JP) | | `0x42` | Peppy |
+| `0x2B` | Luigi (JP) | | `0x43` | Slippy |
+| `0x2C` | DK (JP) | | `0x44` | Banjo |
+| `0x2D` | Pikachu (EU) | | `0x45` | Metal Luigi |
+| `0x2E` | Jigglypuff (JP) | | `0x46` | Ebisumaru |
+| `0x2F` | Jigglypuff (EU) | | `0x47` | Dragon King |
+| `0x30` | Kirby (JP) | | `0x48` | Crash |
+| `0x31` | Yoshi (JP) | | `0x49` | Peach |
+| `0x32` | Pikachu (JP) | | `0x4A` | Roy |
+| `0x33` | Samus (EU) | | `0x4B` | Dr. Luigi |
+| `0x34` | Bowser | | `0x4C` | Lanky Kong |
+
+**Remix polygons (`0x4D`-`0x60`):**
+
+| Value | Name | | Value | Name |
+|---:|---|---|---:|---|
+| `0x4D` | Wario | | `0x57` | Dark Samus |
+| `0x4E` | Lucas | | `0x58` | Marth |
+| `0x4F` | Bowser | | `0x59` | Mewtwo |
+| `0x50` | Wolf | | `0x5A` | Dedede |
+| `0x51` | Dr. Mario | | `0x5B` | Young Link |
+| `0x52` | Sonic | | `0x5C` | Goemon |
+| `0x53` | Sheik | | `0x5D` | Conker |
+| `0x54` | Marina | | `0x5E` | Banjo |
+| `0x55` | Falco | | `0x5F` | Peach |
+| `0x56` | Ganondorf | | `0x60` | Crash |
 
 ### 8.2 Stage IDs
 
-**Vanilla:** `0x00` Peach's Castle · `0x01` Sector Z · `0x02` Congo Jungle ·
-`0x03` Planet Zebes · `0x04` Hyrule Castle · `0x05` Yoshi's Island ·
-`0x06` Dream Land · `0x07` Saffron City · `0x08` Mushroom Kingdom ·
-`0x09`-`0x0A` Dream Land Beta 1-2 · `0x0B` How to Play ·
-`0x0C` Mini Yoshi's Island · `0x0D` Meta Crystal · `0x0E` Duel Zone ·
-`0x0F` Race to the Finish · `0x10` Final Destination.
+**Vanilla:**
+
+| Value | Name | | Value | Name |
+|---:|---|---|---:|---|
+| `0x00` | Peach's Castle | | `0x09` | Dream Land Beta 1 |
+| `0x01` | Sector Z | | `0x0A` | Dream Land Beta 2 |
+| `0x02` | Congo Jungle | | `0x0B` | How to Play |
+| `0x03` | Planet Zebes | | `0x0C` | Mini Yoshi's Island |
+| `0x04` | Hyrule Castle | | `0x0D` | Meta Crystal |
+| `0x05` | Yoshi's Island | | `0x0E` | Duel Zone |
+| `0x06` | Dream Land | | `0x0F` | Race to the Finish |
+| `0x07` | Saffron City | | `0x10` | Final Destination |
+| `0x08` | Mushroom Kingdom | | | |
 
 Remix adds a very large number of additional stages (`0x29` onward, into the
 `0xD0`+ range) not enumerated here — see the *Known limitations* note in §9.
@@ -557,48 +603,72 @@ Remix adds a very large number of additional stages (`0x29` onward, into the
 ### 8.3 Action state IDs
 
 `0x000`-`0x0DB` are shared across every character; `>= 0x0DC` is
-character-specific (special moves — see §9).
+character-specific (special moves — see §9). Where a name ends in a
+numbered/lettered range (e.g. `Walk1-3`), the `Value` column's range
+covers that many consecutive, individually-meaningful states in that
+order — not one state that happens to span multiple codes.
 
-```
-0x000 DeadD(KO bottom)   0x001 DeadS(KO side)     0x002 DeadU(KO top)
-0x003 ScreenKO           0x004 ScreenKOWait       0x005 Entry(spawn)
-0x007 Revive1            0x008 Revive2            0x009 ReviveWait
-0x00A Idle                0x00B-0x00D Walk1-3      0x00F Dash
-0x010 Run                 0x011 RunBrake           0x012 Turn
-0x013 TurnRun             0x014 JumpSquat          0x015 ShieldJumpSquat
-0x016 JumpF               0x017 JumpB              0x018 JumpAerialF
-0x019 JumpAerialB         0x01A Fall               0x01B FallAerial
-0x01C Crouch              0x01D CrouchIdle         0x01E CrouchEnd
-0x01F LandingLight        0x020 LandingHeavy       0x021 Pass(platform drop)
-0x022 ShieldDrop          0x023 Teeter             0x024 TeeterStart
-0x025-0x027 DamageHigh1-3 0x028-0x02A DamageMid1-3 0x02B-0x02D DamageLow1-3
-0x02E-0x030 DamageAir1-3  0x031-0x032 DamageElec1-2
-0x033 DamageFlyHigh       0x034 DamageFlyMid       0x035 DamageFlyLow
-0x036 DamageFlyTop        0x037 DamageFlyRoll      0x038 WallBounce
-0x039 Tumble              0x03A FallSpecial        0x03B LandingSpecial
-0x03C Tornado             0x03D Barrel             0x03E-0x041 Pipe
-0x042 CeilingBonk         0x043-0x048 Knocked down/getup
-0x049-0x04A TechF/TechB   0x04B-0x04E Getup roll fwd/back
-0x04F DownAttackD         0x050 DownAttackU        0x051 Tech
-0x052 Clang               0x053 ClangRecoil        0x054 CliffCatch
-0x055 CliffWait           0x056 CliffQuick         0x057-0x058 CliffClimbQuick1-2
-0x059 CliffSlow           0x05A-0x05B CliffClimbSlow1-2
-0x05C-0x05F CliffAttack Quick/Slow    0x060-0x063 CliffEscape Quick/Slow
-0x064-0x07D Item pickup/throw actions 0x07E-0x097 Item-specific attacks
-0x098 ShieldOn            0x099 Shield             0x09A ShieldOff
-0x09B ShieldStun          0x09C RollF              0x09D RollB
-0x09E ShieldBreak         0x09F ShieldBreakFall    0x0A0-0x0A3 Stun land/start
-0x0A4 Stun                0x0A5 Sleep              0x0A6 Grab
-0x0A7 GrabPull            0x0A8 GrabWait           0x0A9 ThrowF
-0x0AA ThrowB              0x0AB-0x0B3 Captured/inhaled/egg-laid
-0x0B5-0x0BC Being thrown  0x0BD Taunt              0x0BE Jab1
-0x0BF Jab2                0x0C0 DashAttack         0x0C1-0x0C5 FTilt(High->Low)
-0x0C7 UTilt                0x0C9 DTilt              0x0CA-0x0CE FSmash(High->Low)
-0x0CF USmash               0x0D0 DSmash             0x0D1 Nair
-0x0D2 Fair                 0x0D3 Bair               0x0D4 Uair
-0x0D5 Dair                 0x0D6-0x0DA Aerial landing lag (N/F/B/U/D)
-0x0DB LandingAirX(Z-cancel)
-```
+| Value | Name | | Value | Name |
+|---:|---|---|---:|---|
+| `0x000` | DeadD (KO bottom) | | `0x054` | CliffCatch |
+| `0x001` | DeadS (KO side) | | `0x055` | CliffWait |
+| `0x002` | DeadU (KO top) | | `0x056` | CliffQuick |
+| `0x003` | ScreenKO | | `0x057-0x058` | CliffClimbQuick1-2 |
+| `0x004` | ScreenKOWait | | `0x059` | CliffSlow |
+| `0x005` | Entry (spawn) | | `0x05A-0x05B` | CliffClimbSlow1-2 |
+| `0x007` | Revive1 | | `0x05C-0x05F` | CliffAttack Quick/Slow |
+| `0x008` | Revive2 | | `0x060-0x063` | CliffEscape Quick/Slow |
+| `0x009` | ReviveWait | | `0x064-0x07D` | Item pickup/throw actions |
+| `0x00A` | Idle | | `0x07E-0x097` | Item-specific attacks |
+| `0x00B-0x00D` | Walk1-3 | | `0x098` | ShieldOn |
+| `0x00F` | Dash | | `0x099` | Shield |
+| `0x010` | Run | | `0x09A` | ShieldOff |
+| `0x011` | RunBrake | | `0x09B` | ShieldStun |
+| `0x012` | Turn | | `0x09C` | RollF |
+| `0x013` | TurnRun | | `0x09D` | RollB |
+| `0x014` | JumpSquat | | `0x09E` | ShieldBreak |
+| `0x015` | ShieldJumpSquat | | `0x09F` | ShieldBreakFall |
+| `0x016` | JumpF | | `0x0A0-0x0A3` | Stun land/start |
+| `0x017` | JumpB | | `0x0A4` | Stun |
+| `0x018` | JumpAerialF | | `0x0A5` | Sleep |
+| `0x019` | JumpAerialB | | `0x0A6` | Grab |
+| `0x01A` | Fall | | `0x0A7` | GrabPull |
+| `0x01B` | FallAerial | | `0x0A8` | GrabWait |
+| `0x01C` | Crouch | | `0x0A9` | ThrowF |
+| `0x01D` | CrouchIdle | | `0x0AA` | ThrowB |
+| `0x01E` | CrouchEnd | | `0x0AB-0x0B3` | Captured/inhaled/egg-laid |
+| `0x01F` | LandingLight | | `0x0B5-0x0BC` | Being thrown |
+| `0x020` | LandingHeavy | | `0x0BD` | Taunt |
+| `0x021` | Pass (platform drop) | | `0x0BE` | Jab1 |
+| `0x022` | ShieldDrop | | `0x0BF` | Jab2 |
+| `0x023` | Teeter | | `0x0C0` | DashAttack |
+| `0x024` | TeeterStart | | `0x0C1-0x0C5` | FTilt (High->Low) |
+| `0x025-0x027` | DamageHigh1-3 | | `0x0C7` | UTilt |
+| `0x028-0x02A` | DamageMid1-3 | | `0x0C9` | DTilt |
+| `0x02B-0x02D` | DamageLow1-3 | | `0x0CA-0x0CE` | FSmash (High->Low) |
+| `0x02E-0x030` | DamageAir1-3 | | `0x0CF` | USmash |
+| `0x031-0x032` | DamageElec1-2 | | `0x0D0` | DSmash |
+| `0x033` | DamageFlyHigh | | `0x0D1` | Nair |
+| `0x034` | DamageFlyMid | | `0x0D2` | Fair |
+| `0x035` | DamageFlyLow | | `0x0D3` | Bair |
+| `0x036` | DamageFlyTop | | `0x0D4` | Uair |
+| `0x037` | DamageFlyRoll | | `0x0D5` | Dair |
+| `0x038` | WallBounce | | `0x0D6-0x0DA` | Aerial landing lag (N/F/B/U/D) |
+| `0x039` | Tumble | | `0x0DB` | LandingAirX (Z-cancel) |
+| `0x03A` | FallSpecial | | | |
+| `0x03B` | LandingSpecial | | | |
+| `0x03C` | Tornado | | | |
+| `0x03D` | Barrel | | | |
+| `0x03E-0x041` | Pipe | | | |
+| `0x042` | CeilingBonk | | | |
+| `0x043-0x048` | Knocked down/getup | | | |
+| `0x049-0x04A` | TechF/TechB | | | |
+| `0x04B-0x04E` | Getup roll fwd/back | | | |
+| `0x04F` | DownAttackD | | | |
+| `0x050` | DownAttackU | | | |
+| `0x051` | Tech | | | |
+| `0x052` | Clang | | | |
+| `0x053` | ClangRecoil | | | |
 
 Derived predicates a consumer may find useful: dead/being-KO'd =
 `actionStateId <= 0x004`; respawning = `actionStateId == 0x005` or
@@ -610,13 +680,15 @@ Derived predicates a consumer may find useful: dead/being-KO'd =
 
 ### 8.4 Controller button bits (`InputFrame.buttons`)
 
-```
-0x8000 A       0x0400 D-Down   0x0020 L
-0x4000 B       0x0200 D-Left   0x0010 R
-0x2000 Z       0x0100 D-Right  0x0008 C-Up
-0x1000 Start   0x0004 C-Down   0x0002 C-Left
-0x0800 D-Up                    0x0001 C-Right
-```
+| Bit | Button | | Bit | Button |
+|---:|---|---|---:|---|
+| `0x8000` | A | | `0x0100` | D-Right |
+| `0x4000` | B | | `0x0020` | L |
+| `0x2000` | Z | | `0x0010` | R |
+| `0x1000` | Start | | `0x0008` | C-Up |
+| `0x0800` | D-Up | | `0x0004` | C-Down |
+| `0x0400` | D-Down | | `0x0002` | C-Left |
+| `0x0200` | D-Left | | `0x0001` | C-Right |
 
 ### 8.5 `game_status` (internal, not directly exposed as an event field)
 
@@ -733,7 +805,8 @@ tracked (Zebes' rising acid, Duel Zone's disappearing platforms, …).
 
 **Not yet implemented as of this document.** The design is finalized (see
 `docs/superpowers/specs/2026-09-04-rmgr-v2-design.md`); the code below
-still implements format version `4`:
+still implements the earlier, unspecified, in-development revision this
+spec replaces:
 
 - **Writer:** `Source/RMG-Core/Replay.cpp` / `Source/RMG-Core/Replay.hpp`.
 - **Memory reader:** `Source/RMG-Core/ReplayMemory.cpp` /

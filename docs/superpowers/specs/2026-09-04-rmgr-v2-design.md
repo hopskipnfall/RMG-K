@@ -1,16 +1,20 @@
 # `.rmgr` v2 — Format Redesign for Real-User Rollout
 
-**Status:** Design, approved by user 2026-09-04 (revised same day: `version`
-keeps incrementing rather than resetting). Spec doc (`docs/RMGR_SPEC.md`)
-rewritten to match; code changes not yet implemented.
+**Status:** Design, approved by user 2026-09-04 (revised same day:
+`version` keeps incrementing rather than resetting; `recordedAtNanosOffset`
+dropped from the header). Spec doc (`docs/RMGR_SPEC.md`) rewritten to
+match; code changes not yet implemented.
 
-**Supersedes:** `docs/RMGR_SPEC.md` (current format version `4`, recorder schema
-history up to `9`). This is an intentional, total break — old `.rmgr` files
-are not expected to remain readable. The `version` counter does **not**
-reset, though: it continues incrementing (`4` → `5`), specifically so an old
-reader (or a human staring at a hex dump) sees an unfamiliar version number
-and knows unambiguously "this isn't a format I understand" instead of the
-number colliding in value with an unrelated earlier format.
+This is the first time `.rmgr` has had a formal spec at all — the format
+existed only as this fork's in-development `Replay.cpp`/`ReplayMemory.cpp`
+before this document, internally at revision `4`, never shared with or
+seen by the upstream RMG-K maintainers. This design is a from-scratch
+rewrite, not a continuation of that revision history, and old files aren't
+expected to remain readable — there's no migration path and none is
+planned. The `version` field still starts at `5` rather than `1`, though:
+this fork already has real files on disk using values up to `4`
+internally, and starting past that avoids a reader mistaking one of those
+for a valid file under this spec.
 
 ## 1. Why
 
@@ -80,22 +84,23 @@ recorded:
 - **Hitbox/hurtbox removed entirely**, no replacement, no migration path.
   Revisit as a fresh design later if wanted.
 
-## 3. Header layout (112 bytes, uncompressed)
+## 3. Header layout (108 bytes, uncompressed)
 
 | Offset | Size | Type       | Field                    | Notes |
 |-------:|-----:|------------|---------------------------|-------|
 | 0x00   | 4    | `char[4]`  | `magic`                   | `R`,`M`,`G`,`R`, unchanged. |
-| 0x04   | 1    | `u8`       | `version`                 | `5` — continues incrementing from the old spec's `4`, not reset. An old reader (or a human inspecting a file) sees a version number it has never seen before and correctly treats the file as unparseable, rather than the value colliding with an unrelated earlier format. |
+| 0x04   | 1    | `u8`       | `version`                 | `5`. Starts past `1` rather than at it — see the status note above for why. |
 | 0x05   | 3    | `u8[3]`    | `reserved`                | Always zero. |
 | 0x08   | 16   | `char[16]` | `gameFamily`              | NUL-padded ASCII, e.g. `"smash64"`. Empty (all zero) if the loaded ROM wasn't recognized — core events are still valid in that case. |
-| 0x18   | 64   | `char[64]` | `goodName`                | Unchanged from v1: exact ROM build identity, NUL-padded, truncated if longer. |
-| 0x58   | 4    | `u32`      | `recorderSchemaVersion`   | Unchanged concept: scoped per-`goodName`. `0` if `gameFamily` is empty (no extension schema applies). |
-| 0x5C   | 8    | `u64`      | `recordedAtEpochMillis`   | Unchanged. |
-| 0x64   | 4    | `u32`      | `recordedAtNanosOffset`   | Unchanged. |
-| 0x68   | 4    | `u32`      | `uncompressedLength`      | **New.** Byte length of the raw (decompressed) event stream — lets a reader preallocate its output buffer. |
-| 0x6C   | 4    | `u32`      | `compressedLength`        | **New, replaces `streamLength`.** Byte length of the deflate blob immediately following the header. Always correct on disk — no more "0 until finalized" convention, since nothing is written until the match ends. |
+| 0x18   | 64   | `char[64]` | `goodName`                | Exact ROM build identity, NUL-padded, truncated if longer. |
+| 0x58   | 4    | `u32`      | `recorderSchemaVersion`   | Scoped per-`goodName`. `0` if `gameFamily` is empty (no extension schema applies). |
+| 0x5C   | 8    | `u64`      | `recordedAtEpochMillis`   | Wall-clock recording start, epoch milliseconds. |
+| 0x64   | 4    | `u32`      | `uncompressedLength`      | Byte length of the raw (decompressed) event stream — lets a reader preallocate its output buffer. |
+| 0x68   | 4    | `u32`      | `compressedLength`        | Byte length of the deflate blob immediately following the header. Always correct on disk — no "0 until finalized" convention, since nothing is written until the match ends. |
 
-Total: 0x70 = 112 bytes (up from 92).
+Total: 0x6C = 108 bytes. (`recordedAtNanosOffset` was dropped per user
+feedback — sub-millisecond precision wasn't judged useful enough to keep;
+millisecond resolution alone remains.)
 
 ## 4. Event stream (inside the deflate blob)
 
