@@ -5,9 +5,7 @@ has been formally specified — this document did not exist before this
 branch, and it has not yet been shared with the upstream RMG-K
 maintainers. **The writer (`Source/RMG-Core/Replay.cpp` /
 `Source/RMG-Core/ReplayMemory.cpp`) implements this version.** The reader
-side (`rmgr-ts`, `rmgr-viewer`) has not been updated yet — see §10. See
-`docs/superpowers/specs/2026-09-04-rmgr-v2-design.md` for the design
-rationale.
+side (`rmgr-ts`, `rmgr-viewer`) has not been updated yet — see §10.
 
 `version` starts at `5`, not `1`: this fork already produced real files
 under that earlier in-development numbering while this format was being
@@ -66,9 +64,8 @@ attempting to be console-agnostic) — see §2 for how it generalizes across
   produces no file at all, not a truncated one (a rejected alternative
   design streamed events to disk incrementally specifically to avoid this,
   at the cost of the seek-and-patch mechanics that made compression
-  awkward — see the design doc). A match's event data is at most a few MB,
-  so holding it in RAM for a match's duration is not a real memory
-  concern.
+  awkward). A match's event data is at most a few MB, so holding it in RAM
+  for a match's duration is not a real memory concern.
 - **Self-describing, forward-compatible event stream, no schema compiler.**
   Every event is a 1-byte command code followed by a payload whose size was
   declared up front by the very first event in the stream (`EventPayloads`,
@@ -820,5 +817,7 @@ tracked (Zebes' rising acid, Duel Zone's disappearing platforms, …).
   layout. `rmgr-viewer` (consumer of `rmgr-ts`) is therefore also not yet
   able to read files this writer produces.
 
-The reader-side work (`rmgr-ts`, then `rmgr-viewer`) is tracked separately -
-see the design doc's §7 for the specific items each still needs.
+The reader-side work is tracked separately: `rmgr-ts` needs its parser/types
+updated for this version's header (§3.1), compression (§3.4), and event
+catalog (§4/§5) before `rmgr-viewer` (which consumes `rmgr-ts`) can read
+anything this writer produces.
