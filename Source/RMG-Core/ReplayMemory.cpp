@@ -280,9 +280,6 @@ PortPlayerState ReadPortPlayerState(uint32_t matchInfoPtr, int port)
     PortPlayerState state{};
     state.valid = false;
 
-    uint32_t base = matchInfoPtr + MI_PORT_STRUCT_BASE +
-        static_cast<uint32_t>(port) * MI_PORT_STRUCT_STRIDE;
-
     uint32_t playerStruct = ResolvePlayerStruct(matchInfoPtr, port);
     if (!IsValidRdramPointer(playerStruct))
     {
@@ -290,7 +287,6 @@ PortPlayerState ReadPortPlayerState(uint32_t matchInfoPtr, int port)
     }
 
     state.valid               = true;
-    state.characterId          = m64p::Core.DebugMemRead8(base + PORT_CHARACTER_ID);
     state.actionStateId         = static_cast<uint16_t>(m64p::Core.DebugMemRead32(playerStruct + PS_ACTION_STATE_ID));
     state.actionFrameCounter    = m64p::Core.DebugMemRead32(playerStruct + PS_ACTION_FRAME_COUNTER);
     state.facingDirection        = static_cast<int32_t>(m64p::Core.DebugMemRead32(playerStruct + PS_FACING_DIRECTION));

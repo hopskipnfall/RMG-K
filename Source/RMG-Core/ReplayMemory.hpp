@@ -42,7 +42,9 @@ struct PortPlayerState
 {
     bool     valid;     // false if the player-object/player-struct pointer
                          // chase failed (port not currently in a live match)
-    uint8_t  characterId;
+    // No characterId here - it's the exact same base+PORT_CHARACTER_ID
+    // read as PortMatchInfo::characterId; callers that need both should
+    // read PortMatchInfo, not duplicate the read.
     uint16_t actionStateId;
     uint32_t actionFrameCounter;
     int32_t  facingDirection; // 1 = right, -1 = left

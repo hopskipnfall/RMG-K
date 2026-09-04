@@ -10,6 +10,7 @@
 
 #include <RMG-Core/Callback.hpp>
 #include <RMG-Core/Directories.hpp>
+#include <RMG-Core/File.hpp>
 
 #include <cstdio>
 #include <filesystem>
@@ -80,39 +81,6 @@ static std::filesystem::path getPluginPath(const char* category, const char* fil
     pluginDirectory /= category;
     pluginDirectory /= fileName;
     return pluginDirectory;
-}
-
-// Batch-exporting many recordings can finish more than one within the same
-// wall-clock second - the .rmgr filename convention (BuildFileName() in
-// Replay.cpp) is second-granularity, so two exports landing in the same
-// second would otherwise collide and the second would silently overwrite
-// the first. If `desiredPath` already exists, tries "<stem>-2<ext>",
-// "<stem>-3<ext>", ... until a free one is found.
-static std::filesystem::path FindCollisionFreePath(const std::filesystem::path& desiredPath)
-{
-    std::error_code errorCode;
-    if (!std::filesystem::exists(desiredPath, errorCode))
-    {
-        return desiredPath;
-    }
-
-    const std::filesystem::path directory = desiredPath.parent_path();
-    const std::filesystem::path extension = desiredPath.extension();
-    const std::string stem = desiredPath.stem().string();
-
-    for (int suffix = 2; suffix < 10000; suffix++)
-    {
-        std::filesystem::path candidate = directory / (stem + "-" + std::to_string(suffix) + extension.string());
-        if (!std::filesystem::exists(candidate, errorCode))
-        {
-            return candidate;
-        }
-    }
-
-    // Pathological case (10000 same-second collisions) - fall through to
-    // the original path rather than loop forever; the caller's own file
-    // open will just overwrite it same as before this function existed.
-    return desiredPath;
 }
 
 static bool requireExistingFile(const std::filesystem::path& path, const char* label, std::string* errorMessage)
@@ -236,7 +204,7 @@ static bool runReplayFileExport(ReplayFileExportOptions& options, std::string* e
         std::error_code errorCode;
         std::filesystem::create_directories(outputDirectory, errorCode);
     }
-    options.outputPath = FindCollisionFreePath(options.outputPath);
+    options.outputPath = CoreFindCollisionFreePath(options.outputPath);
 
     KrecData krecData;
     if (!ParseKrecFile(options.krecPath, krecData, errorMessage))

@@ -11,6 +11,7 @@
 #include "ReplayMemory.hpp"
 #include "Settings.hpp"
 #include "Callback.hpp"
+#include "File.hpp"
 #include "Library.hpp"
 #include "RomSettings.hpp"
 #ifdef RMGK_HAVE_P2P_TRANSPORT
@@ -31,6 +32,7 @@
 #include <fstream>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace
@@ -367,17 +369,29 @@ void WriteFixedString(char* dest, size_t destSize, const std::string& s)
     std::memcpy(dest, s.data(), std::min(s.size(), destSize));
 }
 
-// Appends one event (code byte + payload) to the in-memory buffer for the
-// match currently being recorded - nothing touches disk until
-// FinalizeFile() compresses and writes the whole thing out at once.
+// Appends raw bytes to the in-memory buffer for the match currently being
+// recorded - nothing touches disk until FinalizeFile() compresses and
+// writes the whole thing out at once. The one primitive WriteEvent() and
+// WriteEventPayloadsEvent() below both build on.
+void AppendBytes(const void* data, size_t size)
+{
+    const size_t offset = s_EventBuffer.size();
+    s_EventBuffer.resize(offset + size);
+    std::memcpy(s_EventBuffer.data() + offset, data, size);
+}
+
+template <typename T>
+void AppendValue(const T& value)
+{
+    AppendBytes(&value, sizeof(value));
+}
+
+// Appends one event (code byte + payload) to the buffer.
 template <typename T>
 void WriteEvent(EventCode code, const T& payload)
 {
-    uint8_t codeByte = static_cast<uint8_t>(code);
-    const size_t offset = s_EventBuffer.size();
-    s_EventBuffer.resize(offset + sizeof(codeByte) + sizeof(payload));
-    std::memcpy(s_EventBuffer.data() + offset, &codeByte, sizeof(codeByte));
-    std::memcpy(s_EventBuffer.data() + offset + sizeof(codeByte), &payload, sizeof(payload));
+    AppendValue(static_cast<uint8_t>(code));
+    AppendValue(payload);
 }
 
 // The Event Payloads event (0x01) is always first: it declares the exact
@@ -393,46 +407,38 @@ void WriteEventPayloadsEvent(bool familyRecognized)
         EventCode code;
         uint16_t  size;
     };
-    static const EventSize coreSizes[] = {
+    static constexpr EventSize kCoreSizes[] = {
         {EventCode::MatchStart, static_cast<uint16_t>(sizeof(MatchStartEvent))},
         {EventCode::InputFrame, static_cast<uint16_t>(sizeof(InputFrameEvent))},
         {EventCode::MatchEnd,   static_cast<uint16_t>(sizeof(MatchEndEvent))},
     };
-    static const EventSize smash64Sizes[] = {
+    static constexpr EventSize kSmash64Sizes[] = {
         {EventCode::StateFrame,        static_cast<uint16_t>(sizeof(StateFrameEvent))},
         {EventCode::ItemUpdate,        static_cast<uint16_t>(sizeof(ItemUpdateEvent))},
         {EventCode::StageHazardUpdate, static_cast<uint16_t>(sizeof(StageHazardUpdateEvent))},
         {EventCode::MatchSettings,     static_cast<uint16_t>(sizeof(MatchSettingsEvent))},
         {EventCode::MatchResult,       static_cast<uint16_t>(sizeof(MatchResultEvent))},
     };
+    constexpr size_t kCoreCount    = sizeof(kCoreSizes) / sizeof(kCoreSizes[0]);
+    constexpr size_t kSmash64Count = sizeof(kSmash64Sizes) / sizeof(kSmash64Sizes[0]);
 
-    const uint8_t count = static_cast<uint8_t>(
-        (sizeof(coreSizes) / sizeof(coreSizes[0])) +
-        (familyRecognized ? (sizeof(smash64Sizes) / sizeof(smash64Sizes[0])) : 0));
-
-    const uint8_t codeByte = static_cast<uint8_t>(EventCode::EventPayloads);
-    size_t offset = s_EventBuffer.size();
-    s_EventBuffer.resize(offset + sizeof(codeByte) + sizeof(count));
-    std::memcpy(s_EventBuffer.data() + offset, &codeByte, sizeof(codeByte));
-    std::memcpy(s_EventBuffer.data() + offset + sizeof(codeByte), &count, sizeof(count));
+    const uint8_t count = static_cast<uint8_t>(kCoreCount + (familyRecognized ? kSmash64Count : 0));
+    AppendValue(static_cast<uint8_t>(EventCode::EventPayloads));
+    AppendValue(count);
 
     auto appendEntries = [](const EventSize* entries, size_t entryCount)
     {
         for (size_t i = 0; i < entryCount; i++)
         {
-            uint8_t  entryCode = static_cast<uint8_t>(entries[i].code);
-            uint16_t entrySize = entries[i].size;
-            const size_t entryOffset = s_EventBuffer.size();
-            s_EventBuffer.resize(entryOffset + sizeof(entryCode) + sizeof(entrySize));
-            std::memcpy(s_EventBuffer.data() + entryOffset, &entryCode, sizeof(entryCode));
-            std::memcpy(s_EventBuffer.data() + entryOffset + sizeof(entryCode), &entrySize, sizeof(entrySize));
+            AppendValue(static_cast<uint8_t>(entries[i].code));
+            AppendValue(entries[i].size);
         }
     };
 
-    appendEntries(coreSizes, sizeof(coreSizes) / sizeof(coreSizes[0]));
+    appendEntries(kCoreSizes, kCoreCount);
     if (familyRecognized)
     {
-        appendEntries(smash64Sizes, sizeof(smash64Sizes) / sizeof(smash64Sizes[0]));
+        appendEntries(kSmash64Sizes, kSmash64Count);
     }
 }
 
@@ -474,6 +480,31 @@ std::string SanitizeForFilename(const std::string& input)
     return result;
 }
 
+// Resolves the effective player names for this match: the per-session
+// override (see SetPlayerNamesOverride) if one was set, otherwise the
+// netplay room's own recording_player_names global. Used for BOTH the
+// filename suffix (BuildFileName below) and MatchStart.playerNames, so the
+// two can never disagree about whose names these are - previously
+// BuildFileName read recording_player_names directly and ignored the
+// override entirely, so headless .krec export produced files with correct
+// in-header names but no player-name suffix on disk.
+std::array<std::string, 4> ResolvePlayerNames(void)
+{
+    if (s_HasPlayerNamesOverride)
+    {
+        return s_PlayerNamesOverride;
+    }
+
+    std::array<std::string, 4> names{};
+#ifdef RMGK_HAVE_P2P_TRANSPORT
+    for (int i = 0; i < 4; i++)
+    {
+        names[i] = recording_player_names[i];
+    }
+#endif
+    return names;
+}
+
 // Loosely mirrors n02_client.cpp's "<date>-Player1-Player2.krec" convention
 // - player-name suffix and 24-char cap the same, but YYYYMMDD-HHMMSS
 // (4-digit year, dashed) rather than krec's compact YYMMDDHHMMSS, for a
@@ -483,7 +514,7 @@ std::string SanitizeForFilename(const std::string& input)
 // recordedAtEpochMillis header field - the filename and the header should
 // never disagree about when the recording started, even though the
 // filename itself is only second-resolution.
-std::string BuildFileName(time_t now)
+std::string BuildFileName(time_t now, const std::array<std::string, 4>& playerNames)
 {
     tm localNow{};
 #ifdef _WIN32
@@ -496,53 +527,17 @@ std::string BuildFileName(time_t now)
 
     std::string filename = datePart;
 
-#ifdef RMGK_HAVE_P2P_TRANSPORT
-    for (int i = 0; i < 4; i++)
+    for (const std::string& name : playerNames)
     {
-        if (recording_player_names[i][0] != 0)
+        if (!name.empty())
         {
             filename += "-";
-            filename += SanitizeForFilename(recording_player_names[i]);
+            filename += SanitizeForFilename(name);
         }
     }
-#endif
 
     filename += ".rmgr";
     return filename;
-}
-
-// If `desiredPath` already exists on disk, tries "<stem>-2<ext>",
-// "<stem>-3<ext>", ... until a free one is found. One emulation session
-// (one OnEmulationStart()..OnEmulationStop() span) can open more than one
-// file here - a single headless export of a multi-game .krec produces one
-// .rmgr per match, all sharing the same base name (see
-// SetOutputPathOverride's doc comment) - so without this, match 2 would
-// silently overwrite match 1's file.
-std::filesystem::path FindCollisionFreePath(const std::filesystem::path& desiredPath)
-{
-    std::error_code errorCode;
-    if (!std::filesystem::exists(desiredPath, errorCode))
-    {
-        return desiredPath;
-    }
-
-    const std::filesystem::path directory = desiredPath.parent_path();
-    const std::filesystem::path extension = desiredPath.extension();
-    const std::string stem = desiredPath.stem().string();
-
-    for (int suffix = 2; suffix < 10000; suffix++)
-    {
-        std::filesystem::path candidate = directory / (stem + "-" + std::to_string(suffix) + extension.string());
-        if (!std::filesystem::exists(candidate, errorCode))
-        {
-            return candidate;
-        }
-    }
-
-    // Pathological case (10000 collisions) - fall through to the original
-    // path rather than loop forever; the caller's own file open just
-    // overwrites it same as before this function existed.
-    return desiredPath;
 }
 
 // Resets per-match state and buffers the header/MatchStart(/MatchSettings)
@@ -554,6 +549,11 @@ bool OpenNewFile(const ReplayMemory::MatchInfo& matchInfo)
 {
     s_FrameNumber = 0;
     s_EventBuffer.clear();
+    // A rough head start on capacity so the first ~1000 frames' worth of
+    // events (well past a typical short stock) don't force repeated
+    // reallocate+copy growth; the buffer still grows geometrically beyond
+    // this for a longer match, same as any std::vector.
+    s_EventBuffer.reserve(256 * 1024);
     s_HasPendingRecording = false;
 
     // Default: live recording, stamped with wall-clock "now" - read from
@@ -586,6 +586,8 @@ bool OpenNewFile(const ReplayMemory::MatchInfo& matchInfo)
     // see docs/RMGR_SPEC.md section 3.3.
     const time_t now = static_cast<time_t>(nowEpochMillis / 1000);
 
+    const std::array<std::string, 4> playerNames = ResolvePlayerNames();
+
     std::filesystem::path path;
     if (s_HasOutputPathOverride)
     {
@@ -595,13 +597,13 @@ bool OpenNewFile(const ReplayMemory::MatchInfo& matchInfo)
         // "<override>.ext" for the first, so a multi-game .krec's export
         // still reads as "<krec name>-<game number>.rmgr" and plainly
         // corresponds back to its source .krec by name.
-        // FindCollisionFreePath() is still a safety net in case this same
-        // krec was already exported before (so "-1" is already taken).
+        // CoreFindCollisionFreePath() is still a safety net in case this
+        // same krec was already exported before (so "-1" is already taken).
         s_OverrideMatchNumber++;
         const std::filesystem::path base(s_OutputPathOverride);
         const std::filesystem::path numberedPath = base.parent_path() /
             (base.stem().string() + "-" + std::to_string(s_OverrideMatchNumber) + base.extension().string());
-        path = FindCollisionFreePath(numberedPath);
+        path = CoreFindCollisionFreePath(numberedPath);
     }
     else
     {
@@ -609,7 +611,7 @@ bool OpenNewFile(const ReplayMemory::MatchInfo& matchInfo)
         // own "records" directory convention (Source/n02/n02_client.cpp)
         // exactly, so .rmgr files land next to .krec files at the top level
         // instead of being nested under the per-platform user-data directory.
-        path = FindCollisionFreePath(std::filesystem::path("replays") / BuildFileName(now));
+        path = CoreFindCollisionFreePath(std::filesystem::path("replays") / BuildFileName(now, playerNames));
     }
 
     std::error_code createDirErrorCode;
@@ -623,6 +625,29 @@ bool OpenNewFile(const ReplayMemory::MatchInfo& matchInfo)
         CoreAddCallbackMessage(CoreDebugMessageType::Warning,
             "Replay: failed to create directory for " + path.string() + " - not recording");
         return false;
+    }
+
+    // Test-open (and immediately close) the actual destination now, before
+    // buffering a single event - a match's worth of data can be several MB,
+    // and the buffered/compressed-once design (see FinalizeFile()) only
+    // writes it out once the match ends, so a write failure discovered only
+    // then would silently lose the whole recording instead of never having
+    // started it. This intentionally leaves a truncated (0-byte) file at
+    // `path` if the match never finishes - a much smaller regression than
+    // losing a full match, and FinalizeFile() overwrites it with the real
+    // content (also truncating) on success.
+    {
+        std::ofstream testOpen(path, std::ios::binary | std::ios::trunc);
+        if (!testOpen.is_open())
+        {
+            if (s_HasOutputPathOverride)
+            {
+                s_OverrideMatchNumber--; // undo - see the increment above, this attempt never happened
+            }
+            CoreAddCallbackMessage(CoreDebugMessageType::Warning,
+                "Replay: failed to open " + path.string() + " for recording");
+            return false;
+        }
     }
     s_PendingOutputPath = path;
 
@@ -654,22 +679,10 @@ bool OpenNewFile(const ReplayMemory::MatchInfo& matchInfo)
         startEvent.slotType[port] = portInfo.slotType;
     }
 
-#ifdef RMGK_HAVE_P2P_TRANSPORT
-    // Not consumed here (unlike the old per-file behavior) - see
-    // SetPlayerNamesOverride's doc comment. Every match recorded during
-    // this session uses the same names.
-    if (s_HasPlayerNamesOverride)
+    for (int port = 0; port < 4; port++)
     {
-        for (int port = 0; port < 4; port++)
-        {
-            WriteFixedString(startEvent.playerNames[port], sizeof(startEvent.playerNames[port]), s_PlayerNamesOverride[port]);
-        }
+        WriteFixedString(startEvent.playerNames[port], sizeof(startEvent.playerNames[port]), playerNames[port]);
     }
-    else
-    {
-        std::memcpy(startEvent.playerNames, recording_player_names, sizeof(startEvent.playerNames));
-    }
-#endif
 
     WriteEvent(EventCode::MatchStart, startEvent);
 
@@ -714,6 +727,48 @@ bool OpenNewFile(const ReplayMemory::MatchInfo& matchInfo)
     return true;
 }
 
+// Compresses `eventBuffer` and writes `header` + the compressed blob to
+// `outputPath` - the actual disk I/O for a finished match. Deliberately a
+// free function taking everything by value/move rather than touching any
+// s_* state: it runs on a detached worker thread (see FinalizeFile()) so
+// compressing a multi-MB buffer and writing it out never blocks the caller
+// of OnEmulationStop()/OnFrame() - frequently the UI thread via
+// CoreStopEmulation(). Needs no locking of its own since nothing it touches
+// is shared with any other thread.
+void CompressAndWriteFile(std::vector<uint8_t> eventBuffer, FileHeader header, std::filesystem::path outputPath)
+{
+    const std::vector<uint8_t> compressed = DeflateCompress(eventBuffer);
+    if (compressed.empty() && !eventBuffer.empty())
+    {
+        CoreAddCallbackMessage(CoreDebugMessageType::Warning,
+            "Replay: failed to compress recorded match data - not writing " + outputPath.string());
+        return;
+    }
+
+    header.uncompressedLength = static_cast<uint32_t>(eventBuffer.size());
+    header.compressedLength   = static_cast<uint32_t>(compressed.size());
+
+    std::ofstream file(outputPath, std::ios::binary | std::ios::trunc);
+    if (!file.is_open())
+    {
+        CoreAddCallbackMessage(CoreDebugMessageType::Warning,
+            "Replay: failed to open " + outputPath.string() + " for writing");
+        return;
+    }
+
+    file.write(reinterpret_cast<const char*>(&header), sizeof(header));
+    if (!compressed.empty())
+    {
+        file.write(reinterpret_cast<const char*>(compressed.data()), static_cast<std::streamsize>(compressed.size()));
+    }
+    file.close();
+
+    CoreAddCallbackMessage(CoreDebugMessageType::Info,
+        "Replay: wrote " + outputPath.string() + " (" +
+        std::to_string(compressed.size()) + " bytes compressed, " +
+        std::to_string(eventBuffer.size()) + " bytes uncompressed)");
+}
+
 void FinalizeFile(uint8_t endReason, const ReplayMemory::MatchInfo& matchInfo)
 {
     if (!s_HasPendingRecording)
@@ -737,40 +792,11 @@ void FinalizeFile(uint8_t endReason, const ReplayMemory::MatchInfo& matchInfo)
         WriteEvent(EventCode::MatchResult, resultEvent);
     }
 
-    const std::vector<uint8_t> compressed = DeflateCompress(s_EventBuffer);
-    if (compressed.empty() && !s_EventBuffer.empty())
-    {
-        CoreAddCallbackMessage(CoreDebugMessageType::Warning,
-            "Replay: failed to compress recorded match data - not writing " + s_PendingOutputPath.string());
-        s_HasPendingRecording = false;
-        s_EventBuffer.clear();
-        return;
-    }
-
-    s_PendingHeader.uncompressedLength = static_cast<uint32_t>(s_EventBuffer.size());
-    s_PendingHeader.compressedLength   = static_cast<uint32_t>(compressed.size());
-
-    std::ofstream file(s_PendingOutputPath, std::ios::binary | std::ios::trunc);
-    if (!file.is_open())
-    {
-        CoreAddCallbackMessage(CoreDebugMessageType::Warning,
-            "Replay: failed to open " + s_PendingOutputPath.string() + " for writing");
-        s_HasPendingRecording = false;
-        s_EventBuffer.clear();
-        return;
-    }
-
-    file.write(reinterpret_cast<const char*>(&s_PendingHeader), sizeof(s_PendingHeader));
-    if (!compressed.empty())
-    {
-        file.write(reinterpret_cast<const char*>(compressed.data()), static_cast<std::streamsize>(compressed.size()));
-    }
-    file.close();
-
-    CoreAddCallbackMessage(CoreDebugMessageType::Info,
-        "Replay: wrote " + s_PendingOutputPath.string() + " (" +
-        std::to_string(compressed.size()) + " bytes compressed, " +
-        std::to_string(s_EventBuffer.size()) + " bytes uncompressed)");
+    // Hand the buffer off to a detached worker thread for compression +
+    // writing (see CompressAndWriteFile()'s doc comment) and reset our own
+    // state immediately - the caller (often the UI thread) doesn't wait for
+    // either to finish.
+    std::thread(CompressAndWriteFile, std::move(s_EventBuffer), s_PendingHeader, s_PendingOutputPath).detach();
 
     s_HasPendingRecording = false;
     s_EventBuffer.clear();
@@ -805,7 +831,7 @@ void RecordFrame(const ReplayMemory::MatchInfo& matchInfo)
             StateFrameEvent stateFrame{};
             stateFrame.frame             = s_FrameNumber;
             stateFrame.port              = static_cast<uint8_t>(port);
-            stateFrame.characterId       = state.characterId;
+            stateFrame.characterId       = portInfo.characterId;
             stateFrame.actionStateId     = state.actionStateId;
             stateFrame.positionX         = state.positionX;
             stateFrame.positionY         = state.positionY;
