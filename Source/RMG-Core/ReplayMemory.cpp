@@ -11,6 +11,7 @@
 #include "m64p/Api.hpp"
 
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 
 namespace
@@ -319,10 +320,38 @@ PortPlayerState ReadPortPlayerState(uint32_t matchInfoPtr, int port)
     // many real jump inputs.
     const uint8_t jumpsUsed = m64p::Core.DebugMemRead8(playerStruct + PS_JUMPS_USED);
     const uint32_t attributesPtr = m64p::Core.DebugMemRead32(playerStruct + PS_ATTRIBUTES_PTR);
-    if (IsValidRdramPointer(attributesPtr))
+    const bool attributesPtrValid = IsValidRdramPointer(attributesPtr);
+    int32_t jumpsMax = 0;
+    if (attributesPtrValid)
     {
-        const int32_t jumpsMax = static_cast<int32_t>(m64p::Core.DebugMemRead32(attributesPtr + FT_ATTR_MAX_JUMPS));
+        jumpsMax = static_cast<int32_t>(m64p::Core.DebugMemRead32(attributesPtr + FT_ATTR_MAX_JUMPS));
         state.jumpsRemaining = jumpsMax - static_cast<int32_t>(jumpsUsed);
+    }
+
+    // TEMPORARY DEBUG INSTRUMENTATION - chasing the bug where
+    // state.jumpsRemaining always reads 0 even during confirmed mid-air
+    // double-jump usage. Prints per-port jump-related values whenever the
+    // logged jumpsRemaining changes for that port, so a human can capture
+    // real values from a live match without flooding the log every frame.
+    // Remove this block once the root cause is found.
+    {
+        static int32_t s_lastLoggedJumpsRemaining[8] = { -9999, -9999, -9999, -9999, -9999, -9999, -9999, -9999 };
+        if (port >= 0 && port < 8 && s_lastLoggedJumpsRemaining[port] != state.jumpsRemaining)
+        {
+            s_lastLoggedJumpsRemaining[port] = state.jumpsRemaining;
+            if (attributesPtrValid)
+            {
+                std::fprintf(stderr,
+                    "[JUMPS_DEBUG] port=%d attributesPtr=0x%08X valid=1 jumpsUsed=%u jumpsMax=%d jumpsRemaining=%d\n",
+                    port, attributesPtr, static_cast<unsigned>(jumpsUsed), jumpsMax, state.jumpsRemaining);
+            }
+            else
+            {
+                std::fprintf(stderr,
+                    "[JUMPS_DEBUG] port=%d attributesPtr=0x%08X valid=0 jumpsUsed=%u jumpsMax=<not read> jumpsRemaining=%d\n",
+                    port, attributesPtr, static_cast<unsigned>(jumpsUsed), state.jumpsRemaining);
+            }
+        }
     }
 
     return state;
