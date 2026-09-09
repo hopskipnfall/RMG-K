@@ -9,6 +9,7 @@
  */
 #include "ReplayMemory.hpp"
 #include "m64p/Api.hpp"
+#include "Callback.hpp"
 
 #include <cmath>
 #include <cstdio>
@@ -330,27 +331,32 @@ PortPlayerState ReadPortPlayerState(uint32_t matchInfoPtr, int port)
 
     // TEMPORARY DEBUG INSTRUMENTATION - chasing the bug where
     // state.jumpsRemaining always reads 0 even during confirmed mid-air
-    // double-jump usage. Prints per-port jump-related values whenever the
+    // double-jump usage. Reports per-port jump-related values whenever the
     // logged jumpsRemaining changes for that port, so a human can capture
     // real values from a live match without flooding the log every frame.
-    // Remove this block once the root cause is found.
+    // Routed through CoreAddCallbackMessage (View -> Log in the GUI) rather
+    // than stderr, since a GUI-launched build has no visible console to
+    // print to - see project history for why this is the logging path that
+    // actually gets seen. Remove this block once the root cause is found.
     {
         static int32_t s_lastLoggedJumpsRemaining[8] = { -9999, -9999, -9999, -9999, -9999, -9999, -9999, -9999 };
         if (port >= 0 && port < 8 && s_lastLoggedJumpsRemaining[port] != state.jumpsRemaining)
         {
             s_lastLoggedJumpsRemaining[port] = state.jumpsRemaining;
+            char messageBuffer[256];
             if (attributesPtrValid)
             {
-                std::fprintf(stderr,
-                    "[JUMPS_DEBUG] port=%d attributesPtr=0x%08X valid=1 jumpsUsed=%u jumpsMax=%d jumpsRemaining=%d\n",
+                std::snprintf(messageBuffer, sizeof(messageBuffer),
+                    "[JUMPS_DEBUG] port=%d attributesPtr=0x%08X valid=1 jumpsUsed=%u jumpsMax=%d jumpsRemaining=%d",
                     port, attributesPtr, static_cast<unsigned>(jumpsUsed), jumpsMax, state.jumpsRemaining);
             }
             else
             {
-                std::fprintf(stderr,
-                    "[JUMPS_DEBUG] port=%d attributesPtr=0x%08X valid=0 jumpsUsed=%u jumpsMax=<not read> jumpsRemaining=%d\n",
+                std::snprintf(messageBuffer, sizeof(messageBuffer),
+                    "[JUMPS_DEBUG] port=%d attributesPtr=0x%08X valid=0 jumpsUsed=%u jumpsMax=<not read> jumpsRemaining=%d",
                     port, attributesPtr, static_cast<unsigned>(jumpsUsed), state.jumpsRemaining);
             }
+            CoreAddCallbackMessage(CoreDebugMessageType::Info, std::string(messageBuffer));
         }
     }
 
