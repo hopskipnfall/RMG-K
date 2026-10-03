@@ -192,3 +192,8 @@ interpreter). Reserve the command id in the schema now.
 4. `DebugMemWrite8/16/32` need hooking in `CoreApi` (exported by core, not
    yet wired).
 5. PIF read-path override point for puppet input.
+
+Status (2026-10-03): item 3 resolved by using the core's deferred rollback
+load and a synchronous rollback save; item 4 done (`CoreApi` hooks); item 5
+done (`PracticePifSyncCallback` in `Emulation.cpp`). Items 1 and 2 remain open
+and are covered by the on-hardware checklist in the implementation plan.
