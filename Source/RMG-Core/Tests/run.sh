@@ -10,7 +10,7 @@ OUT="${TMPDIR:-/tmp}/rmgk-practice-tests"
 mkdir -p "$OUT"
 
 # Core sources under test.
-SOURCES="ReplayMemory.cpp ReplayEventBuilder.cpp PracticeProtocol.cpp PracticeTransport.cpp PracticeApplier.cpp"
+SOURCES="ReplayMemory.cpp ReplayEventBuilder.cpp PracticeProtocol.cpp PracticeTransport.cpp PracticeApplier.cpp PracticeSession.cpp"
 # Sources that make m64p::Core (the DebugMem* function pointers) exist.
 SUPPORT="m64p/Api.cpp m64p/CoreApi.cpp m64p/ConfigApi.cpp Library.cpp"
 
