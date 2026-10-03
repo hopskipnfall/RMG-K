@@ -28,10 +28,8 @@
 #include <unistd.h>
 #endif
 
-#ifndef _WIN32
 #ifndef MSG_NOSIGNAL
-#define MSG_NOSIGNAL 0 // macOS: SO_NOSIGPIPE is set per socket instead
-#endif
+#define MSG_NOSIGNAL 0 // Windows has no SIGPIPE; macOS sets SO_NOSIGPIPE per socket instead
 #endif
 
 namespace PracticeSocket
