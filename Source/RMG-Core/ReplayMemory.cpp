@@ -331,6 +331,34 @@ constexpr uint32_t ADDR_REMIX_POKEMON_ANNOUNCER     = 0x80466FB8;
 constexpr uint32_t ADDR_REMIX_DRAGON_KING_HUD       = 0x80466FF4;
 constexpr uint32_t ADDR_REMIX_CAMERA_MODE           = 0x8046702C;
 constexpr uint32_t ADDR_REMIX_YOSHI_ISLAND_CLOUD_ANIMS = 0x80467060;
+
+// One entry per RemixSettings field, in that struct's declaration order (which
+// is also the order of MatchSettings' Remix fields and the practice
+// protocol's SetSetting key space).
+constexpr uint32_t kRemixSettingAddrs[] = {
+    ADDR_REMIX_HITSTUN, ADDR_REMIX_HITLAG, ADDR_REMIX_DI, ADDR_REMIX_JAPANESE_SOUNDS,
+    ADDR_REMIX_JAPANESE_STUN_SLEEP, ADDR_REMIX_MOMENTUM_SLIDE, ADDR_REMIX_SHIELD_STUN,
+    ADDR_REMIX_Z_CANCEL, ADDR_REMIX_PUNISH_FAILED_Z_CANCEL, ADDR_REMIX_IMPROVED_AI,
+    ADDR_REMIX_TRIPPING, ADDR_REMIX_RAGE, ADDR_REMIX_FOOTSTOOL_JUMPING, ADDR_REMIX_AIR_DODGING,
+    ADDR_REMIX_JAB_LOCKING, ADDR_REMIX_EDGE_C_JUMPING, ADDR_REMIX_PERFECT_SHIELDING,
+    ADDR_REMIX_PARRYING, ADDR_REMIX_SPOT_DODGING, ADDR_REMIX_FAST_FALL_AERIALS,
+    ADDR_REMIX_LEDGE_TRUMPING, ADDR_REMIX_WALL_TECHING, ADDR_REMIX_CHARGE_SMASHES,
+    ADDR_REMIX_ITEM_CONTAINERS, ADDR_REMIX_GAME_SPEED, ADDR_REMIX_SPECIAL_ZOOM,
+    ADDR_REMIX_BLASTZONE_WARP, ADDR_REMIX_SINGLE_BUTTON_MODE, ADDR_REMIX_ALL_ITEMS_R_DROP_AERIAL,
+    ADDR_REMIX_MOVE_STALING, ADDR_REMIX_STOPWATCH_ITEM, ADDR_REMIX_STAGE_SELECT_LAYOUT,
+    ADDR_REMIX_HAZARD_MODE, ADDR_REMIX_WHISPY_MODE, ADDR_REMIX_SAFFRON_POKEMON_RATE,
+    ADDR_REMIX_POKEMON_ANNOUNCER, ADDR_REMIX_DRAGON_KING_HUD, ADDR_REMIX_CAMERA_MODE,
+    ADDR_REMIX_YOSHI_ISLAND_CLOUD_ANIMS,
+};
+static_assert(sizeof(kRemixSettingAddrs) / sizeof(kRemixSettingAddrs[0]) == ReplayMemory::kRemixSettingCount,
+              "kRemixSettingAddrs must have one entry per RemixSettings field");
+
+void WriteFloat(uint32_t address, float value)
+{
+    uint32_t bits;
+    std::memcpy(&bits, &value, sizeof(bits));
+    m64p::Core.DebugMemWrite32(address, bits);
+}
 } // namespace
 
 namespace ReplayMemory
@@ -543,47 +571,72 @@ StageHazards ReadStageHazards(uint8_t stageId)
 
 RemixSettings ReadRemixSettings(void)
 {
+    static_assert(sizeof(RemixSettings) == kRemixSettingCount, "RemixSettings must be exactly one byte per field");
     RemixSettings settings{};
-    settings.hitstun             = static_cast<uint8_t>(m64p::Core.DebugMemRead32(ADDR_REMIX_HITSTUN));
-    settings.hitlag              = static_cast<uint8_t>(m64p::Core.DebugMemRead32(ADDR_REMIX_HITLAG));
-    settings.di                  = static_cast<uint8_t>(m64p::Core.DebugMemRead32(ADDR_REMIX_DI));
-    settings.japaneseSounds      = static_cast<uint8_t>(m64p::Core.DebugMemRead32(ADDR_REMIX_JAPANESE_SOUNDS));
-    settings.japaneseStunSleep   = static_cast<uint8_t>(m64p::Core.DebugMemRead32(ADDR_REMIX_JAPANESE_STUN_SLEEP));
-    settings.momentumSlide       = static_cast<uint8_t>(m64p::Core.DebugMemRead32(ADDR_REMIX_MOMENTUM_SLIDE));
-    settings.shieldStun          = static_cast<uint8_t>(m64p::Core.DebugMemRead32(ADDR_REMIX_SHIELD_STUN));
-    settings.zCancel             = static_cast<uint8_t>(m64p::Core.DebugMemRead32(ADDR_REMIX_Z_CANCEL));
-    settings.punishFailedZCancel = static_cast<uint8_t>(m64p::Core.DebugMemRead32(ADDR_REMIX_PUNISH_FAILED_Z_CANCEL));
-    settings.improvedAI          = static_cast<uint8_t>(m64p::Core.DebugMemRead32(ADDR_REMIX_IMPROVED_AI));
-    settings.tripping            = static_cast<uint8_t>(m64p::Core.DebugMemRead32(ADDR_REMIX_TRIPPING));
-    settings.rage                = static_cast<uint8_t>(m64p::Core.DebugMemRead32(ADDR_REMIX_RAGE));
-    settings.footstoolJumping    = static_cast<uint8_t>(m64p::Core.DebugMemRead32(ADDR_REMIX_FOOTSTOOL_JUMPING));
-    settings.airDodging          = static_cast<uint8_t>(m64p::Core.DebugMemRead32(ADDR_REMIX_AIR_DODGING));
-    settings.jabLocking          = static_cast<uint8_t>(m64p::Core.DebugMemRead32(ADDR_REMIX_JAB_LOCKING));
-    settings.edgeCJumping        = static_cast<uint8_t>(m64p::Core.DebugMemRead32(ADDR_REMIX_EDGE_C_JUMPING));
-    settings.perfectShielding    = static_cast<uint8_t>(m64p::Core.DebugMemRead32(ADDR_REMIX_PERFECT_SHIELDING));
-    settings.parrying            = static_cast<uint8_t>(m64p::Core.DebugMemRead32(ADDR_REMIX_PARRYING));
-    settings.spotDodging         = static_cast<uint8_t>(m64p::Core.DebugMemRead32(ADDR_REMIX_SPOT_DODGING));
-    settings.fastFallAerials     = static_cast<uint8_t>(m64p::Core.DebugMemRead32(ADDR_REMIX_FAST_FALL_AERIALS));
-    settings.ledgeTrumping       = static_cast<uint8_t>(m64p::Core.DebugMemRead32(ADDR_REMIX_LEDGE_TRUMPING));
-    settings.wallTeching         = static_cast<uint8_t>(m64p::Core.DebugMemRead32(ADDR_REMIX_WALL_TECHING));
-    settings.chargeSmashes       = static_cast<uint8_t>(m64p::Core.DebugMemRead32(ADDR_REMIX_CHARGE_SMASHES));
-    settings.itemContainers      = static_cast<uint8_t>(m64p::Core.DebugMemRead32(ADDR_REMIX_ITEM_CONTAINERS));
-    settings.gameSpeed           = static_cast<uint8_t>(m64p::Core.DebugMemRead32(ADDR_REMIX_GAME_SPEED));
-    settings.specialZoom         = static_cast<uint8_t>(m64p::Core.DebugMemRead32(ADDR_REMIX_SPECIAL_ZOOM));
-    settings.blastzoneWarp       = static_cast<uint8_t>(m64p::Core.DebugMemRead32(ADDR_REMIX_BLASTZONE_WARP));
-    settings.singleButtonMode    = static_cast<uint8_t>(m64p::Core.DebugMemRead32(ADDR_REMIX_SINGLE_BUTTON_MODE));
-    settings.allItemsRDropAerial = static_cast<uint8_t>(m64p::Core.DebugMemRead32(ADDR_REMIX_ALL_ITEMS_R_DROP_AERIAL));
-    settings.moveStaling         = static_cast<uint8_t>(m64p::Core.DebugMemRead32(ADDR_REMIX_MOVE_STALING));
-    settings.stopwatchItem       = static_cast<uint8_t>(m64p::Core.DebugMemRead32(ADDR_REMIX_STOPWATCH_ITEM));
-
-    settings.stageSelectLayout    = static_cast<uint8_t>(m64p::Core.DebugMemRead32(ADDR_REMIX_STAGE_SELECT_LAYOUT));
-    settings.hazardMode           = static_cast<uint8_t>(m64p::Core.DebugMemRead32(ADDR_REMIX_HAZARD_MODE));
-    settings.whispyMode           = static_cast<uint8_t>(m64p::Core.DebugMemRead32(ADDR_REMIX_WHISPY_MODE));
-    settings.saffronPokemonRate   = static_cast<uint8_t>(m64p::Core.DebugMemRead32(ADDR_REMIX_SAFFRON_POKEMON_RATE));
-    settings.pokemonAnnouncer     = static_cast<uint8_t>(m64p::Core.DebugMemRead32(ADDR_REMIX_POKEMON_ANNOUNCER));
-    settings.dragonKingHUD        = static_cast<uint8_t>(m64p::Core.DebugMemRead32(ADDR_REMIX_DRAGON_KING_HUD));
-    settings.cameraMode           = static_cast<uint8_t>(m64p::Core.DebugMemRead32(ADDR_REMIX_CAMERA_MODE));
-    settings.yoshiIslandCloudAnims = static_cast<uint8_t>(m64p::Core.DebugMemRead32(ADDR_REMIX_YOSHI_ISLAND_CLOUD_ANIMS));
+    uint8_t* fields = reinterpret_cast<uint8_t*>(&settings);
+    for (int i = 0; i < kRemixSettingCount; i++)
+    {
+        fields[i] = static_cast<uint8_t>(m64p::Core.DebugMemRead32(kRemixSettingAddrs[i]));
+    }
     return settings;
+}
+
+bool WriteRemixSetting(uint16_t key, uint8_t value)
+{
+    if (key >= kRemixSettingCount)
+    {
+        return false;
+    }
+    m64p::Core.DebugMemWrite32(kRemixSettingAddrs[key], value);
+    return true;
+}
+
+void WriteRngSeed(int32_t seed)
+{
+    m64p::Core.DebugMemWrite32(ADDR_RNG_SEED, static_cast<uint32_t>(seed));
+}
+
+bool WritePortPlayerState(uint32_t matchInfoPtr, int port, const PlayerStateWrite& w)
+{
+    if (port < 0 || port > 3)
+    {
+        return false;
+    }
+
+    const uint32_t portBase = matchInfoPtr + MI_PORT_STRUCT_BASE + static_cast<uint32_t>(port) * MI_PORT_STRUCT_STRIDE;
+    if (m64p::Core.DebugMemRead8(portBase + PORT_SLOT_TYPE) == 2)
+    {
+        return false; // port not seated
+    }
+
+    const uint32_t playerStruct = ResolvePlayerStruct(matchInfoPtr, port);
+    if (!IsValidRdramPointer(playerStruct))
+    {
+        return false;
+    }
+
+    uint32_t positionPtr = 0;
+    if (w.mask & (WRITE_POSITION_X | WRITE_POSITION_Y))
+    {
+        positionPtr = m64p::Core.DebugMemRead32(playerStruct + PS_POSITION_PTR);
+        if (!IsValidRdramPointer(positionPtr))
+        {
+            return false;
+        }
+    }
+
+    if (w.mask & WRITE_POSITION_X)         WriteFloat(positionPtr + 0x00, w.positionX);
+    if (w.mask & WRITE_POSITION_Y)         WriteFloat(positionPtr + 0x04, w.positionY);
+    if (w.mask & WRITE_VELOCITY_X)         WriteFloat(playerStruct + PS_VELOCITY_X, w.velocityX);
+    if (w.mask & WRITE_VELOCITY_Y)         WriteFloat(playerStruct + PS_VELOCITY_Y, w.velocityY);
+    if (w.mask & WRITE_FACING_DIRECTION)   m64p::Core.DebugMemWrite32(playerStruct + PS_FACING_DIRECTION, static_cast<uint32_t>(w.facingDirection));
+    if (w.mask & WRITE_DAMAGE_PERCENT)     m64p::Core.DebugMemWrite32(playerStruct + PS_DAMAGE_PERCENT, w.damagePercent);
+    if (w.mask & WRITE_SHIELD_HEALTH)      m64p::Core.DebugMemWrite32(playerStruct + PS_SHIELD_HEALTH, static_cast<uint32_t>(w.shieldHealth));
+    if (w.mask & WRITE_STOCKS_REMAINING)   m64p::Core.DebugMemWrite8(portBase + PORT_STOCKS_REMAINING, static_cast<uint8_t>(w.stocksRemaining));
+    if (w.mask & WRITE_CHARACTER_SPECIFIC) m64p::Core.DebugMemWrite32(playerStruct + PS_PASSIVE_VAR, static_cast<uint32_t>(w.characterSpecific));
+    if (w.mask & WRITE_JUMPS_USED)         m64p::Core.DebugMemWrite8(playerStruct + PS_JUMPS_USED, w.jumpsUsed);
+    if (w.mask & WRITE_HURTBOX_STATE)      m64p::Core.DebugMemWrite8(playerStruct + PS_HURTBOX_STATE, w.hurtboxState);
+    if (w.mask & WRITE_SPECIAL_HIT_STATUS) m64p::Core.DebugMemWrite8(playerStruct + PS_SPECIAL_HITSTATUS, w.specialHitStatus);
+    return true;
 }
 } // namespace ReplayMemory

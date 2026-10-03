@@ -75,6 +75,7 @@ static bool l_InputPluginSwitchRequested = false;
 #define SETTING_SECTION_GCA             SETTING_SECTION_GUI  " - GameCube Adapter Input Plugin"
 #define SETTING_SECTION_KAILLERA        SETTING_SECTION_GUI  " Kaillera"
 #define SETTING_SECTION_GAMESTATS       SETTING_SECTION_GUI  " GameStats"
+#define SETTING_SECTION_PRACTICE        SETTING_SECTION_GUI  " Practice"
 #define SETTING_SECTION_ROLLBACK        SETTING_SECTION_GUI  " Rollback"
 #define SETTING_SECTION_RAPHNET_INPUT   "Input-RaphnetRaw"
 #define SETTING_SECTION_RSP             "Rsp-HLE"
@@ -1662,6 +1663,17 @@ static l_Setting get_setting(SettingsID settingId)
     // Game Stats / Replay Settings
     case SettingsID::GameStats_ReplayEnabled:
         setting = {SETTING_SECTION_GAMESTATS, "ReplayEnabled", false};
+        break;
+
+    // Practice client
+    case SettingsID::Practice_Enabled:
+        setting = {SETTING_SECTION_PRACTICE, "Enabled", false};
+        break;
+    case SettingsID::Practice_Port:
+        setting = {SETTING_SECTION_PRACTICE, "Port", 46464};
+        break;
+    case SettingsID::Practice_TimeoutMs:
+        setting = {SETTING_SECTION_PRACTICE, "TimeoutMs", 8};
         break;
 
     }

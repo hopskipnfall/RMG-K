@@ -566,6 +566,11 @@ enum class SettingsID
     // Game Stats / Replay Settings
     GameStats_ReplayEnabled,
 
+    // Practice client (see docs/PRACTICE_PROTOCOL.md)
+    Practice_Enabled,
+    Practice_Port,
+    Practice_TimeoutMs,
+
     Invalid
 };
 
