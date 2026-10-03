@@ -9,6 +9,7 @@
  */
 #include "Practice.hpp"
 #include "Callback.hpp"
+#include "Library.hpp"
 #include "PracticeSession.hpp"
 #include "ReplayEvents.hpp"
 #include "RollbackNetcode.hpp"
@@ -74,7 +75,7 @@ std::unique_ptr<PracticeSession> s_Session;
 
 namespace Practice
 {
-bool OnEmulationStart(bool allowed)
+CORE_EXPORT bool OnEmulationStart(bool allowed)
 {
     std::lock_guard<std::mutex> lock(s_Mutex);
 
@@ -108,14 +109,14 @@ bool OnEmulationStart(bool allowed)
     return true;
 }
 
-void OnEmulationStop(void)
+CORE_EXPORT void OnEmulationStop(void)
 {
     std::lock_guard<std::mutex> lock(s_Mutex);
     s_Session.reset();
     s_Slots.Clear();
 }
 
-void OnFrame(void)
+CORE_EXPORT void OnFrame(void)
 {
     std::lock_guard<std::mutex> lock(s_Mutex);
     if (s_Session)
@@ -124,7 +125,7 @@ void OnFrame(void)
     }
 }
 
-bool GetPuppetInput(int port, uint16_t& buttons, int8_t& stickX, int8_t& stickY)
+CORE_EXPORT bool GetPuppetInput(int port, uint16_t& buttons, int8_t& stickX, int8_t& stickY)
 {
     std::lock_guard<std::mutex> lock(s_Mutex);
     return s_Session && s_Session->GetPuppetInput(port, buttons, stickX, stickY);
