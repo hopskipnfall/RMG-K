@@ -185,6 +185,7 @@ public:
 #include <RMG-Core/Key.hpp>
 #ifdef RMGK_GAME_STATS
 #include <RMG-Core/Replay.hpp>
+#include <RMG-Core/Practice.hpp>
 #endif
 
 namespace
@@ -5816,6 +5817,7 @@ void MainWindow::on_Emulation_Finished(bool ret, QString error)
     // still open here so it's not just defensively discarded on the next
     // emulation start; no-op when nothing was recorded.
     Replay::OnEmulationStop();
+    Practice::OnEmulationStop();
 #endif
 
 #ifdef _WIN32
