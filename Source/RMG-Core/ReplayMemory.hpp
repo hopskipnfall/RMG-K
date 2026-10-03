@@ -257,11 +257,58 @@ std::vector<ItemObject> ReadItemObjects(void);
 // that internally and returns all-false for a stage it doesn't know yet.
 StageHazards ReadStageHazards(uint8_t stageId);
 
+// Number of RemixSettings fields (all one byte), also the size of the
+// practice protocol's SetSetting key space.
+constexpr int kRemixSettingCount = 39;
+
 // Fixed global Toggles.asm addresses, independent of MatchInfo - always
 // readable regardless of match state (these are menu-configured settings,
 // not live match state). Called once at match start, alongside
 // ReadMatchInfo() - see RemixSettings's own doc comment.
 RemixSettings ReadRemixSettings(void);
+// --- Writes (practice client) ---------------------------------------------
+// Bit n of PlayerStateWrite::mask enables the field of the same name. The bit
+// layout is part of the practice protocol (docs/PRACTICE_PROTOCOL.md 4.4).
+enum PlayerStateWriteBit : uint32_t
+{
+    WRITE_POSITION_X         = 1u << 0,
+    WRITE_POSITION_Y         = 1u << 1,
+    WRITE_VELOCITY_X         = 1u << 2,
+    WRITE_VELOCITY_Y         = 1u << 3,
+    WRITE_FACING_DIRECTION   = 1u << 4,
+    WRITE_DAMAGE_PERCENT     = 1u << 5,
+    WRITE_SHIELD_HEALTH      = 1u << 6,
+    WRITE_STOCKS_REMAINING   = 1u << 7,
+    WRITE_CHARACTER_SPECIFIC = 1u << 8,
+    WRITE_JUMPS_USED         = 1u << 9,
+    WRITE_HURTBOX_STATE      = 1u << 10,
+    WRITE_SPECIAL_HIT_STATUS = 1u << 11,
+    WRITE_ALL_BITS           = (1u << 12) - 1,
+};
+
+struct PlayerStateWrite
+{
+    uint32_t mask = 0;
+    float    positionX = 0, positionY = 0, velocityX = 0, velocityY = 0;
+    int32_t  facingDirection = 0;
+    uint32_t damagePercent = 0;
+    int32_t  shieldHealth = 0;
+    int8_t   stocksRemaining = 0;
+    int32_t  characterSpecific = 0;
+    uint8_t  jumpsUsed = 0, hurtboxState = 0, specialHitStatus = 0;
+};
+
+// Writes the masked fields of one fighter. Returns false (writing nothing)
+// if the port isn't seated or its player struct / position pointer can't be
+// resolved. matchInfoPtr must come from a valid ReadMatchInfo().
+bool WritePortPlayerState(uint32_t matchInfoPtr, int port, const PlayerStateWrite& write);
+
+// key is an index into RemixSettings' fields (0 = hitstun .. 38 =
+// yoshiIslandCloudAnims). Returns false for an out-of-range key.
+bool WriteRemixSetting(uint16_t key, uint8_t value);
+
+// Writes sSYUtilsRandomSeed.
+void WriteRngSeed(int32_t seed);
 } // namespace ReplayMemory
 
 #endif // REPLAY_MEMORY_HPP
