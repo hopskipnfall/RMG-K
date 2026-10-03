@@ -28,6 +28,7 @@
 #endif
 #ifdef RMGK_GAME_STATS
 #include "Replay.hpp"
+#include "Practice.hpp"
 #endif
 
 #include "m64p/Api.hpp"
@@ -276,6 +277,7 @@ static void FrameCallback(unsigned int frameIndex)
     // (see l_RollbackHiddenStepActive in mupen64plus-core's main.c), so this
     // is exactly one call per real emulated frame - never inflated by resim.
     Replay::OnFrame();
+    Practice::OnFrame();
 #endif
 }
 
@@ -600,6 +602,37 @@ static void KailleraPifSyncCallback(struct pif* pif)
     }
 #endif // NETPLAY
 }
+
+#if defined(RMGK_GAME_STATS) && defined(NETPLAY)
+// Practice client puppet input (SetPuppetInput): after the input plugin has
+// written the real controller into the PIF channel, replace it with the
+// server's requested state for ports under override. Registered only for
+// offline practice sessions (never alongside the Kaillera callback).
+static void PracticePifSyncCallback(struct pif* pif)
+{
+    for (int port = 0; port < PIF_CONTROLLER_CHANNELS_COUNT; port++)
+    {
+        const pif_channel& channel = pif->channels[port];
+        if (!pif_channel_has_command(channel) || channel.tx_buf[0] != JCMD_CONTROLLER_READ)
+        {
+            continue;
+        }
+
+        uint16_t buttons = 0;
+        int8_t   stickX = 0;
+        int8_t   stickY = 0;
+        if (!Practice::GetPuppetInput(port, buttons, stickX, stickY))
+        {
+            continue;
+        }
+
+        channel.rx_buf[0] = static_cast<uint8_t>(buttons >> 8);
+        channel.rx_buf[1] = static_cast<uint8_t>(buttons & 0xFF);
+        channel.rx_buf[2] = static_cast<uint8_t>(stickX);
+        channel.rx_buf[3] = static_cast<uint8_t>(stickY);
+    }
+}
+#endif
 
 CORE_EXPORT void CoreStageSpectateKeyframe(const unsigned char* data, int len, int frame)
 {
@@ -1044,8 +1077,11 @@ CORE_EXPORT bool CoreStartEmulation(std::filesystem::path n64rom, std::filesyste
         s_CurrentFrame = 0;
         m64p::Core.DoCommand(M64CMD_SET_FRAME_CALLBACK, 0, (void*)FrameCallback);
 
+        [[maybe_unused]] bool practiceActive = false;
 #ifdef RMGK_GAME_STATS
         Replay::OnEmulationStart();
+        // Practice rewrites game state, so never alongside netplay or local rollback.
+        practiceActive = Practice::OnEmulationStart(!netplay && !localRollbackEnabled);
 #endif
 
 #ifdef NETPLAY
@@ -1074,7 +1110,18 @@ CORE_EXPORT bool CoreStartEmulation(std::filesystem::path n64rom, std::filesyste
 #endif
             if (set_callback)
             {
-                set_callback(address == "KAILLERA" ? KailleraPifSyncCallback : nullptr);
+                pif_sync_callback_t pifCallback = nullptr;
+                if (address == "KAILLERA")
+                {
+                    pifCallback = KailleraPifSyncCallback;
+                }
+#if defined(RMGK_GAME_STATS)
+                else if (practiceActive)
+                {
+                    pifCallback = PracticePifSyncCallback;
+                }
+#endif
+                set_callback(pifCallback);
             }
         }
 #endif
@@ -1176,6 +1223,7 @@ CORE_EXPORT bool CoreStopEmulation(void)
     // Finalizes (patches the length field, closes) any .rmgr file still
     // open - covers the "user quit mid-match" case.
     Replay::OnEmulationStop();
+    Practice::OnEmulationStop();
 #endif
 
     if (!m64p::Core.IsHooked())
