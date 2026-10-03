@@ -72,6 +72,7 @@ endif(PORTABLE_INSTALL)
 if (GAME_STATS)
     list(APPEND RMG_CORE_SOURCES
         ReplayMemory.cpp
+        ReplayEventBuilder.cpp
         Replay.cpp
     )
     add_definitions(-DRMGK_GAME_STATS)
