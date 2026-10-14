@@ -15,9 +15,37 @@
 
 namespace
 {
-constexpr uint32_t ADDR_CURRENT_SCREEN   = 0x800A4AD0;
-constexpr uint32_t ADDR_MATCH_RESET_FLAG = 0x800A4AE2;
-constexpr uint32_t ADDR_MATCH_INFO_PTR   = 0x800A50E8;
+// The seven absolute addresses that move between regions. Everything
+// pointer-relative (MI_*, PORT_*, PS_*, GOBJ_*, ...) is identical on US and
+// JP. Remix and the US builds share the US set; JP values come from the
+// smashremix docs ram-map-vanilla-jp.md / ram-map-19xxte-jp.md (decomp JP
+// symbols + ROM reference scan; not yet confirmed against a live emulator).
+struct RegionAddrs
+{
+    uint32_t currentScreen;
+    uint32_t matchResetFlag;
+    uint32_t matchInfoPtr;
+    uint32_t rngSeed;
+    uint32_t gcCommonLinks;
+    uint32_t whispyStatus;
+    uint32_t whispyLr;
+};
+
+// screen, reset flag, match info ptr, RNG seed, gGCCommonLinks[0], then
+// gGRCommonStruct (0x801313F0) + 0x26 / + 0x2A (Dream Land's Whispy view).
+constexpr RegionAddrs kUsAddrs = {0x800A4AD0, 0x800A4AE2, 0x800A50E8, 0x8003B940,
+                                  0x800466F0, 0x80131416, 0x8013141A};
+constexpr RegionAddrs kJpAddrs = {0x800A2A90, 0x800A2AA2, 0x800A30A8, 0x8003BD50,
+                                  0x800466E0, 0x8012EFA6, 0x8012EFAA};
+
+ReplayMemory::RomVariant s_RomVariantInternal = ReplayMemory::RomVariant::Unknown;
+
+const RegionAddrs& Addrs(void)
+{
+    return (s_RomVariantInternal == ReplayMemory::RomVariant::VanillaJP ||
+            s_RomVariantInternal == ReplayMemory::RomVariant::TE16JP)
+               ? kJpAddrs : kUsAddrs;
+}
 // Smash Remix's "Salty Runback" feature (GameEnd.asm) - holding Start (or
 // the configured combo) on the no-contest/results screen instantly
 // restarts the match from scratch, bypassing the normal win/loss
@@ -25,7 +53,7 @@ constexpr uint32_t ADDR_MATCH_INFO_PTR   = 0x800A50E8;
 // once triggered, written in update_screen_'s _success branch; zeroed in
 // its _end branch (every other outcome). Confirmed via a bass -sym build
 // against real Remix source, not inferred. IMPORTANT: this flag is NOT
-// the same as ADDR_MATCH_RESET_FLAG above (that one is unrelated - the
+// the same as RegionAddrs::matchResetFlag above (that one is unrelated - the
 // pause-menu abort combo - and is never written by this feature at all).
 // See IsSaltyRunbackActive()'s doc comment for what's confirmed vs. not
 // about how long this stays set.
@@ -131,7 +159,7 @@ constexpr uint32_t PS_KNOCKBACK_RESIST     = 0x7E8;
 // contain Items; Weapons (fireballs, boomerang, charge shot, PK Fire/
 // Thunder, ...) live on the separate list at gGCCommonLinks[5] and were
 // never actually reachable that way. See ram-map.md section 10.4 (updated).
-constexpr uint32_t ADDR_GC_COMMON_LINKS = 0x800466F0; // gGCCommonLinks[0]; list head for link_id N is this + N*4
+// gGCCommonLinks[0] is RegionAddrs::gcCommonLinks; gGCCommonLinks[0]; list head for link_id N is this + N*4
 constexpr uint32_t GOBJ_NEXT            = 0x04;
 constexpr uint32_t GOBJ_LINK_ID         = 0x0C; // u8: 3 = Fighter, 4 = Item, 5 = Weapon
 constexpr uint32_t GOBJ_OBJ_PTR         = 0x74; // -> DObj (position/scale)
@@ -195,9 +223,9 @@ constexpr int ITEM_LIST_MAX_OBJECTS = 32;
 // ground" stage; these exact offsets are only valid when the current
 // stage is actually Dream Land.
 constexpr uint8_t  STAGE_ID_DREAM_LAND       = 0x06;
-constexpr uint32_t ADDR_PUPUPU_WHISPY_STATUS = 0x80131416; // gGRCommonStruct (0x801313F0) + 0x26, Dream Land's union view
+// RegionAddrs::whispyStatus: gGRCommonStruct (0x801313F0) + 0x26, Dream Land's union view
 constexpr uint8_t  WHISPY_STATUS_BLOW        = 4;          // grPupupuWhispyWindStatus::Blow
-constexpr uint32_t ADDR_PUPUPU_WHISPY_LR     = 0x8013141A; // gGRCommonStruct + 0x2A - lr_players: 0 = blowing left, 1 = blowing right
+// RegionAddrs::whispyLr: gGRCommonStruct + 0x2A - lr_players: 0 = blowing left, 1 = blowing right
 
 // KSEG0, 8MB expansion-pak RDRAM window. A value outside this range means a
 // pointer chase hit garbage - treat as "not currently available", not a crash.
@@ -215,7 +243,7 @@ float ReadFloat(uint32_t address)
 }
 
 // Walks one gGCCommonLinks[linkId] list (Items or Weapons, never mixed - see
-// ADDR_GC_COMMON_LINKS's doc comment), invoking `visitor(objectAddress,
+// RegionAddrs::gcCommonLinks), invoking `visitor(objectAddress,
 // userData)` for every live entry whose own link_id byte actually matches
 // (defensively skipping anything else, per that list's documented
 // guarantee). `userData` is that GObj's ITStruct*/WPStruct* pointer
@@ -224,7 +252,7 @@ float ReadFloat(uint32_t address)
 template <typename Visitor>
 void WalkGObjLinkList(uint8_t linkId, Visitor&& visitor)
 {
-    const uint32_t listHead = ADDR_GC_COMMON_LINKS + static_cast<uint32_t>(linkId) * 4;
+    const uint32_t listHead = Addrs().gcCommonLinks + static_cast<uint32_t>(linkId) * 4;
     uint32_t current = m64p::Core.DebugMemRead32(listHead);
     for (int i = 0; i < ITEM_LIST_MAX_OBJECTS && IsValidRdramPointer(current); i++)
     {
@@ -277,7 +305,7 @@ uint32_t ResolvePlayerStruct(uint32_t matchInfoPtr, int port)
 // draws at the same points given the same seed and inputs) - it does NOT
 // make a `.rmgr` file's *recorded* state fields independently reproducible
 // without re-simulating.
-constexpr uint32_t ADDR_RNG_SEED = 0x8003b940;
+// RegionAddrs::rngSeed
 
 // Remix settings (Toggles.asm). Every setting - gameplay, stage, music,
 // etc. - is one instance of the same struct; the address below is already
@@ -335,9 +363,23 @@ constexpr uint32_t ADDR_REMIX_YOSHI_ISLAND_CLOUD_ANIMS = 0x80467060;
 
 namespace ReplayMemory
 {
+namespace
+{
+}
+
+void SetRomVariant(RomVariant variant)
+{
+    s_RomVariantInternal = variant;
+}
+
+RomVariant GetRomVariant(void)
+{
+    return s_RomVariantInternal;
+}
+
 bool IsInVsMatchScreen(void)
 {
-    return m64p::Core.DebugMemRead8(ADDR_CURRENT_SCREEN) == 0x16;
+    return m64p::Core.DebugMemRead8(Addrs().currentScreen) == 0x16;
 }
 
 // See ADDR_SALTY_RUNBACK's own doc comment for what this flag is. Callers
@@ -354,6 +396,11 @@ bool IsInVsMatchScreen(void)
 // would have no way to distinguish from "still the first runback".
 bool IsSaltyRunbackActive(void)
 {
+    // Remix-only; the address is outside RDRAM on vanilla/19XXTE.
+    if (s_RomVariantInternal != RomVariant::Remix)
+    {
+        return false;
+    }
     return m64p::Core.DebugMemRead32(ADDR_SALTY_RUNBACK) != 0;
 }
 
@@ -362,7 +409,7 @@ MatchInfo ReadMatchInfo(void)
     MatchInfo info{};
     info.valid = false;
 
-    uint32_t matchInfoPtr = m64p::Core.DebugMemRead32(ADDR_MATCH_INFO_PTR);
+    uint32_t matchInfoPtr = m64p::Core.DebugMemRead32(Addrs().matchInfoPtr);
     if (!IsValidRdramPointer(matchInfoPtr))
     {
         return info;
@@ -378,10 +425,10 @@ MatchInfo ReadMatchInfo(void)
     info.damageRatio         = m64p::Core.DebugMemRead8(matchInfoPtr + MI_DAMAGE_RATIO);
     info.itemFrequency       = m64p::Core.DebugMemRead8(matchInfoPtr + MI_ITEM_FREQUENCY);
     info.gameStatus          = m64p::Core.DebugMemRead8(matchInfoPtr + MI_GAME_STATUS);
-    info.matchWasReset       = m64p::Core.DebugMemRead8(ADDR_MATCH_RESET_FLAG) != 0;
+    info.matchWasReset       = m64p::Core.DebugMemRead8(Addrs().matchResetFlag) != 0;
     info.teamsEnabled        = m64p::Core.DebugMemRead8(matchInfoPtr + MI_TEAMS_ENABLED) != 0;
     info.handicapMode        = m64p::Core.DebugMemRead8(matchInfoPtr + MI_HANDICAP_MODE);
-    info.rngSeed             = static_cast<int32_t>(m64p::Core.DebugMemRead32(ADDR_RNG_SEED));
+    info.rngSeed             = static_cast<int32_t>(m64p::Core.DebugMemRead32(Addrs().rngSeed));
     return info;
 }
 
@@ -529,14 +576,14 @@ StageHazards ReadStageHazards(uint8_t stageId)
     if (stageId == STAGE_ID_DREAM_LAND)
     {
         hazards.whispyBlowing =
-            m64p::Core.DebugMemRead8(ADDR_PUPUPU_WHISPY_STATUS) == WHISPY_STATUS_BLOW;
+            m64p::Core.DebugMemRead8(Addrs().whispyStatus) == WHISPY_STATUS_BLOW;
         // Read unconditionally (cheap, single byte) even when not currently
         // blowing - the engine holds the last-decided direction steady
         // between blows too (see ram-map.md section 10.3.1), harmless to
         // read regardless; only meaningful to a caller when whispyBlowing
         // is true.
         hazards.whispyBlowingRight =
-            m64p::Core.DebugMemRead8(ADDR_PUPUPU_WHISPY_LR) != 0;
+            m64p::Core.DebugMemRead8(Addrs().whispyLr) != 0;
     }
     return hazards;
 }
@@ -544,6 +591,10 @@ StageHazards ReadStageHazards(uint8_t stageId)
 RemixSettings ReadRemixSettings(void)
 {
     RemixSettings settings{};
+    if (s_RomVariantInternal != RomVariant::Remix)
+    {
+        return settings;
+    }
     settings.hitstun             = static_cast<uint8_t>(m64p::Core.DebugMemRead32(ADDR_REMIX_HITSTUN));
     settings.hitlag              = static_cast<uint8_t>(m64p::Core.DebugMemRead32(ADDR_REMIX_HITLAG));
     settings.di                  = static_cast<uint8_t>(m64p::Core.DebugMemRead32(ADDR_REMIX_DI));
