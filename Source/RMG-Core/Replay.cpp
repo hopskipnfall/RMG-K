@@ -14,6 +14,7 @@
 #include "File.hpp"
 #include "Library.hpp"
 #include "RomSettings.hpp"
+#include "RomHeader.hpp"
 #ifdef RMGK_HAVE_P2P_TRANSPORT
 #include "kailleraclient.h"
 #endif
@@ -417,10 +418,42 @@ constexpr const char* kSmash64Family      = "smash64";
 //       section 5.1.
 constexpr uint32_t kRecorderSchemaVersion = 3;
 
-// Whether the currently-loaded ROM is a recognized smash64-family build.
-// Only Smash Remix 2.0.1 is recognized today - see kSmashRemixGoodName's
-// doc comment. Returns "" (not recognized - the recording, if any, stays
-// core-only) or kSmash64Family.
+// Canonical goodNames written to the header for the non-Remix builds. Unlike
+// Remix these are NOT taken from the mupen64plus ROM database: a hack like
+// 19XXTE is absent from it (its GoodName would be filename-derived), and
+// vanilla's database name is a No-Intro-style string that varies by ini
+// version. Recognition for these two is by internal header name + CRC instead.
+constexpr const char* kVanillaUSGoodName = "Smash64US";
+constexpr const char* kTE16GoodName      = "19XXTE1.6";
+constexpr const char* kVanillaJPGoodName = "Smash64JP";
+constexpr const char* kTE16JPGoodName    = "19XXTEJP1.6";
+
+struct RomIdentity
+{
+    ReplayMemory::RomVariant variant = ReplayMemory::RomVariant::Unknown;
+    std::string              goodName;
+    uint32_t                 schemaVersion = 0;
+};
+
+uint32_t ByteSwap32(uint32_t v)
+{
+    return ((v & 0xFFu) << 24) | ((v & 0xFF00u) << 8) | ((v >> 8) & 0xFF00u) | (v >> 24);
+}
+
+// CRC1/CRC2 match, in either byte order (the header may be exposed raw or
+// already swapped depending on the path it came through).
+bool CrcMatches(const CoreRomHeader& header, uint32_t crc1, uint32_t crc2)
+{
+    return (header.CRC1 == crc1 && header.CRC2 == crc2) ||
+           (header.CRC1 == ByteSwap32(crc1) && header.CRC2 == ByteSwap32(crc2));
+}
+
+// Whether the currently-loaded ROM is a recognized smash64-family build, and
+// which. Remix is matched by GoodName (see kSmashRemixGoodName); vanilla US
+// and 19XXTE 1.6 by internal header name + CRC1/CRC2 (docs: smashremix
+// ram-map-vanilla-us.md / ram-map-19xxte-1.6.md section 1). CRC alone can't
+// separate 19XXTE from its sibling builds (e.g. G6), hence the name check.
+// An unrecognized ROM gets variant Unknown (core-only recording).
 //
 // NOTE: this only decides whether the smash64 EXTENSION layer gets written.
 // The recording *trigger* itself (OnFrame()'s state machine below) still
@@ -433,13 +466,54 @@ constexpr uint32_t kRecorderSchemaVersion = 3;
 // yet even though the wire format (docs/RMGR_SPEC.md section 2.1) already
 // supports it - a real gap to close in a follow-up, not something this pass
 // claims to have finished.
-std::string DetermineGameFamily(const CoreRomSettings& romSettings)
+RomIdentity DetermineRomIdentity(const CoreRomSettings& romSettings)
 {
+    RomIdentity id;
     if (romSettings.GoodName == kSmashRemixGoodName)
     {
-        return kSmash64Family;
+        id.variant       = ReplayMemory::RomVariant::Remix;
+        id.goodName      = romSettings.GoodName;
+        id.schemaVersion = kRecorderSchemaVersion;
+        return id;
     }
-    return "";
+
+    CoreRomHeader header;
+    if (!CoreGetCurrentRomHeader(header))
+    {
+        return id;
+    }
+
+    std::string name = header.Name;
+    while (!name.empty() && name.back() == ' ')
+    {
+        name.pop_back();
+    }
+
+    if (name == "SMASH BROTHERS" && CrcMatches(header, 0x916B8B5B, 0x780B85A4))
+    {
+        id.variant       = ReplayMemory::RomVariant::VanillaUS;
+        id.goodName      = kVanillaUSGoodName;
+        id.schemaVersion = 1;
+    }
+    else if (name == "SMASH BROTHERS" && CrcMatches(header, 0x67D20729, 0xF696774C))
+    {
+        id.variant       = ReplayMemory::RomVariant::VanillaJP;
+        id.goodName      = kVanillaJPGoodName;
+        id.schemaVersion = 1;
+    }
+    else if (name == "19XXTEJ 1.6" && CrcMatches(header, 0x05C898D6, 0x00E56C73))
+    {
+        id.variant       = ReplayMemory::RomVariant::TE16JP;
+        id.goodName      = kTE16JPGoodName;
+        id.schemaVersion = 1;
+    }
+    else if (name == "19XXTE 1.6" && CrcMatches(header, 0x50BB7AAB, 0x79719420))
+    {
+        id.variant       = ReplayMemory::RomVariant::TE16;
+        id.goodName      = kTE16GoodName;
+        id.schemaVersion = 1;
+    }
+    return id;
 }
 
 // Copies as much of `s` as fits into `dest` (size `destSize`), NUL-padding
@@ -668,6 +742,16 @@ bool OpenNewFile(const ReplayMemory::MatchInfo& matchInfo)
     const time_t now = static_cast<time_t>(nowEpochMillis / 1000);
 
     const std::array<std::string, 4> playerNames = ResolvePlayerNames();
+    {
+        // Diagnostic: lets a "wrong/missing player names in this .rmgr" report
+        // be traced to what the recorder actually saw at match start.
+        std::string namesLog = "Replay: player names at match start:";
+        for (int i = 0; i < 4; i++)
+        {
+            namesLog += " [" + std::to_string(i + 1) + "]='" + playerNames[i] + "'";
+        }
+        CoreAddCallbackMessage(CoreDebugMessageType::Info, namesLog);
+    }
 
     std::filesystem::path path;
     if (s_HasOutputPathOverride)
@@ -738,15 +822,18 @@ bool OpenNewFile(const ReplayMemory::MatchInfo& matchInfo)
     // loaded ROM can't change mid-session.
     CoreRomSettings romSettings;
     CoreGetCurrentRomSettings(romSettings);
-    const std::string gameFamily = DetermineGameFamily(romSettings);
-    s_FamilyRecognized = !gameFamily.empty();
+    const RomIdentity identity = DetermineRomIdentity(romSettings);
+    ReplayMemory::SetRomVariant(identity.variant);
+    s_FamilyRecognized = identity.variant != ReplayMemory::RomVariant::Unknown;
+    const std::string gameFamily = s_FamilyRecognized ? kSmash64Family : "";
+    const std::string goodName   = s_FamilyRecognized ? identity.goodName : romSettings.GoodName;
 
     s_PendingHeader = FileHeader{};
     std::memcpy(s_PendingHeader.magic, "RMGR", 4);
     s_PendingHeader.version = 5;
     WriteFixedString(s_PendingHeader.gameFamily, sizeof(s_PendingHeader.gameFamily), gameFamily);
-    WriteFixedString(s_PendingHeader.goodName, sizeof(s_PendingHeader.goodName), romSettings.GoodName);
-    s_PendingHeader.recorderSchemaVersion = s_FamilyRecognized ? kRecorderSchemaVersion : 0;
+    WriteFixedString(s_PendingHeader.goodName, sizeof(s_PendingHeader.goodName), goodName);
+    s_PendingHeader.recorderSchemaVersion = identity.schemaVersion;
     s_PendingHeader.recordedAtEpochMillis = nowEpochMillis;
     // uncompressedLength/compressedLength are filled in by FinalizeFile()
     // once the whole match's events are known.
@@ -1058,15 +1145,24 @@ CORE_EXPORT void OnEmulationStart(void)
     }
 
     // NOTE: this is a coarser gate than the format itself supports - see
-    // DetermineGameFamily()'s doc comment for why core-only recording of an
+    // DetermineRomIdentity()'s doc comment for why core-only recording of an
     // unrecognized game isn't actually reachable yet (the recording
     // trigger below is itself a Smash-specific memory read). Once that gap
     // is closed, this early-out should only skip the extension layer, not
     // recording entirely.
     if (enabled)
     {
+        // The variant must be set here, not just in OpenNewFile(): the
+        // waiting-for-match poll reads region-dependent addresses (current
+        // screen, match info pointer) long before any file is opened.
         CoreRomSettings romSettings;
-        if (!CoreGetCurrentRomSettings(romSettings) || DetermineGameFamily(romSettings).empty())
+        ReplayMemory::RomVariant variant = ReplayMemory::RomVariant::Unknown;
+        if (CoreGetCurrentRomSettings(romSettings))
+        {
+            variant = DetermineRomIdentity(romSettings).variant;
+        }
+        ReplayMemory::SetRomVariant(variant);
+        if (variant == ReplayMemory::RomVariant::Unknown)
         {
             CoreAddCallbackMessage(CoreDebugMessageType::Info,
                 "Replay: enabled, but the loaded ROM isn't a recognized game - not recording");
