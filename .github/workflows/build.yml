@@ -206,7 +206,7 @@ jobs:
   build-windows7:
     runs-on: windows-2025
     env:
-      QT_VERSION: 6.8.4
+      QT_VERSION: 6.8.3
       QT_PREFIX: C:/Qt6-win7
       SDL_VERSION: release-3.2.28
       WIN7_FLAGS: -D_WIN32_WINNT=0x0601 -DWINVER=0x0601 -DNTDDI_VERSION=0x06010000
