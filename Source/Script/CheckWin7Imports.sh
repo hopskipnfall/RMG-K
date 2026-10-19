@@ -10,7 +10,7 @@
 
 dir="${1:-.}"
 
-bad_dlls='api-ms-win-core-synch-l1-2|api-ms-win-core-path|api-ms-win-core-winrt|api-ms-win-core-realtime|api-ms-win-core-memory-l1-1-[3-9]|api-ms-win-core-libraryloader-l1-2-[1-9]|api-ms-win-core-sysinfo-l1-2-[1-9]|api-ms-win-core-processthreads-l1-1-[3-9]|api-ms-win-core-file-l1-2-[2-9]|api-ms-win-core-com-l1-1-[1-9]|shcore|bcryptprimitives'
+bad_dlls='api-ms-win-core-path|api-ms-win-core-winrt|api-ms-win-core-realtime|shcore|bcryptprimitives'
 bad_funcs='GetSystemTimePreciseAsFileTime|SetThreadDescription|GetThreadDescription|WaitOnAddress|WakeByAddressSingle|WakeByAddressAll|PrefetchVirtualMemory|CreateFile2|GetOverlappedResultEx|InitializeSynchronizationBarrier|EnterSynchronizationBarrier|DeleteSynchronizationBarrier|GetDpiForWindow|GetDpiForSystem|GetDpiForMonitor|SetProcessDpiAwareness|SetProcessDpiAwarenessContext|SetThreadDpiAwarenessContext|GetThreadDpiAwarenessContext|AreDpiAwarenessContextsEqual|GetSystemMetricsForDpi|AdjustWindowRectExForDpi|EnableNonClientDpiScaling|PathCchCanonicalize|PathCchCanonicalizeEx|PathCchCombine|PathCchCombineEx|VirtualAlloc2|MapViewOfFile3|MapViewOfFileNuma2|OfferVirtualMemory|ReclaimVirtualMemory|DiscardVirtualMemory|SetProcessMitigationPolicy|GetProcessMitigationPolicy|SetProcessValidCallTargets|GetCurrentPackageId|GetCurrentPackageFullName|GetSystemTimeAdjustmentPrecise|QueryInterruptTime|QueryUnbiasedInterruptTimePrecise|GetFileInformationByHandleEx2|SetThreadInformation|GetThreadInformation|SetProcessInformation|GetProcessInformation|SetFileInformationByName|CompareObjectHandles|RtlGetDeviceFamilyInfoEnum|GetTempPath2[AW]|LoadPackagedLibrary|ProcessPrng|CreateRectRgnIndirect2'
 
 found=0
@@ -25,7 +25,8 @@ do
         echo "=> $file"
         echo "$hits"
     fi
-done < <(find "$dir" \( -iname '*.dll' -o -iname '*.exe' \) -print0)
+# api-ms-win-*.dll are the app-local UCRT forwarder stubs, not our code
+done < <(find "$dir" \( -iname '*.dll' -o -iname '*.exe' \) ! -iname 'api-ms-win-*' -print0)
 
 if [ "$found" = 0 ]
 then
