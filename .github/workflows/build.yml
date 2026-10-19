@@ -253,15 +253,15 @@ jobs:
           $env:revision = git describe --tags --always
           echo "GIT_REVISION=$env:revision" >> $env:GITHUB_ENV
         shell: pwsh
-      - name: Build SDL3 (Windows 7 target)
+      - name: Build SDL3
         shell: msys2 {0}
         run: |
+          # SDL3 needs the Windows 8+ headers to compile (Gaming Input etc.) but
+          # loads those APIs at runtime, so it is built with default flags.
           git clone https://github.com/libsdl-org/SDL.git ../SDL3 -b "$SDL_VERSION" --depth=1
           cmake -S ../SDL3 -B ../SDL3/build -G Ninja \
                 -DCMAKE_BUILD_TYPE=Release \
                 -DCMAKE_INSTALL_PREFIX="$(cygpath -m /ucrt64)" \
-                -DCMAKE_C_FLAGS="$WIN7_FLAGS" \
-                -DCMAKE_CXX_FLAGS="$WIN7_FLAGS" \
                 -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF -DSDL_INSTALL_TESTS=OFF
           cmake --build ../SDL3/build --parallel "$(nproc)"
           cmake --install ../SDL3/build
