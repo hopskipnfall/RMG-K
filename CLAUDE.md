@@ -268,4 +268,4 @@ Bin/Release/          # Build output (portable mode)
 4. **N-Rage Input Compatibility**: Per-axis scaling and deadzone matching N-Rage plugin
 5. **USBtoN64v2 Adapter Support**: Compatible with popular USB-to-N64 hardware adapters
 6. **VidExt Override**: Custom Qt-based rendering instead of SDL windows
-7. **Replay File Recording**: Records per-frame inputs and game state (Smash Remix only, currently) to a `.rmgr` file, independent of `.krec`. See `Source/RMG-Core/Replay.cpp`/`ReplayMemory.cpp`, `docs/RMGR_SPEC.md`, and the `GAME_STATS` build option above.
+7. **Replay File Recording**: Records per-frame inputs and game state (Smash Remix, vanilla Smash 64 US/JP, and 19XXTE 1.6 US/JP) to a `.rmgr` file, independent of `.krec`. See `Source/RMG-Core/Replay.cpp`/`ReplayMemory.cpp`, `docs/RMGR_SPEC.md`, and the `GAME_STATS` build option above.

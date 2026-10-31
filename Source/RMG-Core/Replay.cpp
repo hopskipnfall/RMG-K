@@ -435,17 +435,14 @@ struct RomIdentity
     uint32_t                 schemaVersion = 0;
 };
 
-uint32_t ByteSwap32(uint32_t v)
-{
-    return ((v & 0xFFu) << 24) | ((v & 0xFF00u) << 8) | ((v >> 8) & 0xFF00u) | (v >> 24);
-}
+// The ROM identity for the current session, resolved once in OnEmulationStart().
+RomIdentity s_Identity;
 
-// CRC1/CRC2 match, in either byte order (the header may be exposed raw or
-// already swapped depending on the path it came through).
+// CoreGetCurrentRomHeader() already normalizes CRC1/CRC2 (ntohl in
+// RomHeader.cpp), so these compare against the familiar header values.
 bool CrcMatches(const CoreRomHeader& header, uint32_t crc1, uint32_t crc2)
 {
-    return (header.CRC1 == crc1 && header.CRC2 == crc2) ||
-           (header.CRC1 == ByteSwap32(crc1) && header.CRC2 == ByteSwap32(crc2));
+    return header.CRC1 == crc1 && header.CRC2 == crc2;
 }
 
 // Whether the currently-loaded ROM is a recognized smash64-family build, and
@@ -742,16 +739,6 @@ bool OpenNewFile(const ReplayMemory::MatchInfo& matchInfo)
     const time_t now = static_cast<time_t>(nowEpochMillis / 1000);
 
     const std::array<std::string, 4> playerNames = ResolvePlayerNames();
-    {
-        // Diagnostic: lets a "wrong/missing player names in this .rmgr" report
-        // be traced to what the recorder actually saw at match start.
-        std::string namesLog = "Replay: player names at match start:";
-        for (int i = 0; i < 4; i++)
-        {
-            namesLog += " [" + std::to_string(i + 1) + "]='" + playerNames[i] + "'";
-        }
-        CoreAddCallbackMessage(CoreDebugMessageType::Info, namesLog);
-    }
 
     std::filesystem::path path;
     if (s_HasOutputPathOverride)
@@ -817,13 +804,12 @@ bool OpenNewFile(const ReplayMemory::MatchInfo& matchInfo)
     s_PendingOutputPath = path;
 
     // Reaching here already implies replay recording is enabled (see
-    // OnEmulationStart()) - this is just re-fetching the loaded ROM's
-    // identity to decide whether the smash64 extension layer applies. The
-    // loaded ROM can't change mid-session.
+    // OnEmulationStart(), which resolved s_Identity once for the session -
+    // the loaded ROM can't change mid-session). GoodName is only needed for
+    // the unrecognized-ROM fallback below.
     CoreRomSettings romSettings;
     CoreGetCurrentRomSettings(romSettings);
-    const RomIdentity identity = DetermineRomIdentity(romSettings);
-    ReplayMemory::SetRomVariant(identity.variant);
+    const RomIdentity& identity = s_Identity;
     s_FamilyRecognized = identity.variant != ReplayMemory::RomVariant::Unknown;
     const std::string gameFamily = s_FamilyRecognized ? kSmash64Family : "";
     const std::string goodName   = s_FamilyRecognized ? identity.goodName : romSettings.GoodName;
@@ -1152,17 +1138,18 @@ CORE_EXPORT void OnEmulationStart(void)
     // recording entirely.
     if (enabled)
     {
-        // The variant must be set here, not just in OpenNewFile(): the
+        // Resolved here, once per session, and the variant pushed to
+        // ReplayMemory now rather than at the first OpenNewFile(): the
         // waiting-for-match poll reads region-dependent addresses (current
         // screen, match info pointer) long before any file is opened.
         CoreRomSettings romSettings;
-        ReplayMemory::RomVariant variant = ReplayMemory::RomVariant::Unknown;
+        s_Identity = RomIdentity{};
         if (CoreGetCurrentRomSettings(romSettings))
         {
-            variant = DetermineRomIdentity(romSettings).variant;
+            s_Identity = DetermineRomIdentity(romSettings);
         }
-        ReplayMemory::SetRomVariant(variant);
-        if (variant == ReplayMemory::RomVariant::Unknown)
+        ReplayMemory::SetRomVariant(s_Identity.variant);
+        if (s_Identity.variant == ReplayMemory::RomVariant::Unknown)
         {
             CoreAddCallbackMessage(CoreDebugMessageType::Info,
                 "Replay: enabled, but the loaded ROM isn't a recognized game - not recording");
@@ -1219,6 +1206,9 @@ CORE_EXPORT void OnEmulationStop(void)
         FinalizeFile(0 /* aborted: emulation stopped mid-match */, matchInfo);
     }
     s_State = State::Idle;
+    // After FinalizeFile(), which still reads region-dependent addresses.
+    ReplayMemory::SetRomVariant(ReplayMemory::RomVariant::Unknown);
+    s_Identity = RomIdentity{};
 
     // Both overrides apply for the whole session that just ended - every
     // OpenNewFile() call in between reused them (see SetOutputPathOverride/
