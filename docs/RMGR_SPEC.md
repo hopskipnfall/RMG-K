@@ -21,6 +21,38 @@ container format itself hasn't changed, only this event's per-`goodName`
 memory-layout schema, the same mechanism already used for schema `2`'s
 `StateFrame`/`ItemUpdate` additions (§5.2/§5.3).
 
+**Vanilla and 19XXTE support.** The recorder also recognizes Super Smash
+Bros. (U) v1.0 (`goodName == "Smash64US"`) and 19XXTE 1.6 (`goodName ==
+"19XXTE1.6"`), both `gameFamily = "smash64"`, each on its own **recorder
+schema `1`** (§3.2). Recognition is by ROM header name + CRC1/CRC2, not the
+mupen64plus database. All addresses and struct offsets the recorder reads
+are identical to Remix's, with these differences for these two goodNames:
+
+- `MatchSettings` is the same size, but the 39 Remix `Toggles.asm` fields are
+  always `0` (the settings don't exist; a `0` there means "not applicable").
+- Salty Runback does not exist, so a match only ends via `game_status == 5`.
+- `gameType` is the raw byte (vanilla stock-only is `2`, not Remix's forced
+  `3`); don't infer stock mode from it.
+- Combo fields keep the same addresses but use vanilla combo rules (no
+  `Combo.asm` chain extension). Character IDs are `0x00`-`0x1B`, stage IDs
+  `0x00`-`0x10`. On 19XXTE, stage `0x0E` is labeled "Battlefield" (Duel Zone
+  in vanilla).
+- 19XXTE's handicap hook (starting stocks = handicap - 1) and its
+  `Stages.frozen_mode` flag (`0x8038D7A8`) are not recorded yet.
+
+The Japanese releases are recognized the same way: vanilla JP (`NALJ`,
+`goodName == "Smash64JP"`) and 19XXTE-JP 1.6 (`goodName == "19XXTEJP1.6"`,
+built from 19XX `master`, which upstream calls not fully tested), each
+schema `1`. Seven absolute addresses (screen, reset flag, match info
+pointer, RNG seed, GObj link table, Whispy) differ from US; all offsets
+are identical. JP gameplay constants differ from US by design (e.g. reflect
+multiplier 1.5 vs 1.8), so the `goodName` is what tells a reader which rule
+set the match was played under.
+
+None of this has been validated against a live emulator run - it is derived
+from the decomp and the 19XX source (smashremix `docs/ram-map-vanilla-us.md`,
+`docs/ram-map-19xxte-1.6.md`).
+
 ## 1. Overview
 
 A `.rmgr` file is a self-contained binary recording of one N64 match. It
