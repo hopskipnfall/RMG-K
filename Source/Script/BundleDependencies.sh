@@ -6,6 +6,8 @@
 exe="$1"
 bin_dir="$2"
 path="/${MSYSTEM,,}/bin"
+# Qt tools can come from a custom Qt prefix (Windows 7 build)
+qt_bin="${RMG_QT_BIN:-$path}"
 
 function copyForOBJ() {
     local deps=`objdump.exe -p "$1" | grep 'DLL Name:' | sed -e "s/\t*DLL Name: //g"`
@@ -35,11 +37,14 @@ do
 	copyForOBJ "$file"
 done
 
-"$path/windeployqt6" --exclude-plugins qpdf,qwebp,qgif,qtga,qtuiotouchplugin,qglib,qtiff,qmng,qwbmp \
+"$qt_bin/windeployqt6" --exclude-plugins qpdf,qwebp,qgif,qtga,qtuiotouchplugin,qglib,qtiff,qmng,qwbmp \
 				--no-translations "$exe"
 
 qtpaths=""
-if command -v qtpaths6 >/dev/null 2>&1
+if [ -x "$qt_bin/qtpaths6" ]
+then
+    qtpaths="$qt_bin/qtpaths6"
+elif command -v qtpaths6 >/dev/null 2>&1
 then
     qtpaths="$(command -v qtpaths6)"
 elif command -v qtpaths >/dev/null 2>&1
