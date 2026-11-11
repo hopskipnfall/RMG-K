@@ -9,6 +9,8 @@
  */
 #include "Replay.hpp"
 #include "ReplayMemory.hpp"
+#include "ReplayEvents.hpp"
+#include "ReplayEventBuilder.hpp"
 #include "Settings.hpp"
 #include "Callback.hpp"
 #include "File.hpp"
@@ -37,6 +39,8 @@
 
 namespace
 {
+using namespace ReplayEvents;
+
 #pragma pack(push, 1)
 
 // v5, ground-up rewrite - see docs/RMGR_SPEC.md. Breaking change from
@@ -77,230 +81,6 @@ struct FileHeader
 };
 static_assert(sizeof(FileHeader) == 108, "FileHeader must be 108 bytes");
 
-enum class EventCode : uint8_t
-{
-    EventPayloads = 0x01,
-    // Core (always present, any recognized-or-not N64 ROM):
-    MatchStart = 0x02,
-    InputFrame = 0x03,
-    MatchEnd   = 0x05,
-    // smash64 game-family extension (present only when gameFamily ==
-    // "smash64" - see IsSmash64() below):
-    StateFrame        = 0x04,
-    ItemUpdate        = 0x06,
-    StageHazardUpdate = 0x07,
-    MatchSettings     = 0x08,
-    MatchResult       = 0x09,
-};
-
-// Core event, code 0x02. Written exactly once, immediately after
-// EventPayloads. Player display names are sourced from netplay room
-// metadata (RMG-K's own slot-indexed name table), never from any in-game
-// name tag - for an offline match, or a port with no assigned name, the
-// corresponding playerNames entry is all zero bytes. Game-family-specific
-// match settings (stage, character, stock count, damage ratio, items,
-// teams, handicap, CPU difficulty, ...) are NOT part of this event - see
-// MatchSettingsEvent below.
-struct MatchStartEvent
-{
-    char    playerNames[4][32]; // NUL-padded; not necessarily NUL-terminated if it fills the field. UTF-8.
-    uint8_t slotType[4];        // 0 human, 1 CPU, 2 empty - per port 0-3
-};
-static_assert(sizeof(MatchStartEvent) == 132, "MatchStartEvent must be 132 bytes");
-
-// Core event, code 0x03. Input-side data, captured before the game
-// processes that frame's inputs. One event per seated port per frame. Uses
-// the game's already-processed button/stick values, the one input
-// representation available uniformly for both human and CPU-controlled
-// ports.
-struct InputFrameEvent
-{
-    int32_t  frame;
-    uint8_t  port;
-    uint16_t buttons;
-    int8_t   stickX;
-    int8_t   stickY;
-};
-static_assert(sizeof(InputFrameEvent) == 9, "InputFrameEvent must be 9 bytes");
-
-// Core event, code 0x05. Written exactly once, as the last event in the
-// stream. Final per-port results (e.g. smash64's stocks-remaining
-// placements) aren't a universal concept across N64 titles and are NOT part
-// of this event - see MatchResultEvent below.
-struct MatchEndEvent
-{
-    int32_t finalFrame; // last frame value seen in any InputFrame event this match
-    uint8_t endReason;  // 0 aborted (match-was-reset or process/emulation stopped mid-match), 1 normal end
-};
-static_assert(sizeof(MatchEndEvent) == 5, "MatchEndEvent must be 5 bytes");
-
-// smash64 extension event, code 0x08. Written exactly once, immediately
-// after MatchStart - the game-family-specific counterpart split out of what
-// used to be one combined GameStart event. Everything here is
-// Smash-specific and static for the whole match.
-struct MatchSettingsEvent
-{
-    uint8_t stageId;
-    uint8_t gameType;          // 1 time, 2 stock, 3 both (Remix always forces stock)
-    uint8_t stockCountSetting; // 0-based (i.e. 2 means "3 stocks")
-    uint8_t timeLimitMinutes;  // 100 = infinite
-    uint8_t damageRatio;       // 50 = 50%, 200 = 200%
-    uint8_t itemFrequency;     // 0 none .. 5 high
-    uint8_t teamsEnabled;      // 0 off, 1 on
-    uint8_t handicapMode;      // 0 off, 1 on, 2 auto
-    uint8_t characterId[4];    // per port 0-3
-    uint8_t costumeId[4];
-    uint8_t teamColor[4];
-    uint8_t portTeam[4];       // team number per port
-    uint8_t portHandicap[4];   // meaningful only when handicapMode != 0
-    uint8_t portCpuLevel[4];   // meaningless for a human port
-    // Added in recorder schema 3 (kRecorderSchemaVersion above) - see
-    // docs/RMGR_SPEC.md for what every value below means (enum lookup
-    // tables); this struct only documents shape, not semantics, to avoid
-    // keeping two copies of the same table.
-    int32_t rngSeed; // sSYUtilsRandomSeed at match start - see ReplayMemory::MatchInfo::rngSeed
-    // Gameplay Settings (31, Remix Toggles.asm)
-    uint8_t hitstun;
-    uint8_t hitlag;
-    uint8_t di;
-    uint8_t japaneseSounds;
-    uint8_t japaneseStunSleep;
-    uint8_t momentumSlide;
-    uint8_t shieldStun;
-    uint8_t zCancel;
-    uint8_t punishFailedZCancel;
-    uint8_t improvedAI;
-    uint8_t tripping;
-    uint8_t rage;
-    uint8_t footstoolJumping;
-    uint8_t airDodging;
-    uint8_t jabLocking;
-    uint8_t edgeCJumping;
-    uint8_t perfectShielding;
-    uint8_t parrying;
-    uint8_t spotDodging;
-    uint8_t fastFallAerials;
-    uint8_t ledgeTrumping;
-    uint8_t wallTeching;
-    uint8_t chargeSmashes;
-    uint8_t itemContainers;
-    uint8_t gameSpeed;
-    uint8_t specialZoom;
-    uint8_t blastzoneWarp;
-    uint8_t singleButtonMode;
-    uint8_t allItemsRDropAerial;
-    uint8_t moveStaling;
-    uint8_t stopwatchItem;
-    // Stage Settings (8, Remix Toggles.asm)
-    uint8_t stageSelectLayout;
-    uint8_t hazardMode;
-    uint8_t whispyMode;
-    uint8_t saffronPokemonRate;
-    uint8_t pokemonAnnouncer;
-    uint8_t dragonKingHUD;
-    uint8_t cameraMode;
-    uint8_t yoshiIslandCloudAnims;
-};
-static_assert(sizeof(MatchSettingsEvent) == 75, "MatchSettingsEvent must be 75 bytes");
-
-// smash64 extension event, code 0x04. State-side data, captured after that
-// frame's physics/collision resolution - the resulting state. One event per
-// seated port per frame, always immediately following that port's
-// InputFrame in the stream.
-struct StateFrameEvent
-{
-    int32_t  frame; // same frame counter as the paired InputFrame
-    uint8_t  port;
-    uint8_t  characterId;
-    uint16_t actionStateId;
-    float    positionX;
-    float    positionY;
-    int32_t  facingDirection; // 1 right, -1 left
-    float    velocityX;
-    float    velocityY;
-    uint32_t damagePercent;
-    int8_t   stocksRemaining; // 0-based; negative once eliminated
-    // jumpsMax (per-character, from FTAttributes) minus jumps_used
-    // (playerStruct+0x148, a u8 that resets to 0 on landing). 0 through
-    // most of a grounded match is normal; Remix can also force this to 0
-    // without that many real jump inputs (e.g. certain up-specials).
-    uint8_t  jumpsRemaining;
-    uint8_t  groundedState; // 0 grounded, 1 airborne
-    uint8_t  hurtboxState;  // motion-script GMHitStatus: 0 off, 1 normal, 2 invincible, 3 intangible
-    uint16_t hitstunCounter;
-    uint32_t actionFrameCounter;
-    // Native engine combo tracking, not mod-added. Belongs to the victim
-    // (this port), not the attacker: hits taken in the current unbroken
-    // chain. 0 = no active chain, 1 = a single hit, 2+ = an actual combo.
-    // Both zero the instant the chain breaks.
-    uint32_t comboHitCount;
-    uint32_t comboDamage;
-    // Appended in recorder schema 2 (docs/RMGR_SPEC.md sections 5.2 and 6);
-    // schema-1 files' StateFrame ends after comboDamage. scaleX/scaleY: the
-    // fighter's render scale (root joint DObj scale); characterSpecific:
-    // Samus/DK charge level or Kirby's copied fighter (see ReplayMemory.cpp's
-    // PS_PASSIVE_VAR).
-    float    scaleX;
-    float    scaleY;
-    int32_t  characterSpecific;
-    // Also schema 2: shield health, the timed hit status (GMHitStatus -
-    // respawn invincibility etc., separate from hurtboxState's motion-script
-    // one), and temporary knockback armor (Yoshi's double jump).
-    int32_t  shieldHealth;
-    uint8_t  specialHitStatus;
-    float    knockbackResist;
-};
-static_assert(sizeof(StateFrameEvent) == 71, "StateFrameEvent must be 71 bytes");
-
-// smash64 extension event, code 0x06. Zero or more per frame - one per live
-// Item or Weapon GObj (ReplayMemory::ItemObject) currently not held by a
-// fighter, following that frame's InputFrame/StateFrame pairs. "Weapon" is
-// a free-flying character special-move projectile (boomerang, fireball,
-// ...); "Item" covers thrown/spawned items and hazard objects, including
-// some fighter-held things like Link's pulled bomb.
-struct ItemUpdateEvent
-{
-    int32_t  frame;         // same numbering as InputFrame/StateFrame
-    uint32_t objectAddress; // the object's own RDRAM address - not a semantic spawn ID, see ReplayMemory::ItemObject
-    uint8_t  linkId;        // 4 = Item, 5 = Weapon - which enum `kind` below means (docs/RMGR_SPEC.md section 8.6)
-    int32_t  kind;          // ITKind (linkId == 4) or WPKind (linkId == 5)
-    float    positionX;
-    float    positionY;
-    float    positionZ;
-    // Appended in recorder schema 2 (docs/RMGR_SPEC.md sections 5.3 and 6) -
-    // the object's render scale (DObj scale x/y). Schema-1 files' ItemUpdate
-    // ends after positionZ; EventPayloads' declared size tells readers which.
-    float    scaleX;
-    float    scaleY;
-};
-static_assert(sizeof(ItemUpdateEvent) == 33, "ItemUpdateEvent must be 33 bytes");
-
-// smash64 extension event, code 0x07. Zero or one per frame, following that
-// frame's ItemUpdate events - written only when at least one tracked hazard
-// is currently active, same sparse convention as ItemUpdate. Currently
-// tracks exactly one hazard: Whispy Woods' wind on Dream Land.
-struct StageHazardUpdateEvent
-{
-    int32_t frame;
-    uint8_t hazardFlags; // bit 0 = Whispy Woods currently blowing (Dream Land only);
-                          // bit 1 = blowing direction (0 = left, 1 = right) -
-                          // only meaningful when bit 0 is set, and only ever
-                          // written alongside it (see below)
-};
-static_assert(sizeof(StageHazardUpdateEvent) == 5, "StageHazardUpdateEvent must be 5 bytes");
-
-constexpr uint8_t kHazardFlagWhispyBlowing      = 0x01;
-constexpr uint8_t kHazardFlagWhispyBlowingRight = 0x02;
-
-// smash64 extension event, code 0x09. Written exactly once, immediately
-// after the core MatchEnd event - the game-family-specific counterpart
-// split out of what used to be one combined GameEnd event, since "stocks
-// remaining" is a Smash concept, not a universal one.
-struct MatchResultEvent
-{
-    int8_t placements[4]; // final stocks remaining per port, -1 if never seated
-};
-static_assert(sizeof(MatchResultEvent) == 4, "MatchResultEvent must be 4 bytes");
 
 #pragma pack(pop)
 
@@ -379,43 +159,6 @@ bool                          s_HasRecordedAtBaseOverride = false;
 uint64_t                      s_RecordedAtBaseEpochSeconds = 0;
 Replay::FrameIndexProvider    s_RecordedAtFrameIndexProvider = nullptr;
 
-// This feature's memory offsets were only ever derived/verified against
-// Smash Remix 2.0.1 (see docs/RMGR_SPEC.md); recording its extension events
-// against any other ROM would pointer-chase addresses that mean nothing
-// there. GoodName comes from mupen64plus-core's own ROM database
-// (CoreRomSettings::GoodName, via CoreGetCurrentRomSettings()) - for a
-// ROM/hack absent from that database it degrades to a filename-derived
-// value, so this exact-match check can only ever be as reliable as that
-// database entry.
-constexpr const char* kSmashRemixGoodName = "SmashRemix2.0.1";
-constexpr const char* kSmash64Family      = "smash64";
-
-// Bump whenever this recorder's interpretation of a goodName's memory
-// layout changes in a way that affects what an smash64-family reader gets -
-// not just when a field is newly appended (which the per-event
-// EventPayloads declared-size mechanism, docs/RMGR_SPEC.md section 6,
-// already handles on its own), but also e.g. a bugfix to an existing
-// field's offset that silently changes recorded *values* without changing
-// any event's byte size. This is its own counter per goodName - see
-// docs/RMGR_SPEC.md section 3.2.
-//
-// Starts fresh at 1 for this container rewrite: every memory-offset fix
-// this recorder previously accumulated (schema 2 through 9 under the old,
-// unspecified container layout - see git history for that trail) is already
-// reflected as correct in ReplayMemory.cpp today. There's nothing left to
-// carry forward; the old numbering tracked a struct layout (GameStart/
-// PostFrameUpdate) that no longer exists.
-//
-// History (this container):
-//   1 - initial version.
-//   2 - ItemUpdate gains trailing scaleX/scaleY (render scale), and
-//       StateFrame gains trailing scaleX/scaleY/characterSpecific/
-//       shieldHealth/specialHitStatus/knockbackResist -
-//       docs/RMGR_SPEC.md sections 5.2 and 5.3.
-//   3 - MatchSettings gains trailing rngSeed plus 31 Gameplay Settings and
-//       8 Stage Settings from Remix's Toggles.asm - docs/RMGR_SPEC.md
-//       section 5.1.
-constexpr uint32_t kRecorderSchemaVersion = 3;
 
 // Whether the currently-loaded ROM is a recognized smash64-family build.
 // Only Smash Remix 2.0.1 is recognized today - see kSmashRemixGoodName's
@@ -440,87 +183,6 @@ std::string DetermineGameFamily(const CoreRomSettings& romSettings)
         return kSmash64Family;
     }
     return "";
-}
-
-// Copies as much of `s` as fits into `dest` (size `destSize`), NUL-padding
-// or truncating as needed - `dest` is assumed zero-initialized already, so
-// this only needs to write the bytes that actually fit.
-void WriteFixedString(char* dest, size_t destSize, const std::string& s)
-{
-    std::memcpy(dest, s.data(), std::min(s.size(), destSize));
-}
-
-// Appends raw bytes to the in-memory buffer for the match currently being
-// recorded - nothing touches disk until FinalizeFile() compresses and
-// writes the whole thing out at once. The one primitive WriteEvent() and
-// WriteEventPayloadsEvent() below both build on.
-void AppendBytes(const void* data, size_t size)
-{
-    const size_t offset = s_EventBuffer.size();
-    s_EventBuffer.resize(offset + size);
-    std::memcpy(s_EventBuffer.data() + offset, data, size);
-}
-
-template <typename T>
-void AppendValue(const T& value)
-{
-    AppendBytes(&value, sizeof(value));
-}
-
-// Appends one event (code byte + payload) to the buffer.
-template <typename T>
-void WriteEvent(EventCode code, const T& payload)
-{
-    AppendValue(static_cast<uint8_t>(code));
-    AppendValue(payload);
-}
-
-// The Event Payloads event (0x01) is always first: it declares the exact
-// payload size of every other event code THIS file uses, so a parser
-// reading an unfamiliar/old-version file can skip unknown or resized events
-// instead of breaking. Declares only the 3 core codes for a core-only
-// (unrecognized game) recording; declares all 8 for a smash64 recording -
-// see docs/RMGR_SPEC.md section 5.0.
-void WriteEventPayloadsEvent(bool familyRecognized)
-{
-    struct EventSize
-    {
-        EventCode code;
-        uint16_t  size;
-    };
-    static constexpr EventSize kCoreSizes[] = {
-        {EventCode::MatchStart, static_cast<uint16_t>(sizeof(MatchStartEvent))},
-        {EventCode::InputFrame, static_cast<uint16_t>(sizeof(InputFrameEvent))},
-        {EventCode::MatchEnd,   static_cast<uint16_t>(sizeof(MatchEndEvent))},
-    };
-    static constexpr EventSize kSmash64Sizes[] = {
-        {EventCode::StateFrame,        static_cast<uint16_t>(sizeof(StateFrameEvent))},
-        {EventCode::ItemUpdate,        static_cast<uint16_t>(sizeof(ItemUpdateEvent))},
-        {EventCode::StageHazardUpdate, static_cast<uint16_t>(sizeof(StageHazardUpdateEvent))},
-        {EventCode::MatchSettings,     static_cast<uint16_t>(sizeof(MatchSettingsEvent))},
-        {EventCode::MatchResult,       static_cast<uint16_t>(sizeof(MatchResultEvent))},
-    };
-    constexpr size_t kCoreCount    = sizeof(kCoreSizes) / sizeof(kCoreSizes[0]);
-    constexpr size_t kSmash64Count = sizeof(kSmash64Sizes) / sizeof(kSmash64Sizes[0]);
-
-    const uint8_t count = static_cast<uint8_t>(kCoreCount + (familyRecognized ? kSmash64Count : 0));
-    AppendValue(static_cast<uint8_t>(EventCode::EventPayloads));
-    AppendValue(count);
-
-    auto appendEntries = [](const EventSize* entries, size_t entryCount)
-    {
-        for (size_t i = 0; i < entryCount; i++)
-        {
-            AppendValue(static_cast<uint8_t>(entries[i].code));
-            AppendValue(entries[i].size);
-        }
-    };
-
-    appendEntries(kCoreSizes, kCoreCount);
-    if (familyRecognized)
-    {
-        appendEntries(kSmash64Sizes, kSmash64Count);
-    }
 }
 
 // zlib deflate, max compression level - see docs/RMGR_SPEC.md section 3.4.
@@ -751,97 +413,12 @@ bool OpenNewFile(const ReplayMemory::MatchInfo& matchInfo)
     // uncompressedLength/compressedLength are filled in by FinalizeFile()
     // once the whole match's events are known.
 
-    WriteEventPayloadsEvent(s_FamilyRecognized);
-
-    MatchStartEvent startEvent{};
-    for (int port = 0; port < 4; port++)
-    {
-        ReplayMemory::PortMatchInfo portInfo = ReplayMemory::ReadPortMatchInfo(matchInfo.matchInfoPtr, port);
-        startEvent.slotType[port] = portInfo.slotType;
-    }
-
-    for (int port = 0; port < 4; port++)
-    {
-        WriteFixedString(startEvent.playerNames[port], sizeof(startEvent.playerNames[port]), playerNames[port]);
-    }
-
-    WriteEvent(EventCode::MatchStart, startEvent);
+    ReplayEventBuilder::AppendEventPayloadsEvent(s_EventBuffer, s_FamilyRecognized);
+    ReplayEventBuilder::AppendMatchStart(s_EventBuffer, matchInfo, playerNames);
 
     if (s_FamilyRecognized)
     {
-        MatchSettingsEvent settingsEvent{};
-        settingsEvent.stageId           = matchInfo.stageId;
-        settingsEvent.gameType          = matchInfo.gameType;
-        settingsEvent.stockCountSetting = matchInfo.stockCountSetting;
-        settingsEvent.timeLimitMinutes  = matchInfo.timeLimitMinutes;
-        settingsEvent.damageRatio       = matchInfo.damageRatio;
-        settingsEvent.itemFrequency     = matchInfo.itemFrequency;
-        settingsEvent.teamsEnabled      = matchInfo.teamsEnabled ? 1 : 0;
-        settingsEvent.handicapMode      = matchInfo.handicapMode;
-        settingsEvent.rngSeed           = matchInfo.rngSeed;
-
-        ReplayMemory::RemixSettings remixSettings = ReplayMemory::ReadRemixSettings();
-        settingsEvent.hitstun               = remixSettings.hitstun;
-        settingsEvent.hitlag                = remixSettings.hitlag;
-        settingsEvent.di                    = remixSettings.di;
-        settingsEvent.japaneseSounds        = remixSettings.japaneseSounds;
-        settingsEvent.japaneseStunSleep     = remixSettings.japaneseStunSleep;
-        settingsEvent.momentumSlide         = remixSettings.momentumSlide;
-        settingsEvent.shieldStun            = remixSettings.shieldStun;
-        settingsEvent.zCancel               = remixSettings.zCancel;
-        settingsEvent.punishFailedZCancel   = remixSettings.punishFailedZCancel;
-        settingsEvent.improvedAI            = remixSettings.improvedAI;
-        settingsEvent.tripping              = remixSettings.tripping;
-        settingsEvent.rage                  = remixSettings.rage;
-        settingsEvent.footstoolJumping      = remixSettings.footstoolJumping;
-        settingsEvent.airDodging            = remixSettings.airDodging;
-        settingsEvent.jabLocking            = remixSettings.jabLocking;
-        settingsEvent.edgeCJumping          = remixSettings.edgeCJumping;
-        settingsEvent.perfectShielding      = remixSettings.perfectShielding;
-        settingsEvent.parrying              = remixSettings.parrying;
-        settingsEvent.spotDodging           = remixSettings.spotDodging;
-        settingsEvent.fastFallAerials       = remixSettings.fastFallAerials;
-        settingsEvent.ledgeTrumping         = remixSettings.ledgeTrumping;
-        settingsEvent.wallTeching           = remixSettings.wallTeching;
-        settingsEvent.chargeSmashes         = remixSettings.chargeSmashes;
-        settingsEvent.itemContainers        = remixSettings.itemContainers;
-        settingsEvent.gameSpeed             = remixSettings.gameSpeed;
-        settingsEvent.specialZoom           = remixSettings.specialZoom;
-        settingsEvent.blastzoneWarp         = remixSettings.blastzoneWarp;
-        settingsEvent.singleButtonMode      = remixSettings.singleButtonMode;
-        settingsEvent.allItemsRDropAerial   = remixSettings.allItemsRDropAerial;
-        settingsEvent.moveStaling           = remixSettings.moveStaling;
-        settingsEvent.stopwatchItem         = remixSettings.stopwatchItem;
-        settingsEvent.stageSelectLayout     = remixSettings.stageSelectLayout;
-        settingsEvent.hazardMode            = remixSettings.hazardMode;
-        settingsEvent.whispyMode            = remixSettings.whispyMode;
-        settingsEvent.saffronPokemonRate    = remixSettings.saffronPokemonRate;
-        settingsEvent.pokemonAnnouncer      = remixSettings.pokemonAnnouncer;
-        settingsEvent.dragonKingHUD         = remixSettings.dragonKingHUD;
-        settingsEvent.cameraMode            = remixSettings.cameraMode;
-        settingsEvent.yoshiIslandCloudAnims = remixSettings.yoshiIslandCloudAnims;
-
-        for (int port = 0; port < 4; port++)
-        {
-            ReplayMemory::PortMatchInfo portInfo = ReplayMemory::ReadPortMatchInfo(matchInfo.matchInfoPtr, port);
-            settingsEvent.characterId[port] = portInfo.characterId;
-            settingsEvent.costumeId[port]   = portInfo.costumeId;
-            settingsEvent.teamColor[port]   = portInfo.teamColor;
-
-            // team/handicap/cpuLevel need the player-object/player-struct
-            // chase, which can be unpopulated if the file opened during the
-            // pre-match countdown (game_status == 0) before characters have
-            // spawned. Left at their zero-initialized default in that case.
-            ReplayMemory::PortPlayerState playerState = ReplayMemory::ReadPortPlayerState(matchInfo.matchInfoPtr, port);
-            if (playerState.valid)
-            {
-                settingsEvent.portTeam[port]     = playerState.team;
-                settingsEvent.portHandicap[port] = playerState.handicap;
-                settingsEvent.portCpuLevel[port] = playerState.cpuLevel;
-            }
-        }
-
-        WriteEvent(EventCode::MatchSettings, settingsEvent);
+        ReplayEventBuilder::AppendMatchSettings(s_EventBuffer, matchInfo);
     }
 
     s_HasPendingRecording = true;
@@ -899,21 +476,8 @@ void FinalizeFile(uint8_t endReason, const ReplayMemory::MatchInfo& matchInfo)
         return;
     }
 
-    MatchEndEvent endEvent{};
-    endEvent.finalFrame = s_FrameNumber > 0 ? (s_FrameNumber - 1) : 0;
-    endEvent.endReason  = endReason;
-    WriteEvent(EventCode::MatchEnd, endEvent);
-
-    if (s_FamilyRecognized)
-    {
-        MatchResultEvent resultEvent{};
-        for (int port = 0; port < 4; port++)
-        {
-            ReplayMemory::PortMatchInfo portInfo = ReplayMemory::ReadPortMatchInfo(matchInfo.matchInfoPtr, port);
-            resultEvent.placements[port] = portInfo.seated ? portInfo.stocksRemaining : -1;
-        }
-        WriteEvent(EventCode::MatchResult, resultEvent);
-    }
+    ReplayEventBuilder::AppendMatchEnd(s_EventBuffer, s_FrameNumber > 0 ? (s_FrameNumber - 1) : 0, endReason,
+                                       matchInfo, s_FamilyRecognized);
 
     // Hand the buffer off to a detached worker thread for compression +
     // writing (see CompressAndWriteFile()'s doc comment) and reset our own
@@ -927,107 +491,7 @@ void FinalizeFile(uint8_t endReason, const ReplayMemory::MatchInfo& matchInfo)
 
 void RecordFrame(const ReplayMemory::MatchInfo& matchInfo)
 {
-    for (int port = 0; port < 4; port++)
-    {
-        ReplayMemory::PortMatchInfo portInfo = ReplayMemory::ReadPortMatchInfo(matchInfo.matchInfoPtr, port);
-        if (!portInfo.seated)
-        {
-            continue;
-        }
-
-        ReplayMemory::PortPlayerState state = ReplayMemory::ReadPortPlayerState(matchInfo.matchInfoPtr, port);
-        if (!state.valid)
-        {
-            continue;
-        }
-
-        InputFrameEvent input{};
-        input.frame   = s_FrameNumber;
-        input.port    = static_cast<uint8_t>(port);
-        input.buttons = state.processedButtons;
-        input.stickX  = state.stickX;
-        input.stickY  = state.stickY;
-        WriteEvent(EventCode::InputFrame, input);
-
-        if (s_FamilyRecognized)
-        {
-            StateFrameEvent stateFrame{};
-            stateFrame.frame             = s_FrameNumber;
-            stateFrame.port              = static_cast<uint8_t>(port);
-            stateFrame.characterId       = portInfo.characterId;
-            stateFrame.actionStateId     = state.actionStateId;
-            stateFrame.positionX         = state.positionX;
-            stateFrame.positionY         = state.positionY;
-            stateFrame.facingDirection   = state.facingDirection;
-            stateFrame.velocityX         = state.velocityX;
-            stateFrame.velocityY         = state.velocityY;
-            stateFrame.damagePercent     = state.damagePercent;
-            stateFrame.stocksRemaining   = portInfo.stocksRemaining;
-            // Clamped rather than a raw cast: state.jumpsRemaining is signed
-            // and defaults to 0 if the FTAttributes pointer chase ever
-            // fails, but could in principle read momentarily negative
-            // mid-transition - wrapping that to a large uint8_t via a raw
-            // cast would be actively misleading, not just imprecise.
-            stateFrame.jumpsRemaining    = static_cast<uint8_t>(std::max(0, state.jumpsRemaining));
-            stateFrame.groundedState     = state.groundedState;
-            stateFrame.hurtboxState      = state.hurtboxState;
-            stateFrame.hitstunCounter    = state.hitstunCounter;
-            stateFrame.actionFrameCounter = state.actionFrameCounter;
-            stateFrame.comboHitCount     = portInfo.comboHitCount;
-            stateFrame.comboDamage       = portInfo.comboDamage;
-            stateFrame.scaleX            = state.scaleX;
-            stateFrame.scaleY            = state.scaleY;
-            stateFrame.characterSpecific = state.characterSpecific;
-            stateFrame.shieldHealth      = state.shieldHealth;
-            stateFrame.specialHitStatus  = state.specialHitStatus;
-            stateFrame.knockbackResist   = state.knockbackResist;
-            WriteEvent(EventCode::StateFrame, stateFrame);
-        }
-    }
-
-    if (s_FamilyRecognized)
-    {
-        // One ItemUpdate per currently-live Item/Weapon GObj - after every
-        // seated port's InputFrame/StateFrame pair, same as the per-port
-        // events above. Zero events written when the list is empty this
-        // frame - never a zeroed/placeholder event, same convention as an
-        // unseated port.
-        for (const ReplayMemory::ItemObject& item : ReplayMemory::ReadItemObjects())
-        {
-            ItemUpdateEvent itemEvent{};
-            itemEvent.frame         = s_FrameNumber;
-            itemEvent.objectAddress = item.objectAddress;
-            itemEvent.linkId        = item.linkId;
-            itemEvent.kind          = item.kind;
-            itemEvent.positionX     = item.positionX;
-            itemEvent.positionY     = item.positionY;
-            itemEvent.positionZ     = item.positionZ;
-            itemEvent.scaleX        = item.scaleX;
-            itemEvent.scaleY        = item.scaleY;
-            WriteEvent(EventCode::ItemUpdate, itemEvent);
-        }
-
-        // StageHazardUpdate - only written when at least one tracked hazard
-        // is active, same sparse convention as ItemUpdate above.
-        const ReplayMemory::StageHazards hazards = ReplayMemory::ReadStageHazards(matchInfo.stageId);
-        uint8_t hazardFlags = 0;
-        if (hazards.whispyBlowing)
-        {
-            hazardFlags |= kHazardFlagWhispyBlowing;
-            if (hazards.whispyBlowingRight)
-            {
-                hazardFlags |= kHazardFlagWhispyBlowingRight;
-            }
-        }
-        if (hazardFlags != 0)
-        {
-            StageHazardUpdateEvent hazardEvent{};
-            hazardEvent.frame       = s_FrameNumber;
-            hazardEvent.hazardFlags = hazardFlags;
-            WriteEvent(EventCode::StageHazardUpdate, hazardEvent);
-        }
-    }
-
+    ReplayEventBuilder::AppendFrameEvents(s_EventBuffer, s_FrameNumber, matchInfo, s_FamilyRecognized);
     s_FrameNumber++;
 }
 } // namespace
