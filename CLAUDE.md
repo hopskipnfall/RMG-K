@@ -68,6 +68,7 @@ Configure via `-D` flags in CMake command:
 - `USE_ANGRYLION` (OFF): Build angrylion-rdp-plus (non-GPL license)
 - `NO_ASM` (OFF): Disables assembly in mupen64plus-core
 - `USE_CCACHE` (ON): Use ccache if available
+- `TEST_LOBBY` (OFF): Connect to the test lobby server instead of prod (also tags window titles "[TEST]")
 - `GAME_STATS` (ON): Enables `.rmgr` replay-file recording (see "Replay File Recording" below); builds mupen64plus-core with `DEBUGGER=1`, which pulls in a binutils (`libopcodes`/`libbfd`) link dependency. On by default; pass `--no-game-stats` to `Build.sh` (or `-DGAME_STATS=OFF` directly) to skip it and avoid the extra dependency. Without it, the "Record replay file" checkbox in Settings is present but disabled.
 
 ## Architecture Overview
