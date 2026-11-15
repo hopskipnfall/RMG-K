@@ -68,6 +68,7 @@ Configure via `-D` flags in CMake command:
 - `USE_ANGRYLION` (OFF): Build angrylion-rdp-plus (non-GPL license)
 - `NO_ASM` (OFF): Disables assembly in mupen64plus-core
 - `USE_CCACHE` (ON): Use ccache if available
+- `TEST_LOBBY` (OFF): Connect to the test lobby server instead of prod (also tags window titles "[TEST]")
 - `GAME_STATS` (ON): Enables `.rmgr` replay-file recording (see "Replay File Recording" below); builds mupen64plus-core with `DEBUGGER=1`, which pulls in a binutils (`libopcodes`/`libbfd`) link dependency. On by default; pass `--no-game-stats` to `Build.sh` (or `-DGAME_STATS=OFF` directly) to skip it and avoid the extra dependency. Without it, the "Record replay file" checkbox in Settings is present but disabled.
 
 ## Architecture Overview
@@ -269,3 +270,4 @@ Bin/Release/          # Build output (portable mode)
 5. **USBtoN64v2 Adapter Support**: Compatible with popular USB-to-N64 hardware adapters
 6. **VidExt Override**: Custom Qt-based rendering instead of SDL windows
 7. **Replay File Recording**: Records per-frame inputs and game state (Smash Remix only, currently) to a `.rmgr` file, independent of `.krec`. See `Source/RMG-Core/Replay.cpp`/`ReplayMemory.cpp`, `docs/RMGR_SPEC.md`, and the `GAME_STATS` build option above.
+8. **Practice Client**: While Smash Remix 2.0.1 runs offline, streams each frame's game state to a localhost practice server and applies its replies (state writes, controller overrides, savestates). Off by default (`[Rosalie's Mupen GUI Practice] Enabled = True`; `Port` default 46464, `TimeoutMs` default 8). Wire protocol: `docs/PRACTICE_PROTOCOL.md`; logic: `Source/RMG-Core/Practice*.cpp`. Built under `GAME_STATS`; puppet input also needs `NETPLAY`. Host tests: `sh Source/RMG-Core/Tests/run.sh` (no emulator or Qt needed). `Source/Script/practice_probe.py` is a manual probe, not the server.

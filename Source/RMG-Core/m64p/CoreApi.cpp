@@ -43,6 +43,9 @@ bool CoreApi::Hook(m64p_dynlib_handle handle)
     HOOK_FUNC(handle, , DebugMemRead8);
     HOOK_FUNC(handle, , DebugMemRead16);
     HOOK_FUNC(handle, , DebugMemRead32);
+    HOOK_FUNC(handle, , DebugMemWrite8);
+    HOOK_FUNC(handle, , DebugMemWrite16);
+    HOOK_FUNC(handle, , DebugMemWrite32);
 
     this->handle = handle;
     this->hooked = true;
@@ -67,6 +70,9 @@ bool CoreApi::Unhook(void)
     UNHOOK_FUNC(, DebugMemRead8);
     UNHOOK_FUNC(, DebugMemRead16);
     UNHOOK_FUNC(, DebugMemRead32);
+    UNHOOK_FUNC(, DebugMemWrite8);
+    UNHOOK_FUNC(, DebugMemWrite16);
+    UNHOOK_FUNC(, DebugMemWrite32);
 
     this->handle = nullptr;
     this->hooked = false;

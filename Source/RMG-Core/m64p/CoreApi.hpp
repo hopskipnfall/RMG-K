@@ -51,6 +51,10 @@ class CoreApi
     ptr_DebugMemRead8 DebugMemRead8;
     ptr_DebugMemRead16 DebugMemRead16;
     ptr_DebugMemRead32 DebugMemRead32;
+    // practice client only (Source/RMG-Core/Practice*.cpp); same DEBUGGER=1 requirement
+    ptr_DebugMemWrite8 DebugMemWrite8;
+    ptr_DebugMemWrite16 DebugMemWrite16;
+    ptr_DebugMemWrite32 DebugMemWrite32;
 
   private:
     bool hooked = false;
