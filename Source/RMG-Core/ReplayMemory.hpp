@@ -205,10 +205,28 @@ struct RemixSettings
     uint8_t yoshiIslandCloudAnims;
 };
 
+// Which Smash 64 build is loaded. The core engine addresses this reader uses
+// (screen, match info, GObj links, FTStruct offsets, ...) are identical on
+// the US-layout builds; JP builds move seven absolute addresses (see
+// RegionAddrs in the .cpp). The variant also gates what is Remix-specific (Salty Runback,
+// the Toggles.asm settings). Set once per session by Replay.cpp.
+enum class RomVariant
+{
+    Unknown,
+    Remix,      // Smash Remix 2.0.1
+    VanillaUS,  // Super Smash Bros. (U) v1.0
+    TE16,       // 19XXTE 1.6 (vanilla layout + tournament patches)
+    VanillaJP,  // Nintendo All-Star! Dairantou Smash Brothers (J)
+    TE16JP      // 19XXTE-JP 1.6 (19XX master JP port)
+};
+
+void       SetRomVariant(RomVariant variant);
+RomVariant GetRomVariant(void);
+
 // current_screen == 0x16 ("in a VS match")
 bool IsInVsMatchScreen(void);
 
-// Smash Remix's "Salty Runback" feature - see the .cpp's own doc comment
+// Smash Remix's "Salty Runback" feature (always false on other variants) - see the .cpp's own doc comment
 // (on ADDR_SALTY_RUNBACK and this function) for exactly what's confirmed,
 // and why a caller must do its own 0->1 edge detection rather than
 // treating "non-zero" alone as "a runback just happened".
@@ -260,7 +278,8 @@ StageHazards ReadStageHazards(uint8_t stageId);
 // Fixed global Toggles.asm addresses, independent of MatchInfo - always
 // readable regardless of match state (these are menu-configured settings,
 // not live match state). Called once at match start, alongside
-// ReadMatchInfo() - see RemixSettings's own doc comment.
+// ReadMatchInfo() - see RemixSettings's own doc comment. All zeros unless
+// the variant is Remix (the addresses lie outside a 4 MB RDRAM elsewhere).
 RemixSettings ReadRemixSettings(void);
 } // namespace ReplayMemory
 
