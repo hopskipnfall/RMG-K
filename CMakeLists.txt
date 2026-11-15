@@ -13,6 +13,7 @@ option(USE_CCACHE       "Enables usage of ccache when ccache has been found" ON)
 option(NO_ASM           "Disables the usage of assembly in the mupen64plus-core" OFF)
 option(USE_ANGRYLION    "Enables building angrylion-rdp-plus which uses a non-GPL compliant license" OFF)
 option(INSTALL_CHEATS   "Installs bundled cheat files" ON)
+option(TEST_LOBBY       "Connects to the test lobby server instead of prod" OFF)
 set(KAILLERA_APP_VERSION_OVERRIDE "" CACHE STRING "Override Kaillera app version string advertised by RMG-K (dev/testing)")
 
 project(RMG)
@@ -66,9 +67,9 @@ if (NOT GIT_FOUND OR NOT ${GIT_RESULT} EQUAL 0)
     file(STRINGS "VERSION" GIT_VERSION)
 endif()
 
-# vdev builds default to the test lobby, tagged releases to prod.
-# Checked before the override below so faking a version doesn't change servers.
-if (GIT_VERSION MATCHES "^vdev-")
+# Every build connects to the prod lobby unless TEST_LOBBY is on (upstream
+# instead sends every untagged vdev build to the test lobby).
+if (TEST_LOBBY)
     set(RMGK_TEST_BUILD ON)
 endif()
 
