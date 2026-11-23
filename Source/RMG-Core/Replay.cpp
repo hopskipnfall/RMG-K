@@ -14,6 +14,7 @@
 #include "File.hpp"
 #include "Library.hpp"
 #include "RomSettings.hpp"
+#include "Version.hpp"
 #ifdef RMGK_HAVE_P2P_TRANSPORT
 #include "kailleraclient.h"
 #endif
@@ -39,43 +40,49 @@ namespace
 {
 #pragma pack(push, 1)
 
-// v5, ground-up rewrite - see docs/RMGR_SPEC.md. Breaking change from
-// everything recorded before this document existed: no migration path, none
-// planned. `version` keeps incrementing (this fork's prior in-development
-// numbering reached 4) rather than resetting to 1, purely so a reader that
-// only understands the old, unspecified layout sees an unfamiliar number and
-// correctly refuses to parse, instead of the value colliding with an
-// unrelated earlier meaning.
+// Container version 6, the first stable version - see docs/RMGR_SPEC.md
+// section 3.1 for the field-by-field layout. Versions before 6 were
+// prototypes only and are not readable as this layout.
 struct FileHeader
 {
-    char     magic[4];        // "RMGR"
-    uint8_t  version;         // 5
-    uint8_t  reserved[3];     // zero
-    // Which game-family extension event set (below) applies - a coarser,
-    // slower-growing identity than goodName. Empty (all zero) if the loaded
-    // ROM isn't recognized: the file is still a fully valid core-only
-    // recording in that case, just with no extension events. See
-    // docs/RMGR_SPEC.md section 2.1/3.2.
+    char     magic[4];        // 0x00 "RMGR"
+    uint8_t  version;         // 0x04 container version, 6
+    // 0x05 version of gameFamily's extension spec (kSmash64FamilyVersion
+    // below); 0 when gameFamily is empty. See docs/RMGR_SPEC.md section 3.2.
+    uint16_t familyVersion;
+    uint8_t  reserved;        // 0x07 zero
+    // 0x08 which game-family extension event set (below) applies - a
+    // coarser identity than goodName. Empty (all zero) if the loaded ROM
+    // isn't recognized: the file is then a core-only recording. See
+    // docs/RMGR_SPEC.md sections 2.1/3.2.
     char     gameFamily[16];
-    // Exact ROM build identity (mupen64plus-core's own ROM database string) -
-    // distinct from gameFamily: two different goodNames can share one family
-    // (e.g. a future vanilla-SSB64 recorder alongside Smash Remix, both
-    // "smash64"), each with its own recorderSchemaVersion numbering space.
+    // 0x18 exact ROM build identity (mupen64plus-core's ROM database string).
+    // Several goodNames can share one gameFamily and its familyVersion.
     char     goodName[64];
-    uint32_t recorderSchemaVersion; // see kRecorderSchemaVersion below; 0 when gameFamily is empty
-    uint64_t recordedAtEpochMillis; // milliseconds since the Unix epoch (UTC)
-    // Byte length of the event stream after decompression - lets a reader
-    // preallocate its output buffer instead of growing it dynamically.
+    // 0x58 name and version of the program that wrote the file, e.g.
+    // "RMG-K v0.9.16" - NUL-padded, not necessarily NUL-terminated.
+    char     clientName[32];
+    uint64_t recordedAtEpochMillis; // 0x78 milliseconds since the Unix epoch (UTC)
+    // 0x80 byte length of the event stream after decompression - lets a
+    // reader preallocate its output buffer instead of growing it dynamically.
     uint32_t uncompressedLength;
-    // Byte length of the deflate-compressed block immediately following this
-    // header. Always correct on disk: the whole match is buffered in memory
-    // and compressed once, at match end (see s_EventBuffer below), so there
-    // is no "0 until finalized, patched via seek" convention to speak of -
-    // and, as an accepted trade-off, a crash or force-quit mid-match now
-    // produces no file at all rather than a truncated one.
+    // 0x84 byte length of the deflate-compressed block immediately following
+    // this header, i.e. starting at file offset 136. Always correct on disk:
+    // the whole match is buffered in memory and compressed once, at match
+    // end (see s_EventBuffer below), so there is no "0 until finalized,
+    // patched via seek" convention to speak of - and, as an accepted
+    // trade-off, a crash or force-quit mid-match produces no file at all
+    // rather than a truncated one.
     uint32_t compressedLength;
 };
-static_assert(sizeof(FileHeader) == 108, "FileHeader must be 108 bytes");
+static_assert(sizeof(FileHeader) == 136, "FileHeader must be 136 bytes");
+static_assert(offsetof(FileHeader, familyVersion) == 0x05, "FileHeader::familyVersion must be at 0x05");
+static_assert(offsetof(FileHeader, gameFamily) == 0x08, "FileHeader::gameFamily must be at 0x08");
+static_assert(offsetof(FileHeader, goodName) == 0x18, "FileHeader::goodName must be at 0x18");
+static_assert(offsetof(FileHeader, clientName) == 0x58, "FileHeader::clientName must be at 0x58");
+static_assert(offsetof(FileHeader, recordedAtEpochMillis) == 0x78, "FileHeader::recordedAtEpochMillis must be at 0x78");
+static_assert(offsetof(FileHeader, uncompressedLength) == 0x80, "FileHeader::uncompressedLength must be at 0x80");
+static_assert(offsetof(FileHeader, compressedLength) == 0x84, "FileHeader::compressedLength must be at 0x84");
 
 enum class EventCode : uint8_t
 {
@@ -154,10 +161,9 @@ struct MatchSettingsEvent
     uint8_t portTeam[4];       // team number per port
     uint8_t portHandicap[4];   // meaningful only when handicapMode != 0
     uint8_t portCpuLevel[4];   // meaningless for a human port
-    // Added in recorder schema 3 (kRecorderSchemaVersion above) - see
-    // docs/RMGR_SPEC.md for what every value below means (enum lookup
-    // tables); this struct only documents shape, not semantics, to avoid
-    // keeping two copies of the same table.
+    // See docs/RMGR_SPEC.md section 5.1 for what every value below means
+    // (enum lookup tables); this struct only documents shape, not
+    // semantics, to avoid keeping two copies of the same table.
     int32_t rngSeed; // sSYUtilsRandomSeed at match start - see ReplayMemory::MatchInfo::rngSeed
     // Gameplay Settings (31, Remix Toggles.asm)
     uint8_t hitstun;
@@ -235,15 +241,13 @@ struct StateFrameEvent
     // Both zero the instant the chain breaks.
     uint32_t comboHitCount;
     uint32_t comboDamage;
-    // Appended in recorder schema 2 (docs/RMGR_SPEC.md sections 5.2 and 6);
-    // schema-1 files' StateFrame ends after comboDamage. scaleX/scaleY: the
-    // fighter's render scale (root joint DObj scale); characterSpecific:
-    // Samus/DK charge level or Kirby's copied fighter (see ReplayMemory.cpp's
-    // PS_PASSIVE_VAR).
+    // scaleX/scaleY: the fighter's render scale (root joint DObj scale);
+    // characterSpecific: Samus/DK charge level or Kirby's copied fighter
+    // (see ReplayMemory.cpp's PS_PASSIVE_VAR). docs/RMGR_SPEC.md section 5.2.
     float    scaleX;
     float    scaleY;
     int32_t  characterSpecific;
-    // Also schema 2: shield health, the timed hit status (GMHitStatus -
+    // Shield health, the timed hit status (GMHitStatus -
     // respawn invincibility etc., separate from hurtboxState's motion-script
     // one), and temporary knockback armor (Yoshi's double jump).
     int32_t  shieldHealth;
@@ -267,9 +271,8 @@ struct ItemUpdateEvent
     float    positionX;
     float    positionY;
     float    positionZ;
-    // Appended in recorder schema 2 (docs/RMGR_SPEC.md sections 5.3 and 6) -
-    // the object's render scale (DObj scale x/y). Schema-1 files' ItemUpdate
-    // ends after positionZ; EventPayloads' declared size tells readers which.
+    // The object's render scale (DObj scale x/y) - docs/RMGR_SPEC.md
+    // section 5.3.
     float    scaleX;
     float    scaleY;
 };
@@ -390,32 +393,15 @@ Replay::FrameIndexProvider    s_RecordedAtFrameIndexProvider = nullptr;
 constexpr const char* kSmashRemixGoodName = "SmashRemix2.0.1";
 constexpr const char* kSmash64Family      = "smash64";
 
-// Bump whenever this recorder's interpretation of a goodName's memory
-// layout changes in a way that affects what an smash64-family reader gets -
-// not just when a field is newly appended (which the per-event
-// EventPayloads declared-size mechanism, docs/RMGR_SPEC.md section 6,
-// already handles on its own), but also e.g. a bugfix to an existing
-// field's offset that silently changes recorded *values* without changing
-// any event's byte size. This is its own counter per goodName - see
-// docs/RMGR_SPEC.md section 3.2.
-//
-// Starts fresh at 1 for this container rewrite: every memory-offset fix
-// this recorder previously accumulated (schema 2 through 9 under the old,
-// unspecified container layout - see git history for that trail) is already
-// reflected as correct in ReplayMemory.cpp today. There's nothing left to
-// carry forward; the old numbering tracked a struct layout (GameStart/
-// PostFrameUpdate) that no longer exists.
-//
-// History (this container):
-//   1 - initial version.
-//   2 - ItemUpdate gains trailing scaleX/scaleY (render scale), and
-//       StateFrame gains trailing scaleX/scaleY/characterSpecific/
-//       shieldHealth/specialHitStatus/knockbackResist -
-//       docs/RMGR_SPEC.md sections 5.2 and 5.3.
-//   3 - MatchSettings gains trailing rngSeed plus 31 Gameplay Settings and
-//       8 Stage Settings from Remix's Toggles.asm - docs/RMGR_SPEC.md
-//       section 5.1.
-constexpr uint32_t kRecorderSchemaVersion = 3;
+// FileHeader::familyVersion for smash64 files: the version of the smash64
+// extension event definitions (docs/RMGR_SPEC.md section 5). Bump on any
+// change to those definitions, including a new trailing field - see
+// docs/RMGR_SPEC.md sections 3.2 and 6. A writer bugfix that changes no
+// event definition doesn't bump it; clientName identifies those files.
+constexpr uint16_t kSmash64FamilyVersion = 1;
+
+// FileHeader::clientName prefix; CoreGetVersion() is appended.
+constexpr const char* kClientNamePrefix = "RMG-K ";
 
 // Whether the currently-loaded ROM is a recognized smash64-family build.
 // Only Smash Remix 2.0.1 is recognized today - see kSmashRemixGoodName's
@@ -743,10 +729,12 @@ bool OpenNewFile(const ReplayMemory::MatchInfo& matchInfo)
 
     s_PendingHeader = FileHeader{};
     std::memcpy(s_PendingHeader.magic, "RMGR", 4);
-    s_PendingHeader.version = 5;
+    s_PendingHeader.version = 6;
+    s_PendingHeader.familyVersion = s_FamilyRecognized ? kSmash64FamilyVersion : 0;
     WriteFixedString(s_PendingHeader.gameFamily, sizeof(s_PendingHeader.gameFamily), gameFamily);
     WriteFixedString(s_PendingHeader.goodName, sizeof(s_PendingHeader.goodName), romSettings.GoodName);
-    s_PendingHeader.recorderSchemaVersion = s_FamilyRecognized ? kRecorderSchemaVersion : 0;
+    WriteFixedString(s_PendingHeader.clientName, sizeof(s_PendingHeader.clientName),
+        std::string(kClientNamePrefix) + CoreGetVersion());
     s_PendingHeader.recordedAtEpochMillis = nowEpochMillis;
     // uncompressedLength/compressedLength are filled in by FinalizeFile()
     // once the whole match's events are known.
