@@ -1428,8 +1428,8 @@ CORE_EXPORT bool CoreStopEmulation(void)
 #endif
 
 #ifdef RMGK_GAME_STATS
-    // Finalizes (patches the length field, closes) any .rmgr file still
-    // open - covers the "user quit mid-match" case.
+    // Compresses and writes out any .rmgr match still in progress
+    // - covers the "user quit mid-match" case.
     Replay::OnEmulationStop();
 #endif
 
