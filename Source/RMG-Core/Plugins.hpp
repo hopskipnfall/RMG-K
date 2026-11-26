@@ -10,6 +10,7 @@
 #ifndef CORE_PLUGINS_HPP
 #define CORE_PLUGINS_HPP
 
+#include <cstdint>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -81,8 +82,37 @@ bool CorePluginsShutdown(void);
 // skipped/rendered receive the display lists skipped and still rendered since the last call.
 bool CorePluginsSetGfxSkipRendering(bool skip, unsigned int* skipped = nullptr, unsigned int* rendered = nullptr);
 
+// The same for the frames a rollback re-simulates and never shows. The plugin
+// only skips while its drawing can't change what the game sees. Returns false
+// when the plugin can't.
+bool CorePluginsSetGfxSkipHiddenRendering(bool skip);
+
+// Hands a graphics plugin that renders with Vulkan the hooks it calls to have
+// the app's on-screen display drawn into its frames (see VulkanOverlay.h).
+// Returns false when the plugin can't.
+struct RmgkVulkanOverlayHooks;
+bool CorePluginsSetGfxVulkanOverlay(const RmgkVulkanOverlayHooks* hooks);
+
+// Prepares the loaded plugins for a session that has to stay in sync with
+// other machines (netplay, replays), or puts them back for normal play.
+// Synced: loads the RSP plugin that matches the loaded graphics plugin
+// (HLE for GLideN64, cxd4 for the others; the user's RSP setting is left
+// alone and comes back with CoreApplyPluginSettings) and has the graphics
+// plugin use the shared interrupt timing.
+bool CorePluginsApplyNetplayMode(bool synced);
+
 // -1: unavailable, 0: no valid response, 1: normal/checking, 2: slow USB.
 int CoreGetRaphnetHealth(void);
+using RaphnetHintCallback = void (*)(std::uint64_t, unsigned int, unsigned int);
+using RaphnetArmHint = void (*)(std::uint64_t, unsigned int, RaphnetHintCallback);
+RaphnetArmHint CoreGetRaphnetArmHint();
+// Pad samples use rollback input order (two button bytes, signed X, signed Y).
+using InputPadSample = void (*)(std::uint64_t, std::uint32_t);
+using ArmInputPadSamples = void (*)(int control, std::uint64_t ticket, InputPadSample);
+ArmInputPadSamples CoreGetInputArmPadSamples();
+using RaphnetPadSample = InputPadSample;
+using RaphnetArmPadSamples = void (*)(std::uint64_t, RaphnetPadSample);
+RaphnetArmPadSamples CoreGetRaphnetArmPadSamples();
 void CorePauseRaphnetMonitoring(bool pause);
 
 #endif // CORE_PLUGINS_HPP

@@ -9,6 +9,7 @@
 #include <juice/juice.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <deque>
@@ -27,6 +28,7 @@ struct Peer
     std::mutex agentMutex;
     std::atomic<LobbyIcePeerState> state{LobbyIcePeerState::Disconnected};
     std::atomic<bool> active{true};
+    bool probeOnly = false; // set before the agent exists, never changed
     std::mutex pingMutex;
     std::map<std::uint64_t, std::uint64_t> pingSentAtUs;
     bool hasRemoteDescription = false;
@@ -62,6 +64,20 @@ std::map<std::uint64_t, bool> g_nextPeerUsesUpperPortRange;
 std::map<std::uint64_t, std::vector<PendingRemoteSignal>> g_pendingRemoteSignals;
 std::deque<LobbyIceSignal> g_localSignals;
 std::deque<QueuedPacket> g_packets;
+// What each channel has waiting in g_packets (guarded by g_mutex). A channel
+// is only emptied while something reads it (pre-match packets only before a
+// match, say), so a peer that keeps sending on one nobody reads would grow
+// the queue for as long as it stays connected. Past these limits a channel's
+// new packets are dropped, like any other lost datagram.
+struct ChannelLoad
+{
+    std::size_t packets = 0;
+    std::size_t bytes = 0;
+};
+std::array<ChannelLoad, 256> g_channelLoad;
+constexpr std::size_t CHANNEL_QUEUE_PACKET_CAP = 4096;
+constexpr std::size_t CHANNEL_QUEUE_BYTE_CAP = 2 * 1024 * 1024;
+std::deque<QueuedPacket> g_buttonHints;
 std::atomic<bool> g_diagnosticsEnabled{false};
 std::vector<LobbyIceDiagnostic> g_diagnostics;
 std::size_t g_diagnosticsDropped = 0;
@@ -185,10 +201,13 @@ void on_recv(juice_agent_t* agent, const char* data, size_t size, void* userPtr)
         channelByte >= static_cast<std::uint8_t>(LobbyIceChannel::GekkoEpochFirst) &&
         channelByte <= static_cast<std::uint8_t>(LobbyIceChannel::GekkoEpochLast);
     if (channel != LobbyIceChannel::Ping && channel != LobbyIceChannel::Prematch &&
-        channel != LobbyIceChannel::Gekko && channel != LobbyIceChannel::LagStats && !gekkoEpoch)
+        channel != LobbyIceChannel::Gekko && channel != LobbyIceChannel::LagStats &&
+        channel != LobbyIceChannel::ButtonHint && !gekkoEpoch)
     {
         return;
     }
+    if (peer->probeOnly && channel != LobbyIceChannel::Ping)
+        return;
 
     // Ping payload: request/reply byte plus nonce. Echo requests directly from
     // libjuice's receive callback so the 25 ms Qt queue-poll interval is not
@@ -203,6 +222,10 @@ void on_recv(juice_agent_t* agent, const char* data, size_t size, void* userPtr)
         // If the immediate send ever fails, queue it for the existing UI-side
         // fallback and normal retry machinery.
     }
+
+    if (channel == LobbyIceChannel::ButtonHint && size != 1 + kLobbyButtonHintSize &&
+        size != 1 + kLobbyStickHintSize)
+        return;
 
     QueuedPacket packet;
     packet.peerUserId = peer->userId;
@@ -220,9 +243,34 @@ void on_recv(juice_agent_t* agent, const char* data, size_t size, void* userPtr)
             peer->pingSentAtUs.erase(it);
         }
     }
-    packet.data.assign(data + 1, data + size);
     std::lock_guard<std::mutex> lock(g_mutex);
+    if (channel == LobbyIceChannel::ButtonHint)
+    {
+        packet.data.assign(data + 1, data + size);
+        if (g_buttonHints.size() >= 64)
+            g_buttonHints.pop_front();
+        g_buttonHints.push_back(std::move(packet));
+        return;
+    }
+    ChannelLoad& load = g_channelLoad[channelByte];
+    if (load.packets >= CHANNEL_QUEUE_PACKET_CAP || load.bytes + (size - 1) > CHANNEL_QUEUE_BYTE_CAP)
+        return;
+    packet.data.assign(data + 1, data + size);
+    load.packets++;
+    load.bytes += size - 1;
     g_packets.push_back(std::move(packet));
+}
+
+// Recounts g_channelLoad after packets left the queue. Call with g_mutex held.
+void recount_channel_load()
+{
+    g_channelLoad.fill(ChannelLoad{});
+    for (const QueuedPacket& packet : g_packets)
+    {
+        ChannelLoad& load = g_channelLoad[static_cast<std::uint8_t>(packet.channel)];
+        load.packets++;
+        load.bytes += packet.data.size();
+    }
 }
 
 std::shared_ptr<Peer> find_peer(std::uint64_t peerUserId)
@@ -353,6 +401,8 @@ void LobbyIce::reset()
         g_pendingRemoteSignals.clear();
         g_localSignals.clear();
         g_packets.clear();
+        g_channelLoad.fill(ChannelLoad{});
+        g_buttonHints.clear();
         g_localUserId = 0;
         g_stunHost.clear();
         g_stunPort = 0;
@@ -369,8 +419,16 @@ void LobbyIce::reset()
     }
 }
 
-bool LobbyIce::add_peer(std::uint64_t peerUserId)
+bool LobbyIce::add_peer(std::uint64_t peerUserId, bool probeOnly)
 {
+    // A probe-only agent never becomes the room's: its credentials and remote
+    // description belong to the ping check, so the mesh starts over.
+    if (const auto existing = find_peer(peerUserId);
+        existing != nullptr && existing->probeOnly && !probeOnly)
+    {
+        remove_peer(peerUserId);
+    }
+
     std::string stunHost;
     std::uint16_t stunPort = 0;
     bool useUpperPortRange = false;
@@ -378,6 +436,7 @@ bool LobbyIce::add_peer(std::uint64_t peerUserId)
     std::vector<PendingRemoteSignal> pending;
     auto peer = std::make_shared<Peer>();
     peer->userId = peerUserId;
+    peer->probeOnly = probeOnly;
 
     {
         std::lock_guard<std::mutex> lock(g_mutex);
@@ -386,9 +445,10 @@ bool LobbyIce::add_peer(std::uint64_t peerUserId)
         {
             return false;
         }
-        if (g_peers.find(peerUserId) != g_peers.end())
+        if (const auto it = g_peers.find(peerUserId); it != g_peers.end())
         {
-            return true;
+            // A mesh agent is never turned into a probe-only one.
+            return it->second->probeOnly == probeOnly;
         }
         useUpperPortRange = g_nextPeerUsesUpperPortRange[peerUserId];
         g_nextPeerUsesUpperPortRange[peerUserId] = !useUpperPortRange;
@@ -487,9 +547,13 @@ void LobbyIce::remove_peer(std::uint64_t peerUserId)
         std::erase_if(g_localSignals, [peerUserId](const LobbyIceSignal& signal) {
             return signal.peerUserId == peerUserId;
         });
+        std::erase_if(g_buttonHints, [peerUserId](const QueuedPacket& packet) {
+            return packet.peerUserId == peerUserId;
+        });
         std::erase_if(g_packets, [peerUserId](const QueuedPacket& packet) {
             return packet.peerUserId == peerUserId;
         });
+        recount_channel_load();
     }
     {
         std::lock_guard<std::mutex> agentLock(peer->agentMutex);
@@ -569,7 +633,8 @@ bool LobbyIce::send(std::uint64_t peerUserId, LobbyIceChannel channel,
 {
     const auto peer = find_peer(peerUserId);
     if (peer == nullptr || !peer_connected(peerUserId) ||
-        (data == nullptr && size != 0) || size > 4000)
+        (data == nullptr && size != 0) || size > 4000 ||
+        (peer->probeOnly && channel != LobbyIceChannel::Ping))
     {
         return false;
     }
@@ -612,17 +677,19 @@ std::vector<LobbyIcePacket> LobbyIce::take_packets(LobbyIceChannel channel)
 {
     std::vector<LobbyIcePacket> out;
     std::lock_guard<std::mutex> lock(g_mutex);
-    for (auto it = g_packets.begin(); it != g_packets.end();)
+    auto& packets = channel == LobbyIceChannel::ButtonHint ? g_buttonHints : g_packets;
+    for (auto it = packets.begin(); it != packets.end();)
     {
         if (it->channel == channel)
         {
             out.push_back({it->peerUserId, it->roundTripUs, std::move(it->data)});
-            it = g_packets.erase(it);
+            it = packets.erase(it);
         }
         else
         {
             ++it;
         }
     }
+    g_channelLoad[static_cast<std::uint8_t>(channel)] = {};
     return out;
 }

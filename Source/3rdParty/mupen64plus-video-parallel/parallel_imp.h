@@ -10,6 +10,7 @@ extern "C"
 #endif
 
     extern int32_t vk_rescaling;
+    extern bool rmgk_netplay_timing;
     extern bool vk_ssreadbacks;
     extern bool vk_ssdither;
 
@@ -33,6 +34,8 @@ extern "C"
     void vk_destroy();
     void vk_resize();
     void vk_read_screen(unsigned char* dest);
+    // RMG-K: hooks the app draws its on-screen display through (RmgkVulkanOverlayHooks)
+    void vk_set_overlay(const void* hooks);
 
 #ifdef __cplusplus
 }

@@ -7,6 +7,7 @@
 #include "rdp_device.hpp"
 #include "wsi.hpp"
 #include "wsi_platform.hpp"
+#include "../../RMG-Core/VulkanOverlay.h"
 
 static int cmd_cur;
 static int cmd_ptr;
@@ -16,7 +17,50 @@ static std::unique_ptr<RDP::CommandProcessor> processor;
 static std::unique_ptr<Vulkan::WSI> wsi;
 static std::unique_ptr<MupenWSIPlatform> wsi_platform;
 
+// RMG-K: the app's on-screen display (chat, port names, messages), drawn by the
+// app into the swapchain pass after the game's picture.
+static RmgkVulkanOverlayHooks rmgk_overlay = {};
+static bool rmgk_overlay_used;
+
+void vk_set_overlay(const void* hooks)
+{
+	if (hooks)
+		rmgk_overlay = *static_cast<const RmgkVulkanOverlayHooks *>(hooks);
+	else
+		rmgk_overlay = {};
+}
+
+static bool rmgk_overlay_prepare(Vulkan::Device &device)
+{
+	if (!rmgk_overlay.prepare || !rmgk_overlay.draw)
+		return false;
+
+	auto &view = device.get_swapchain_view();
+	const Vulkan::QueueInfo &queues = device.get_queue_info();
+
+	RmgkVulkanOverlayFrame frame = {};
+	frame.instance = device.get_instance();
+	frame.physicalDevice = device.get_physical_device();
+	frame.device = device.get_device();
+	frame.queue = queues.queues[Vulkan::QUEUE_INDEX_GRAPHICS];
+	frame.queueFamily = queues.family_indices[Vulkan::QUEUE_INDEX_GRAPHICS];
+	frame.imageCount = device.get_num_swapchain_images();
+	frame.format = static_cast<uint32_t>(view.get_format());
+	frame.width = view.get_image().get_width();
+	frame.height = view.get_image().get_height();
+	frame.getInstanceProcAddr = [](void *instance, const char *name) -> void * {
+		return reinterpret_cast<void *>(vkGetInstanceProcAddr(static_cast<VkInstance>(instance), name));
+	};
+	frame.queueLock = [](void *user) { static_cast<Vulkan::Device *>(user)->external_queue_lock(); };
+	frame.queueUnlock = [](void *user) { static_cast<Vulkan::Device *>(user)->external_queue_unlock(); };
+	frame.userData = &device;
+
+	rmgk_overlay_used = true;
+	return rmgk_overlay.prepare(&frame) != 0;
+}
+
 int32_t vk_rescaling;
+bool rmgk_netplay_timing;
 bool vk_ssreadbacks;
 bool vk_ssdither;
 uint32_t vk_overscan_left;
@@ -208,6 +252,9 @@ static void render_frame(Vulkan::Device &device)
 	                                       &vertex_layout,
 	                                       &fragment_layout);
 
+	// RMG-K: laid out before the command buffer is open; it may upload font glyphs.
+	const bool overlay = rmgk_overlay_prepare(device);
+
 	// Blit image on screen.
 	auto cmd = device.request_command_buffer();
 	{
@@ -232,6 +279,10 @@ static void render_frame(Vulkan::Device &device)
 			// Draws fullscreen quad using oversized triangle.
 			cmd->draw(3);
 		}
+		// RMG-K: last in the pass. It binds its own state behind this command
+		// buffer's back, and nothing is drawn after it.
+		if (overlay)
+			rmgk_overlay.draw(cmd->get_command_buffer());
 		cmd->end_render_pass();
 	}
 	device.submit(cmd);
@@ -444,7 +495,10 @@ void vk_process_commands()
 		{
 			uint32_t width = viCalculateHorizonalWidth(*GET_GFX_INFO(VI_H_START_REG), *GET_GFX_INFO(VI_X_SCALE_REG), *GET_GFX_INFO(VI_WIDTH_REG));
 			uint32_t height = viCalculateVerticalHeight(*GET_GFX_INFO(VI_V_START_REG), *GET_GFX_INFO(VI_Y_SCALE_REG));
-			*GET_GFX_INFO(DPC_CLOCK_REG) = width * height * 2;
+			// RMG-K: this delays the DP interrupt by a rough render time. In
+			// netplay every graphics plugin has to raise it at the same point,
+			// and the others don't delay it.
+			*GET_GFX_INFO(DPC_CLOCK_REG) = rmgk_netplay_timing ? 0 : width * height * 2;
 
 			processor->wait_for_timeline(processor->signal_timeline());
 
@@ -474,6 +528,13 @@ void vk_destroy()
 		wsi->end_frame();
 
 	processor.reset();
+	if (wsi && rmgk_overlay_used && rmgk_overlay.shutdown)
+	{
+		// RMG-K: the overlay's objects belong to this device
+		wsi->get_device().wait_idle();
+		rmgk_overlay.shutdown();
+	}
+	rmgk_overlay_used = false;
 	wsi.reset();
 	wsi_platform.reset();
 
@@ -491,7 +552,12 @@ bool vk_init()
 
 	/* initialize Vulkan loader */
 	if (!::Vulkan::Context::init_loader(nullptr))
+	{
+		// RMG-K: the window is up by now; give it back, or the app's
+		// on-screen display stays set up for Vulkan in the next session
+		screen_close();
 		return false;
+	}
 
 	Vulkan::Context::SystemHandles handles = {};
 

@@ -276,7 +276,7 @@ ExternalProject_Add(mupen64plus-video-GLideN64
 
     BUILD_IN_SOURCE False
     BUILD_ALWAYS True
-    CMAKE_ARGS -DMUPENPLUSAPI=ON -DMUPENPLUSAPI_GLIDENUI=ON -DGLIDENUI_QT6=ON -DUSE_IPO=OFF -DUSE_SYSTEM_LIBS=ON ${CMAKE_CONFIGURE_ARGS}
+    CMAKE_ARGS -DMUPENPLUSAPI=ON -DMUPENPLUSAPI_GLIDENUI=ON -DGLIDENUI_QT6=ON -DUSE_IPO=OFF -DUSE_SYSTEM_LIBS=ON -DCRC_OPT=ON ${CMAKE_CONFIGURE_ARGS}
 
     SOURCE_SUBDIR ./src/
     BINARY_DIR ${CMAKE_CURRENT_BINARY_DIR}/mupen64plus-video-GLideN64
@@ -307,8 +307,17 @@ set(IMGUI_SOURCES
     ${IMGUI_DIR}/backends/imgui_impl_opengl3.h 
     ${IMGUI_DIR}/backends/imgui_impl_opengl3_loader.h 
 )
+# the OSD over a Vulkan graphics plugin (Parallel); the plugin owns the
+# Vulkan loader, so its functions are looked up at run time
+list(APPEND IMGUI_SOURCES
+    ${IMGUI_DIR}/backends/imgui_impl_vulkan.cpp
+    ${IMGUI_DIR}/backends/imgui_impl_vulkan.h
+)
 add_library(imgui STATIC ${IMGUI_SOURCES})
+target_compile_definitions(imgui PUBLIC IMGUI_IMPL_VULKAN_NO_PROTOTYPES)
 target_include_directories(imgui PRIVATE ${IMGUI_DIR})
+# chat can hold emoji and rarer Han characters, which are past U+FFFF
+target_compile_definitions(imgui PUBLIC IMGUI_USE_WCHAR32)
 
 set(SDL_GAMECONTROLLERDB_DIR ${CMAKE_CURRENT_SOURCE_DIR}/SDL_GameControllerDB)
 set(SDL_GAMECONTROLLERDB_BUILD_DIR ${CMAKE_CURRENT_BINARY_DIR}/SDL_GameControllerDB)

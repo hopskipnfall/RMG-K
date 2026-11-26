@@ -18,6 +18,7 @@
 #include "Config.h"
 #include "TextureFilterHandler.h"
 #include "DisplayWindow.h"
+#include "FrameBufferTransitions.h"
 
 using namespace std;
 
@@ -34,6 +35,10 @@ RSPInfo		RSP;
 static std::atomic<bool> s_skipRendering(false);
 static std::atomic<u32> s_skippedDLists(0);
 static std::atomic<u32> s_renderedDLists(0);
+// RMG-K: the same skip for frames rollback re-simulates and never shows. Every
+// player has to end up with the same memory whether or not a frame was
+// re-simulated, so it only applies while drawing can't write to RDRAM.
+static std::atomic<bool> s_skipHiddenRendering(false);
 
 void RSP_SetSkipRendering(bool _skip, u32 * _skipped, u32 * _rendered)
 {
@@ -119,6 +124,11 @@ bool _canSkipDList(u32 * _segments)
 			previous = cmd;
 	}
 	return false;
+}
+
+void RSP_SetSkipHiddenRendering(bool _skip)
+{
+	s_skipHiddenRendering = _skip;
 }
 
 static
@@ -216,6 +226,8 @@ void RSP_ProcessDList()
 		RSP.infloop = false;
 		RSP.halt = false;
 	} else {
+		FBTransitions_Update(s_skipHiddenRendering);
+
 		if (*REG.VI_ORIGIN != VI.lastOrigin) {
 			VI_UpdateSize();
 			dwnd().updateScale();
@@ -263,7 +275,8 @@ void RSP_ProcessDList()
 			*REG.SP_STATUS |= 0x800;   // set sig4
 		}
 
-		if (s_skipRendering) {
+		const bool skipHidden = s_skipHiddenRendering && config.frameBufferEmulation.enable == 0;
+		if (s_skipRendering || skipHidden) {
 			u32 segments[16];
 			memcpy(segments, gSP.segment, sizeof(segments));
 			if (_canSkipDList(segments)) {
@@ -274,10 +287,12 @@ void RSP_ProcessDList()
 				*REG.DPC_STATUS &= ~(0x020 | 0x040 | 0x008); // pipe busy | cmd busy | start gclk
 				CheckInterrupts();
 				RSP.busy = false;
-				++s_skippedDLists;
+				if (s_skipRendering)
+					++s_skippedDLists;
 				return;
 			}
-			++s_renderedDLists;
+			if (s_skipRendering)
+				++s_renderedDLists;
 		}
 	}
 
@@ -467,6 +482,11 @@ void RSP_Init()
 	else if (strstr(RSP.romname, (const char *)"PAPER MARIO") ||
 		strstr(RSP.romname, (const char *)"MARIO STORY"))
 		config.generalEmulation.hacks |= hack_paper_mario_subscreen;
+	// RMG-K: FrameBufferTransitions.cpp reads the RAM of Super Smash Bros. (U) and
+	// of Smash Remix, which is built on it (PAL builds too). Other regions differ.
+	else if (strstr(RSP.romname, (const char *)"SMASH REMIX") != nullptr ||
+		(strstr(RSP.romname, (const char *)"SMASH BROTHERS") != nullptr && HEADER[0x3E ^ 3] == 'E'))
+		config.generalEmulation.hacks |= hack_SmashTransitions;
 
 	api().FindPluginPath(RSP.pluginpath);
 
