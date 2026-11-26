@@ -28,6 +28,7 @@
 #include <cstring>
 #include <array>
 #include <atomic>
+#include <bit>
 
 //
 // Local Variables
@@ -628,6 +629,27 @@ CORE_EXPORT bool CorePluginsShutdown(void)
     return ret == M64ERR_SUCCESS;
 }
 
+ArmInputPadSamples CoreGetInputArmPadSamples()
+{
+    auto& plugin = get_plugin(CorePluginType::Input);
+    return plugin.IsHooked() ? std::bit_cast<ArmInputPadSamples>(
+        CoreGetLibrarySymbol(plugin.GetHandle(), "InputArmPadSamples")) : nullptr;
+}
+
+RaphnetArmHint CoreGetRaphnetArmHint()
+{
+    auto& plugin = get_plugin(CorePluginType::Input);
+    return plugin.IsHooked() ? std::bit_cast<RaphnetArmHint>(
+        CoreGetLibrarySymbol(plugin.GetHandle(), "RaphnetArmButtonHint")) : nullptr;
+}
+
+RaphnetArmPadSamples CoreGetRaphnetArmPadSamples()
+{
+    auto& plugin = get_plugin(CorePluginType::Input);
+    return plugin.IsHooked() ? std::bit_cast<RaphnetArmPadSamples>(
+        CoreGetLibrarySymbol(plugin.GetHandle(), "RaphnetArmPadSamples")) : nullptr;
+}
+
 // The UI reads a core-owned atomic, never a possibly unloading plugin handle.
 CORE_EXPORT int CoreGetRaphnetHealth(void)
 {
@@ -683,6 +705,89 @@ CORE_EXPORT bool CorePluginsSetGfxSkipRendering(bool skip, unsigned int* skipped
     if (rendered != nullptr)
     {
         *rendered = renderedCount;
+    }
+    return true;
+}
+
+using SetVulkanOverlay = void (CALL *)(const RmgkVulkanOverlayHooks*);
+
+CORE_EXPORT bool CorePluginsSetGfxVulkanOverlay(const RmgkVulkanOverlayHooks* hooks)
+{
+    auto& plugin = get_plugin(CorePluginType::Gfx);
+    const auto setVulkanOverlay = plugin.IsHooked() ? reinterpret_cast<SetVulkanOverlay>(
+        CoreGetLibrarySymbol(plugin.GetHandle(), "RmgkSetVulkanOverlay")) : nullptr;
+    if (setVulkanOverlay == nullptr)
+    {
+        return false;
+    }
+    setVulkanOverlay(hooks);
+    return true;
+}
+
+using SetSkipHiddenRendering = void (CALL *)(int);
+
+CORE_EXPORT bool CorePluginsSetGfxSkipHiddenRendering(bool skip)
+{
+    auto& plugin = get_plugin(CorePluginType::Gfx);
+    const auto setSkipRendering = plugin.IsHooked() ? reinterpret_cast<SetSkipHiddenRendering>(
+        CoreGetLibrarySymbol(plugin.GetHandle(), "RmgkSetSkipHiddenRendering")) : nullptr;
+    if (setSkipRendering == nullptr)
+    {
+        return false;
+    }
+    setSkipRendering(skip ? 1 : 0);
+    return true;
+}
+
+CORE_EXPORT bool CorePluginsApplyNetplayMode(bool synced)
+{
+    auto& gfxPlugin = get_plugin(CorePluginType::Gfx);
+
+    if (synced)
+    {
+        // GLideN64 draws from display lists, which needs the HLE RSP. The other
+        // graphics plugins need the RSP emulated: cxd4 gives the same result
+        // after a rollback, ParaLLEl-RSP doesn't (it keeps state of its own
+        // across a load).
+        const std::string gfxFile = std::filesystem::path(
+            l_PluginFiles[static_cast<int>(CorePluginType::Gfx) - 1]).filename().string();
+        const bool hle = gfxFile.find("GLideN64") != std::string::npos;
+#ifdef _WIN32
+        const std::string extension = ".dll";
+#else
+        const std::string extension = ".so";
+#endif
+        if (!hle)
+        {
+            // cxd4 has to run the microcode itself here, with nothing that
+            // depends on host timing.
+            CoreSettingsSetValue("rsp-cxd4", "DisplayListToGraphicsPlugin", false);
+            CoreSettingsSetValue("rsp-cxd4", "AudioListToAudioPlugin", false);
+            CoreSettingsSetValue("rsp-cxd4", "WaitForCPUHost", false);
+            CoreSettingsSetValue("rsp-cxd4", "SupportCPUSemaphoreLock", false);
+        }
+        const std::array<std::string, 4> settings =
+        {
+            (hle ? "mupen64plus-rsp-hle" : "mupen64plus-rsp-cxd4") + extension,
+            std::string(), std::string(), std::string()
+        };
+        if (!apply_plugin_settings(settings))
+        {
+            return false;
+        }
+        if (!l_Plugins[static_cast<int>(CorePluginType::Rsp) - 1].IsHooked())
+        {
+            CoreSetError("CorePluginsApplyNetplayMode Failed: " + settings[0] + " is missing, netplay needs it");
+            return false;
+        }
+    }
+
+    using SetNetplayTiming = void (CALL *)(int);
+    const auto setNetplayTiming = gfxPlugin.IsHooked() ? reinterpret_cast<SetNetplayTiming>(
+        CoreGetLibrarySymbol(gfxPlugin.GetHandle(), "RmgkSetNetplayTiming")) : nullptr;
+    if (setNetplayTiming != nullptr)
+    {
+        setNetplayTiming(synced ? 1 : 0);
     }
     return true;
 }

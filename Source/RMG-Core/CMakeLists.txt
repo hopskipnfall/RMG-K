@@ -7,6 +7,9 @@ set(CMAKE_CXX_STANDARD 20)
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(MINIZIP REQUIRED minizip)
+# Linked directly: Compression.cpp calls zlib itself, and minizip only
+# lists it as a private dependency on some distributions.
+find_package(ZLIB REQUIRED)
 if (WIN32)
     pkg_check_modules(ICONV REQUIRED iconv)
 endif(WIN32)
@@ -43,6 +46,7 @@ set(RMG_CORE_SOURCES
     Callback.cpp
     Settings.cpp
     Archive.cpp
+    Compression.cpp
     Library.cpp
     Netplay.cpp
     Kaillera.cpp
@@ -50,6 +54,7 @@ set(RMG_CORE_SOURCES
     Version.cpp
     Cheats.cpp
     NetplaySave.cpp
+    GameOptions.cpp
     String.cpp
     Volume.cpp
     VidExt.cpp
@@ -63,7 +68,7 @@ set(RMG_CORE_SOURCES
 
 if (NETPLAY)
     add_definitions(-DNETPLAY)
-    list(APPEND RMG_CORE_SOURCES LobbyIce.cpp)
+    list(APPEND RMG_CORE_SOURCES LobbyIce.cpp LobbyButtonHints.cpp)
 endif(NETPLAY)
 
 if (PORTABLE_INSTALL)
@@ -95,6 +100,7 @@ endif(WIN32)
 
 target_link_libraries(RMG-Core PRIVATE
     ${MINIZIP_LIBRARIES}
+    ZLIB::ZLIB
     lzma
     ZLIB::ZLIB
 )

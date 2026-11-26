@@ -17,6 +17,11 @@ endif(PORTABLE_INSTALL)
 
 if (RMGK_TEST_BUILD)
     add_definitions(-DRMGK_TEST_BUILD)
+    option(RMGK_USE_PRODUCTION_LOBBY "Use the production lobby in this development build" OFF)
+    if (NOT RMGK_USE_PRODUCTION_LOBBY)
+        set_property(SOURCE UserInterface/Dialog/Lobby/LobbyConnectDialog.cpp
+            APPEND PROPERTY COMPILE_DEFINITIONS RMGK_USE_TEST_LOBBY)
+    endif()
 endif(RMGK_TEST_BUILD)
 
 if (UPDATER)
@@ -91,6 +96,7 @@ set(RMG_SOURCES
     UserInterface/UIResources.rc
     UserInterface/UIResources.qrc
     UserInterface/Flags.qrc
+    UserInterface/LobbyResources.qrc
     Thread/RomSearcherThread.cpp
     Thread/EmulationThread.cpp
     Utilities/QtKeyToSdl3Key.cpp
@@ -131,12 +137,22 @@ if (NETPLAY)
         UserInterface/Dialog/Kaillera/KailleraP2PDialog.cpp
         UserInterface/Dialog/Kaillera/KailleraWaitingGamesDialog.cpp
         UserInterface/Dialog/Lobby/LobbyClient.cpp
+        UserInterface/Dialog/Lobby/LobbyTheme.cpp
+        UserInterface/Dialog/Lobby/LobbyWidgets.cpp
+        UserInterface/Dialog/Lobby/LobbyBrowsePanels.cpp
+        UserInterface/Dialog/Lobby/LobbyPanelLayout.cpp
+        UserInterface/Dialog/Lobby/LobbyRoomWindow.cpp
+        UserInterface/Dialog/Lobby/LobbySocialWidgets.cpp
+        UserInterface/Dialog/Lobby/LobbyPrivateChats.cpp
+        UserInterface/Dialog/Lobby/LobbySocialDialogs.cpp
         UserInterface/Dialog/Lobby/LobbyConnectDialog.cpp
         UserInterface/Dialog/Lobby/CreateRoomDialog.cpp
         UserInterface/Dialog/Lobby/RollbackLobbyDialog.cpp
+        UserInterface/Dialog/Lobby/RollbackLobbySocial.cpp
         UserInterface/Dialog/Lobby/LagStats.cpp
         UserInterface/Dialog/Lobby/LagStatsDialog.cpp
         UserInterface/Dialog/Lobby/NetplaySaveDialogs.cpp
+        UserInterface/Dialog/Lobby/GameSettingsDialog.cpp
         UserInterface/Dialog/Netplay/NetplayCommon.cpp
         UserInterface/Dialog/Netplay/CreateNetplaySessionDialog.cpp
         UserInterface/Dialog/Netplay/CreateNetplaySessionDialog.ui
@@ -153,17 +169,17 @@ if (NETPLAY)
         UserInterface/Widget/Netplay/CreateNetplaySessionWidget.cpp
         UserInterface/Widget/Netplay/CreateNetplaySessionEmptyWidget.cpp
         UserInterface/Widget/Netplay/CreateNetplaySessionEmptyWidget.ui
+        Utilities/KailleraExport/ChatOverlay.cpp
         Utilities/KailleraExport/KrecParser.cpp
+        Utilities/KailleraExport/KrecMp4Export.cpp
+        Utilities/KailleraExport/EmulatorProxy.cpp
+        Utilities/KailleraExport/PifReplay.cpp
+        Utilities/KailleraExport/FrameCapture.cpp
+        Utilities/KailleraExport/FfmpegEncoder.cpp
+        Utilities/KailleraExport/VidExtProxy.cpp
     )
     if (WIN32)
         list(APPEND RMG_SOURCES
-            Utilities/KailleraExport/KrecMp4Export.cpp
-            Utilities/KailleraExport/ChatOverlay.cpp
-            Utilities/KailleraExport/EmulatorProxy.cpp
-            Utilities/KailleraExport/PifReplay.cpp
-            Utilities/KailleraExport/FrameCapture.cpp
-            Utilities/KailleraExport/FfmpegEncoder.cpp
-            Utilities/KailleraExport/VidExtProxy.cpp
             Utilities/KailleraExport/ReplayFileExport.cpp
             Utilities/KailleraExport/ReplayHook.cpp
         )

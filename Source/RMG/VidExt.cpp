@@ -13,6 +13,7 @@
 #include <RMG-Core/Emulation.hpp>
 #include <RMG-Core/Kaillera.hpp>
 #include <RMG-Core/Netplay.hpp>
+#include <RMG-Core/Plugins.hpp>
 #include <RMG-Core/Settings.hpp>
 #include <RMG-Core/rmgk_gekko.hpp>
 #include <RMG-Core/VidExt.hpp>
@@ -557,6 +558,16 @@ static void VidExt_UpdateOsdDisplaySize(void)
         return;
     }
 
+    // The window's own size in pixels. The viewport a plugin leaves behind isn't
+    // always the window: Angrylion's is the size of the N64 picture, which drew
+    // the OSD tiny in the bottom left corner.
+    const QSize windowSize = (*l_OGLWidget)->size() * (*l_OGLWidget)->devicePixelRatio();
+    if (windowSize.width() > 0 && windowSize.height() > 0)
+    {
+        OnScreenDisplaySetDisplaySize(windowSize.width(), windowSize.height());
+        return;
+    }
+
     QOpenGLFunctions* functions = context->functions();
     if (functions == nullptr)
     {
@@ -748,6 +759,17 @@ static m64p_error VidExt_SetMode(int Width, int Height, int BitsPerPixel, int Sc
 
             OnScreenDisplayLoadSettings();
             l_OsdInitialized = true;
+        }
+    }
+    else if (!l_OsdInitialized)
+    {
+        // Vulkan: the plugin draws the OSD into its own frames. A plugin
+        // that can't simply goes without one.
+        if (OnScreenDisplayInit(true))
+        {
+            OnScreenDisplayLoadSettings();
+            l_OsdInitialized = true;
+            CorePluginsSetGfxVulkanOverlay(OnScreenDisplayGetVulkanHooks());
         }
     }
 
@@ -975,6 +997,7 @@ static m64p_error VidExt_GLSwapBuf(void)
             swapUs,
             0,
             1);
+        rmgk_gekko::pace_after_present();
 
         return M64ERR_SUCCESS;
     }
@@ -1010,6 +1033,7 @@ static m64p_error VidExt_GLSwapBuf(void)
         swapUs,
         makeCurrentUs,
         2);
+    rmgk_gekko::pace_after_present();
 
     return M64ERR_SUCCESS;
 }

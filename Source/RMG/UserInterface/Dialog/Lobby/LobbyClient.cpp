@@ -22,10 +22,12 @@
 #include "LobbyClient.hpp"
 
 #include <RMG-Core/Cheats.hpp>
+#include <RMG-Core/Compression.hpp>
 #include <RMG-Core/Directories.hpp>
 #include <RMG-Core/Error.hpp>
 #include <RMG-Core/LobbyIce.hpp>
 #include <RMG-Core/NetplaySave.hpp>
+#include <RMG-Core/GameOptions.hpp>
 #include <RMG-Core/Settings.hpp>
 #include <RMG-Core/Version.hpp>
 
@@ -53,6 +55,7 @@
 #include <QtConcurrent/QtConcurrentRun>
 #include <cstring>
 #include <algorithm>
+#include <chrono>
 #include <filesystem>
 #include <system_error>
 #include <utility>
@@ -67,6 +70,48 @@ namespace
     constexpr int KEYFRAME_UPLOAD_CHUNK_BYTES = 64 * 1024;
     constexpr int MAX_KEYFRAME_RAW_BYTES = 24 * 1024 * 1024;
     const QByteArray KEYFRAME_ZLIB_MAGIC("RMGKZ1", 6);
+    // An encoded keyframe or late-join blob: the raw state, or the magic, a
+    // size and a smaller compressed copy (encodeSpectateKeyframe).
+    constexpr int MAX_KEYFRAME_ENCODED_BYTES = MAX_KEYFRAME_RAW_BYTES + 6 + 4;
+
+    // What a keyframe or late-join blob may arrive as. The lobby enforces its
+    // own limits (broadcast.go, latejoin.go); these hold even if it doesn't,
+    // so a stream of chunks can't grow without bound here. Generous on count:
+    // the total byte cap is the real limit.
+    constexpr int MAX_RECEIVED_CHUNK_COUNT = 4096;
+    constexpr int MAX_RECEIVED_CHUNK_BYTES = 1024 * 1024;
+
+    // The largest save-data section (RMGKSAV1, uncompressed) is about 162 KiB:
+    // 2 KiB EEPROM + 32 KiB SRAM + 128 KiB FlashRAM plus a few headers.
+    constexpr int MAX_SAVE_SECTION_RAW_BYTES = 256 * 1024;
+
+    // The largest pre-match manifest a spectator or late joiner takes; the
+    // lobby holds broadcasters to the same size (broadcast.go).
+    constexpr int MAX_RELAYED_MANIFEST_BYTES = 512 * 1024;
+
+    // Inflates qCompress() output (a 4-byte big-endian size, then a zlib
+    // stream) from another machine. qUncompress() trusts that size, and keeps
+    // growing past it, so a few bytes could make it allocate gigabytes; here
+    // the output is a buffer of the declared size, at most maxBytes, that the
+    // stream must fill exactly.
+    bool uncompressFromPeer(const char* data, qsizetype size, qsizetype maxBytes, QByteArray& out)
+    {
+        out.clear();
+        if (data == nullptr || size <= qsizetype(sizeof(quint32)))
+            return false;
+
+        const quint32 declared = qFromBigEndian<quint32>(data);
+        if (declared == 0 || qsizetype(declared) > maxBytes)
+            return false;
+
+        QByteArray inflated(qsizetype(declared), Qt::Uninitialized);
+        if (!CoreZlibInflateExact(data + sizeof(quint32), size_t(size) - sizeof(quint32),
+                                  inflated.data(), size_t(declared)))
+            return false;
+
+        out = std::move(inflated);
+        return true;
+    }
 
     QByteArray encodeSpectateKeyframe(const QByteArray& raw)
     {
@@ -86,11 +131,13 @@ namespace
         return packed.size() < raw.size() ? packed : raw;
     }
 
-    bool decodeSpectateKeyframe(const QByteArray& encoded, QByteArray& raw)
+    // maxRawBytes is the most the decoded blob may hold.
+    bool decodeSpectateKeyframe(const QByteArray& encoded, QByteArray& raw,
+                                int maxRawBytes = MAX_KEYFRAME_RAW_BYTES)
     {
         if (!encoded.startsWith(KEYFRAME_ZLIB_MAGIC))
         {
-            if (encoded.isEmpty() || encoded.size() > MAX_KEYFRAME_RAW_BYTES)
+            if (encoded.isEmpty() || encoded.size() > maxRawBytes)
                 return false;
             raw = encoded; // keyframe from a pre-compression broadcaster
             return true;
@@ -102,11 +149,17 @@ namespace
         quint32 rawSizeBE = 0;
         std::memcpy(&rawSizeBE, encoded.constData() + KEYFRAME_ZLIB_MAGIC.size(), sizeof(rawSizeBE));
         const quint32 expectedSize = qFromBigEndian(rawSizeBE);
-        if (expectedSize == 0 || expectedSize > MAX_KEYFRAME_RAW_BYTES)
+        if (expectedSize == 0 || expectedSize > quint32(maxRawBytes))
             return false;
 
-        raw = qUncompress(encoded.sliced(headerBytes));
-        return raw.size() == static_cast<int>(expectedSize);
+        // The compressed copy carries its own size too; it must agree.
+        QByteArray inflated;
+        if (!uncompressFromPeer(encoded.constData() + headerBytes, encoded.size() - headerBytes,
+                                qsizetype(expectedSize), inflated) ||
+            inflated.size() != qsizetype(expectedSize))
+            return false;
+        raw = std::move(inflated);
+        return true;
     }
 
     // Pinned-anchor-port rebind retry (see initiateUdpAnchor): attempt cadence
@@ -162,6 +215,39 @@ namespace
     // port; only the twentieth failure reaches the UI.
     constexpr int MAX_ICE_AUTO_RESTARTS = 19;
     constexpr int MAX_ICE_CONNECTION_ATTEMPTS = MAX_ICE_AUTO_RESTARTS + 1;
+    // How long a reply to an ICE ping series that has ended still counts: a
+    // real round trip, just slower than the retries allowed for.
+    constexpr qint64 ICE_PING_LATE_REPLY_MS = 5'000;
+
+    // Ping checks. A join waits this long for the host's ping before it goes
+    // ahead unmeasured, and decides on the lowest of a few samples so one slow
+    // reply doesn't turn it away.
+    constexpr qint64 PING_CHECK_TIMEOUT_MS = 6'000;
+    constexpr int PING_CHECK_SAMPLES = 3;
+    // A challenge's probe agent outlives the challenge by the lobby's 5 s grant
+    // grace, so a last sample can land; a little more covers a lost
+    // PING_CHECK_END.
+    constexpr qint64 PROBE_PEER_GRACE_MS = 6'000;
+    constexpr qint64 PROBE_PEER_SLACK_MS = 3'000;
+    // A probe agent gets a few fresh ICE generations, not the mesh's twenty:
+    // the measurement is a nicety, and its grant is short.
+    constexpr int MAX_PROBE_PEER_RESTARTS = 3;
+    // Quick samples first so a number shows within a second or two, then
+    // the room's 3 s cadence while a challenge stays open.
+    qint64 probePeerIntervalMs(int seriesStarted)
+    {
+        return seriesStarted < 3 ? 500 : seriesStarted < 6 ? 1'000 : 3'000;
+    }
+
+    // Unanswered heartbeats are forgotten after this.
+    constexpr qint64 HEARTBEAT_ACK_TIMEOUT_MS = 60'000;
+
+    // Round trips and expiry use a clock that never jumps.
+    qint64 monotonicMs()
+    {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
 
     QString iceStateName(int state)
     {
@@ -325,18 +411,23 @@ namespace
     }
 
     // Manifest sections, in this order after the header.
-    constexpr uint32_t PREMATCH_SECTION_CHEATS    = 1u << 0;
-    constexpr uint32_t PREMATCH_SECTION_SAVE_DATA = 1u << 1;
+    constexpr uint32_t PREMATCH_SECTION_CHEATS       = 1u << 0;
+    constexpr uint32_t PREMATCH_SECTION_SAVE_DATA    = 1u << 1;
+    constexpr uint32_t PREMATCH_SECTION_GAME_OPTIONS = 1u << 2;
 
     // saveData is the host's starting save, or null to start blank. It rides
     // compressed in its own section, which clients before save data refuse;
-    // the lobby keeps them out of matches that use it.
+    // the lobby keeps them out of matches that use it. gameOptions, when there
+    // are any, ride the same way (uncompressed: they're small), and a match
+    // without them gets no section, so its manifest stays as it always was.
     bool buildPrematchManifest(const QString& romFile, const CoreNetplaySaveData* saveData,
+                               const CoreNetplayGameOptions& gameOptions,
                                std::string& manifest, uint64_t& manifestHash, size_t& cheatCount)
     {
         std::vector<CoreCheat> cheats;
         std::string cheatManifest;
         std::string saveSection;
+        std::string gameOptionsSection;
 
         if (!CoreGetEnabledNetplayCheats(romFile.toStdU32String(), cheats) || !CoreSerializeNetplayCheats(cheats, cheatManifest))
             return false;
@@ -348,18 +439,27 @@ namespace
             const QByteArray packed = qCompress(QByteArray::fromStdString(raw), 9);
             saveSection.assign(packed.constData(), size_t(packed.size()));
         }
+        const bool hasGameOptions = !gameOptions.IsEmpty();
+        if (hasGameOptions && !CoreSerializeNetplayGameOptions(gameOptions, gameOptionsSection))
+            return false;
 
         manifest.clear();
         manifest.append("RMGKPMAN", 8);
         appendPrematchU32(manifest, 1);
         appendPrematchU32(manifest, PREMATCH_SECTION_CHEATS |
-            (saveData != nullptr ? PREMATCH_SECTION_SAVE_DATA : 0u));
+            (saveData != nullptr ? PREMATCH_SECTION_SAVE_DATA : 0u) |
+            (hasGameOptions ? PREMATCH_SECTION_GAME_OPTIONS : 0u));
         appendPrematchU32(manifest, static_cast<uint32_t>(cheatManifest.size()));
         manifest.append(cheatManifest);
         if (saveData != nullptr)
         {
             appendPrematchU32(manifest, static_cast<uint32_t>(saveSection.size()));
             manifest.append(saveSection);
+        }
+        if (hasGameOptions)
+        {
+            appendPrematchU32(manifest, static_cast<uint32_t>(gameOptionsSection.size()));
+            manifest.append(gameOptionsSection);
         }
         manifestHash = prematchHashBytes(manifest);
         cheatCount = cheats.size();
@@ -380,7 +480,8 @@ namespace
         if (manifest.size() < 8 || std::memcmp(manifest.data(), "RMGKPMAN", 8) != 0 ||
             !readPrematchU32(manifest, offset, version) ||
             !readPrematchU32(manifest, offset, sectionMask) ||
-            version != 1 || (sectionMask & ~(PREMATCH_SECTION_CHEATS | PREMATCH_SECTION_SAVE_DATA)) != 0 ||
+            version != 1 ||
+            (sectionMask & ~(PREMATCH_SECTION_CHEATS | PREMATCH_SECTION_SAVE_DATA | PREMATCH_SECTION_GAME_OPTIONS)) != 0 ||
             !readPrematchU32(manifest, offset, cheatManifestLen) ||
             offset + cheatManifestLen > manifest.size())
         {
@@ -400,9 +501,24 @@ namespace
             uint32_t saveLen = 0;
             if (!readPrematchU32(manifest, offset, saveLen) || offset + saveLen > manifest.size())
                 return false;
-            const QByteArray raw = qUncompress(QByteArray(manifest.data() + offset, int(saveLen)));
+            QByteArray raw;
+            if (!uncompressFromPeer(manifest.data() + offset, qsizetype(saveLen),
+                                    MAX_SAVE_SECTION_RAW_BYTES, raw))
+                return false;
             offset += saveLen;
-            if (raw.isEmpty() || !CoreDeserializeNetplaySaveData(raw.toStdString(), saveData))
+            if (!CoreDeserializeNetplaySaveData(raw.toStdString(), saveData))
+                return false;
+        }
+        // Likewise game options: none without the section.
+        CoreNetplayGameOptions gameOptions;
+        if ((sectionMask & PREMATCH_SECTION_GAME_OPTIONS) != 0)
+        {
+            uint32_t gameOptionsLen = 0;
+            if (!readPrematchU32(manifest, offset, gameOptionsLen) || gameOptionsLen > manifest.size() - offset)
+                return false;
+            const std::string section(manifest.data() + offset, gameOptionsLen);
+            offset += gameOptionsLen;
+            if (!CoreDeserializeNetplayGameOptions(section, gameOptions) || gameOptions.IsEmpty())
                 return false;
         }
         if (offset != manifest.size())
@@ -412,6 +528,7 @@ namespace
         if (!CoreSetNetplayCheats(cheats))
             return false;
         CoreSetNetplaySaveData(saveData);
+        CoreSetNetplayGameOptions(gameOptions);
         return true;
     }
 
@@ -440,10 +557,13 @@ namespace
         return readPrematchU64(packet, 13, manifestHash);
     }
 
+    // Manifest bytes per fragment datagram, after its 29-byte header.
+    constexpr int PREMATCH_FRAGMENT_PAYLOAD_BYTES = 1000;
+
     QList<QByteArray> fragmentPrematchPacket(const QByteArray& packet,
         quint64 senderUserId, uint64_t manifestHash)
     {
-        constexpr int kPayloadBytes = 1000;
+        constexpr int kPayloadBytes = PREMATCH_FRAGMENT_PAYLOAD_BYTES;
         if (packet.size() <= kPayloadBytes)
             return {packet};
 
@@ -508,6 +628,7 @@ namespace
 
 LobbyClient::LobbyClient(QObject* parent)
     : QObject(parent)
+    , m_iceProbes(PROBE_ATTEMPTS, PROBE_RETRY_INTERVAL_MS, ICE_PING_LATE_REPLY_MS)
 {
     m_ws = new QWebSocket(QString(), QWebSocketProtocol::VersionLatest, this);
     connect(m_ws, &QWebSocket::connected,           this, &LobbyClient::onWsConnected);
@@ -600,6 +721,16 @@ void LobbyClient::connectToServer(const QString& wsUrl, const QString& username,
     m_selfUserId       = 0;
     m_users.clear();
     m_rooms.clear();
+    // The server drops local players with the connection.
+    m_localPlayers.clear();
+    m_pendingLocalControllers.clear();
+    m_localPlayersSupported = false;
+    m_socialSupported = false;
+    m_pingCheckSupported = false;
+    m_spectatorChatSupported = false;
+    m_challengeSettingsSupported = false;
+    m_pmSettingsSupported = false;
+    emit localPlayersChanged();
 
     qInfo() << "Rollback lobby local IPv4 detection"
             << "localIp" << (m_pendingLocalIp.isEmpty() ? QString("<none>") : m_pendingLocalIp);
@@ -825,6 +956,7 @@ void LobbyClient::onWsConnected()
     // The WebSocket is connected by the time this slot runs, so its local
     // address reflects the route the OS actually chose for lobby traffic.
     const QString transport = detectTransportMedium(m_ws->localAddress());
+    m_connection = transport;
     if (!transport.isEmpty())
         data["connection"] = transport;
     // Ask the server to withhold our country from presence and flag us
@@ -846,7 +978,19 @@ void LobbyClient::onWsConnected()
     data["romHashes"] = romArr;
     data["iceSupported"] = true;
     data["lateJoin"] = true;
+    data["localPlayers"] = true;
+    data["social"] = true;
+    data["spectatorChat"] = true;
     data["saveData"] = true;
+    data["gameOptions"] = true;
+    // A room with more options than older clients take keeps them out of its
+    // matches (CoreGameOptionsLegacyMaxOptions).
+    data["gameOptionsMax"] = CoreGameOptionsMaxOptions;
+    data["pingCheck"] = true;
+    if (m_challengesOff)
+        data["noChallenges"] = true;
+    if (m_privateMessagesOff)
+        data["noPrivateMessages"] = true;
     if (!m_pendingLocalIp.isEmpty())
         data["localIp"] = m_pendingLocalIp;
 
@@ -881,13 +1025,23 @@ void LobbyClient::onWsDisconnected()
     m_heartbeatTimer->stop();
     m_udpKeepaliveTimer->stop();
     m_isModerator = false; // role is per-connection; must re-auth after reconnect
+    m_moderatorUsers.clear();
     // User ids restart when the server does — drop measurements so a recycled
     // id can't inherit another player's ping history.
     m_measuredPing.clear();
+    // Ping checks need the lobby to signal and end them. Their agents never
+    // carry a match, so they go now even while a match defers the reset.
+    for (const quint64 peerId : m_probePeers.keys())
+        removeProbePeer(peerId, QStringLiteral("disconnected"));
+    m_probeGenerations.clear();
+    m_pingCheck = PingCheck{};
+    m_heartbeatSentMs.clear();
+    m_serverRttMs = 0;
     // In-flight probe series belong to the old connection: their endpoints and
     // user ids are stale, so retrying them would burst at whoever now holds
     // those ids and emit failure notices for peers we're no longer talking to.
     m_pendingProbes.clear();
+    m_iceProbes.clear();
     m_probeFailStreak.clear();
     m_recentlyMatchedNonces.clear();
     // Learned routes are keyed by user id too — same recycled-id hazard.
@@ -924,7 +1078,7 @@ void LobbyClient::handleEnvelope(const QJsonObject& env)
 
     if      (type == "HELLO_OK")             handleHelloOk(data);
     else if (type == "HELLO_FAIL")           handleHelloFail(data);
-    else if (type == "HEARTBEAT_ACK")        handleHeartbeatAck(data);
+    else if (type == "HEARTBEAT_ACK")        handleHeartbeatAck(env.value("id").toString());
     else if (type == "PRESENCE_FULL")        handlePresenceFull(data);
     else if (type == "PRESENCE_DELTA")       handlePresenceDelta(data);
     else if (type == "ROOM_LIST")            handleRoomList(data);
@@ -936,25 +1090,41 @@ void LobbyClient::handleEnvelope(const QJsonObject& env)
     else if (type == "ROOM_LEFT")            handleRoomLeft(data);
     else if (type == "CHAT_MSG")             handleChatMsg(data);
     else if (type == "CHAT_HISTORY_REPLY")   handleChatHistoryReply(data);
+    else if (type == "CHAT_FAIL")            handleChatFail(data);
+    else if (type == "CHALLENGE_SENT")       handleChallengeSent(data);
+    else if (type == "CHALLENGE_INCOMING")   handleChallengeIncoming(data);
+    else if (type == "CHALLENGE_RESULT")     handleChallengeResult(data);
+    else if (type == "CHALLENGE_GAMES_REPLY") handleChallengeGamesReply(data);
     else if (type == "PING_PROBE_REPLY")     handlePingProbeReply(data);
     else if (type == "PING_PROBE_INCOMING")  handlePingProbeIncoming(data);
     else if (type == "ICE_SIGNAL")           handleIceSignal(data);
+    else if (type == "PING_CHECK_REPLY")     handlePingCheckReply(data, env.value("id").toString());
+    else if (type == "PING_CHECK_INCOMING")  handlePingCheckIncoming(data);
+    else if (type == "PING_CHECK_END")       handlePingCheckEnd(data);
     else if (type == "MATCH_BEGIN")          handleMatchBegin(data);
     else if (type == "MATCH_PEER_LEFT")      handleMatchPeerLeft(data);
     else if (type == "MATCH_ADMIT_BEGIN")    handleMatchAdmitBegin(data);
     else if (type == "MATCH_ADMIT_SIGNAL")   handleMatchAdmitSignal(data);
     else if (type == "MATCH_ADMIT_FAIL")     handleMatchAdmitFail(data);
     else if (type == "QUICK_MATCH_STATUS")   handleQuickMatchStatus(data);
+    else if (type == "LOCAL_PLAYER_ADDED")   handleLocalPlayerAdded(data);
+    else if (type == "LOCAL_PLAYER_REMOVED") handleLocalPlayerRemoved(data);
+    else if (type == "LOCAL_PLAYER_FAIL")    handleLocalPlayerFail(data);
     else if (type == "SPECTATE_BEGIN")       handleSpectateBegin(data);
     else if (type == "SPECTATE_DATA")        handleSpectateData(data);
     else if (type == "SPECTATE_KEYFRAME")    handleSpectateKeyframe(data);
     else if (type == "SPECTATE_END")         handleSpectateEnd(data);
     else if (type == "SPECTATE_FAIL")        handleSpectateFail(data);
     else if (type == "BROADCAST_VIEWER_COUNT") handleBroadcastViewerCount(data);
+    else if (type == "BROADCAST_KEYFRAME_REQUEST") handleBroadcastKeyframeRequest(data);
     else if (type == "ADMIN_AUTH_OK")        handleAdminAuthOk(data);
     else if (type == "ADMIN_AUTH_FAIL")      handleAdminAuthFail(data);
     else if (type == "MOD_NOTICE")           handleModNotice(data);
     else if (type == "MOD_LIST")             handleModList(data);
+    else if (type == "ADMIN_LOGGED_OUT")     handleAdminLoggedOut();
+    else if (type == "MOD_RESULT")           handleModResult(data);
+    else if (type == "MOD_TARGET_INFO")      handleModTargetInfo(data);
+    else if (type == "MOD_PEERS")            handleModPeers(data);
     else qDebug() << "lobby: unknown message type" << type;
 }
 
@@ -963,8 +1133,19 @@ void LobbyClient::handleEnvelope(const QJsonObject& env)
 void LobbyClient::handleHelloOk(const QJsonObject& data)
 {
     m_selfUserId  = static_cast<quint64>(data.value("userId").toDouble());
+    // The lobby keeps one spelling of a name, which may not be the one typed.
+    const QString keptUsername = data.value("username").toString();
+    if (!keptUsername.isEmpty())
+        m_pendingUsername = keptUsername;
     m_observedIp  = data.value("observedIp").toString();
     m_region      = data.value("region").toString();
+    m_localPlayersSupported = data.value("localPlayers").toBool();
+    m_socialSupported = data.value("social").toBool();
+    m_spectatorChatSupported = data.value("spectatorChat").toBool();
+    m_challengeSettingsSupported = data.value("challengeSettings").toBool();
+    m_pmSettingsSupported = data.value("pmSettings").toBool();
+    m_pingCheckSupported = data.value("pingCheck").toBool();
+    emit localPlayersChanged();
 
     std::string stunHost = "stun.l.google.com";
     quint16 stunPort = 19302;
@@ -1034,6 +1215,9 @@ void LobbyClient::handleHelloOk(const QJsonObject& data)
 
     setState(ConnectionState::Connected);
     m_heartbeatTimer->start();
+    // One now, so the lobby round trip is known by the next heartbeat rather
+    // than the one after.
+    onHeartbeatTimer();
     // ICE owns the UDP sockets. The legacy lobby anchor is intentionally not
     // opened by ICE-capable clients.
 }
@@ -1048,10 +1232,16 @@ void LobbyClient::handleHelloFail(const QJsonObject& data)
         m_ws->close();
 }
 
-void LobbyClient::handleHeartbeatAck(const QJsonObject& data)
+void LobbyClient::handleHeartbeatAck(const QString& envelopeId)
 {
-    Q_UNUSED(data);
-    // TODO: use serverTime drift if we care
+    const auto sent = m_heartbeatSentMs.constFind(envelopeId);
+    if (envelopeId.isEmpty() || sent == m_heartbeatSentMs.constEnd())
+        return;
+    const qint64 rttMs = monotonicMs() - sent.value();
+    m_heartbeatSentMs.erase(sent);
+    if (rttMs < 0 || rttMs > HEARTBEAT_ACK_TIMEOUT_MS)
+        return;
+    m_serverRttMs = LobbyPing::smoothRtt(m_serverRttMs, int(std::max<qint64>(1, rttMs)));
 }
 
 void LobbyClient::handlePresenceFull(const QJsonObject& data)
@@ -1110,6 +1300,11 @@ void LobbyClient::handleRoomList(const QJsonObject& data)
         r.matchId      = static_cast<quint64>(o.value("matchId").toDouble());
         r.viewerCount  = qMax(0, o.value("viewerCount").toInt());
         r.lateJoin     = o.value("lateJoin").toBool();
+        r.privateRoom  = o.value("private").toBool();
+        r.maxPing      = qMax(0, o.value("maxPing").toInt());
+        r.wiredOnly    = o.value("wiredOnly").toBool();
+        r.gameOptions  = parseGameOptions(o.value("gameOptions"));
+        r.gameOptionsPreset = parseGameOptionsPreset(o.value("gameOptionsPreset"));
         for (const auto& n : o.value("playerNames").toArray())
             r.playerNames << n.toString();
         m_rooms.insert(r.id, r);
@@ -1151,9 +1346,104 @@ void LobbyClient::handleRoomJoinFail(const QJsonObject& data)
     emit roomJoinFailed(data.value("reason").toString());
 }
 
+quint64 LobbyClient::seatPeerId(const QJsonObject& seat)
+{
+    const quint64 peerId = static_cast<quint64>(seat.value("peerId").toDouble());
+    return peerId != 0 ? peerId : static_cast<quint64>(seat.value("userId").toDouble());
+}
+
+QList<LobbyClient::LobbyMatchPeer> LobbyClient::connectionPeers(const QList<LobbyMatchPeer>& peers)
+{
+    QList<LobbyMatchPeer> connections;
+    for (const LobbyMatchPeer& peer : peers)
+    {
+        if (peer.userId == peer.peerId)
+            connections.append(peer);
+    }
+    return connections;
+}
+
+bool LobbyClient::isLocalPlayer(quint64 userId) const
+{
+    return std::any_of(m_localPlayers.cbegin(), m_localPlayers.cend(),
+                       [userId](const LocalPlayer& player) { return player.userId == userId; });
+}
+
+int LobbyClient::localPlayerController(quint64 userId) const
+{
+    for (const LocalPlayer& player : m_localPlayers)
+    {
+        if (player.userId == userId)
+            return player.controller;
+    }
+    return 0;
+}
+
+void LobbyClient::addLocalPlayer(const QString& name, int controller)
+{
+    m_pendingLocalControllers.insert(name, controller);
+    QJsonObject d;
+    d["name"] = name;
+    sendEnvelope("LOCAL_PLAYER_ADD", d);
+}
+
+void LobbyClient::removeLocalPlayer(quint64 userId)
+{
+    QJsonObject d;
+    d["userId"] = QJsonValue(qint64(userId));
+    sendEnvelope("LOCAL_PLAYER_REMOVE", d);
+}
+
+void LobbyClient::setLocalPlayerController(quint64 userId, int controller)
+{
+    for (LocalPlayer& player : m_localPlayers)
+    {
+        if (player.userId == userId)
+            player.controller = controller;
+    }
+    emit localPlayersChanged();
+}
+
+void LobbyClient::handleLocalPlayerAdded(const QJsonObject& data)
+{
+    LocalPlayer player;
+    player.userId = static_cast<quint64>(data.value("userId").toDouble());
+    player.name = data.value("name").toString();
+    player.controller = m_pendingLocalControllers.take(player.name);
+    m_localPlayers.append(player);
+    emit localPlayersChanged();
+}
+
+void LobbyClient::handleLocalPlayerRemoved(const QJsonObject& data)
+{
+    const quint64 userId = static_cast<quint64>(data.value("userId").toDouble());
+    m_localPlayers.removeIf([userId](const LocalPlayer& player) { return player.userId == userId; });
+    emit localPlayersChanged();
+}
+
+void LobbyClient::handleLocalPlayerFail(const QJsonObject& data)
+{
+    const QString name = data.value("name").toString();
+    m_pendingLocalControllers.remove(name);
+    emit localPlayerFailed(name, data.value("reason").toString());
+}
+
 void LobbyClient::reconcileIcePeers(const QJsonObject& roomState)
 {
     const quint64 roomId = static_cast<quint64>(roomState.value("id").toDouble());
+
+    m_seatPeers.clear();
+    for (const QJsonValue& value : roomState.value("players").toArray())
+    {
+        const QJsonObject player = value.toObject();
+        const quint64 userId = static_cast<quint64>(player.value("userId").toDouble());
+        const quint64 peerId = seatPeerId(player);
+        m_seatPeers.insert(userId, peerId);
+        // Seated with us: the room mesh measures them from here on. The other
+        // side drops its probe agent on the same room state.
+        dropProbePeerForMesh(userId);
+        dropProbePeerForMesh(peerId);
+    }
 
     // Room state is control-plane data. Once GekkoNet owns the established
     // mesh, no server-side room transition may replace or remove the agents
@@ -1170,7 +1460,7 @@ void LobbyClient::reconcileIcePeers(const QJsonObject& roomState)
         for (const QJsonValue& value : roomState.value("players").toArray())
         {
             const QJsonObject player = value.toObject();
-            const quint64 userId = static_cast<quint64>(player.value("userId").toDouble());
+            const quint64 userId = seatPeerId(player);
             if (userId == 0 || userId == m_selfUserId)
                 continue;
             seated.insert(userId);
@@ -1200,7 +1490,7 @@ void LobbyClient::reconcileIcePeers(const QJsonObject& roomState)
     for (const QJsonValue& value : roomState.value("players").toArray())
     {
         const QJsonObject player = value.toObject();
-        const quint64 userId = static_cast<quint64>(player.value("userId").toDouble());
+        const quint64 userId = seatPeerId(player);
         if (userId == 0 || userId == m_selfUserId)
             continue;
         if (!player.value("iceSupported").toBool())
@@ -1268,7 +1558,10 @@ void LobbyClient::resetIceMesh()
     }
 
     for (quint64 userId : std::as_const(m_icePeerIds))
+    {
         LobbyIce::remove_peer(userId);
+        m_iceProbes.cancel(userId);
+    }
     m_icePeerIds.clear();
     m_lastIceStates.clear();
     m_iceGenerations.clear();
@@ -1277,6 +1570,7 @@ void LobbyClient::resetIceMesh()
     m_currentIceHostUserId = 0;
     m_roomPeerPings.clear();
     m_pendingProbes.clear();
+    m_seatPeers.clear();
 }
 
 void LobbyClient::resetIceTransport()
@@ -1292,6 +1586,9 @@ void LobbyClient::resetIceTransport()
 
     resetIceMesh();
     LobbyIce::reset();
+    m_probePeers.clear();
+    m_probeGenerations.clear();
+    m_iceProbes.clear();
     m_deferredIceMeshReset = false;
     m_deferredIceTransportReset = false;
 }
@@ -1322,6 +1619,12 @@ void LobbyClient::setMatchTransportActive(bool active)
 
 void LobbyClient::handleIceSignal(const QJsonObject& data)
 {
+    if (data.value("probe").toBool())
+    {
+        handleProbeIceSignal(data);
+        return;
+    }
+
     const quint64 roomId = static_cast<quint64>(data.value("roomId").toDouble());
     const quint64 fromUserId = static_cast<quint64>(data.value("fromUserId").toDouble());
     const QString kind = data.value("kind").toString();
@@ -1334,6 +1637,9 @@ void LobbyClient::handleIceSignal(const QJsonObject& data)
                                 .arg(fromUserId).arg(roomId).arg(m_currentIceRoomId).arg(kind));
         return;
     }
+    // They're building the room's agent for us, so our ping-check agent for
+    // them can't take this. Without it the signal waits for the mesh's own.
+    dropProbePeerForMesh(fromUserId);
 
     const quint32 currentGeneration = m_iceGenerations.value(fromUserId, 0);
     if (generation < currentGeneration)
@@ -1443,6 +1749,7 @@ bool LobbyClient::restartIcePeer(quint64 userId, quint32 generation,
         userId, m_iceRestartAttempts.value(userId) + 1,
         MAX_ICE_CONNECTION_ATTEMPTS);
 
+    m_iceProbes.cancel(userId);
     for (auto it = m_pendingProbes.begin(); it != m_pendingProbes.end();)
     {
         if (it->targetUserId == userId)
@@ -1505,10 +1812,33 @@ void LobbyClient::flushIceEvents()
                                          QString::fromStdString(diagnostic.message))));
     }
 
-    if (m_ws && m_ws->state() == QAbstractSocket::ConnectedState && m_currentIceRoomId != 0)
+    if (m_ws && m_ws->state() == QAbstractSocket::ConnectedState &&
+        (m_currentIceRoomId != 0 || !m_probePeers.isEmpty()))
     {
         for (LobbyIceSignal& signal : LobbyIce::take_local_signals())
         {
+            // A ping check's agent signals outside any room.
+            if (const auto probe = m_probePeers.constFind(signal.peerUserId); probe != m_probePeers.constEnd())
+            {
+                QJsonObject data;
+                data["targetUserId"] = QJsonValue(qint64(signal.peerUserId));
+                data["roomId"] = 0;
+                data["probe"] = true;
+                data["kind"] = QString::fromStdString(signal.kind);
+                data["generation"] = int(probe->generation);
+                if (!signal.value.empty())
+                    data["value"] = QString::fromStdString(signal.value);
+                writePingDiagnostic(QStringLiteral("PROBE_SIGNAL_OUT"),
+                                    QStringLiteral("peer=%1 kind=%2 generation=%3 %4")
+                                        .arg(pingUserLabel(signal.peerUserId), QString::fromStdString(signal.kind))
+                                        .arg(probe->generation)
+                                        .arg(iceSignalSummary(QString::fromStdString(signal.kind),
+                                                              QString::fromStdString(signal.value))));
+                sendEnvelope("ICE_SIGNAL", data);
+                continue;
+            }
+            if (m_currentIceRoomId == 0)
+                continue; // no room mesh for it to belong to
             QJsonObject data;
             data["targetUserId"] = QJsonValue(qint64(signal.peerUserId));
             data["roomId"] = QJsonValue(qint64(m_currentIceRoomId));
@@ -1573,22 +1903,36 @@ void LobbyClient::flushIceEvents()
         }
         if (static_cast<quint8>(packet.data[0]) != ICE_PING_OP_REPLY)
             continue;
-        const auto it = m_pendingProbes.find(nonce);
-        if (it == m_pendingProbes.end() || it->targetUserId != packet.peerUserId)
+        // Timed against the attempt this nonce went out with: libjuice's own
+        // timing when it has one, else the time since that attempt.
+        const auto sample = m_iceProbes.reply(packet.peerUserId, nonce, packet.roundTripUs, monotonicMs());
+        if (!sample)
             continue;
-        const qint64 rttUs = packet.roundTripUs == 0 ? -1 : qint64(packet.roundTripUs);
-        const int rttMs = rttUs >= 0
-            ? int(std::clamp<qint64>((rttUs + 500) / 1000, 0, 65535))
-            : int(std::clamp<qint64>(
-                  QDateTime::currentMSecsSinceEpoch() - it->attemptSendMs, 0, 65535));
-        m_pendingProbes.erase(it);
+        const int rttMs = sample->rttMs;
         m_probeFailStreak[packet.peerUserId] = 0;
-        m_measuredPing[packet.peerUserId] = rttMs;
         writePingDiagnostic(QStringLiteral("ICE_PING_REPLY"),
-                            QStringLiteral("peer=%1 rtt_ms=%2 rtt_us=%3")
-                                .arg(pingUserLabel(packet.peerUserId)).arg(rttMs).arg(rttUs));
-        sendRoomPingReport(packet.peerUserId, rttMs);
-        emit pingProbeMeasured(packet.peerUserId, rttMs);
+                            QStringLiteral("peer=%1 rtt_ms=%2 rtt_us=%3 attempt=%4 late=%5")
+                                .arg(pingUserLabel(packet.peerUserId)).arg(rttMs)
+                                .arg(packet.roundTripUs == 0 ? qint64(-1) : qint64(packet.roundTripUs))
+                                .arg(sample->attempt)
+                                .arg(sample->late ? QStringLiteral("true") : QStringLiteral("false")));
+
+        const auto probe = m_probePeers.find(packet.peerUserId);
+        if (probe == m_probePeers.end())
+        {
+            sendRoomPingReport(packet.peerUserId, rttMs);
+            recordPingSample(packet.peerUserId, rttMs, false);
+            continue;
+        }
+        // A ping check's sample is kept under the id this PC knows them by.
+        recordPingSample(probe->displayId, rttMs, true);
+        if (m_pingCheck.roomId != 0 && m_pingCheck.peerId == packet.peerUserId)
+        {
+            m_pingCheck.samples.append(rttMs);
+            const int best = *std::min_element(m_pingCheck.samples.cbegin(), m_pingCheck.samples.cend());
+            if (best <= m_pingCheck.maxPingMs || m_pingCheck.samples.size() >= PING_CHECK_SAMPLES)
+                finishPingCheck(best, true, QStringLiteral("measured"));
+        }
     }
 
     std::vector<quint64> peersToRestart;
@@ -1621,7 +1965,7 @@ void LobbyClient::flushIceEvents()
             // path did. Send any canonical reports now instead of waiting for
             // the next three-second probe cycle.
             for (auto it = m_measuredPing.constBegin(); it != m_measuredPing.constEnd(); ++it)
-                sendRoomPingReport(it.key(), it.value());
+                sendRoomPingReport(it.key(), it.value().ms);
         }
     }
 
@@ -1630,6 +1974,369 @@ void LobbyClient::flushIceEvents()
         const quint32 nextGeneration = m_iceGenerations.value(userId, 0) + 1;
         restartIcePeer(userId, nextGeneration, QStringLiteral("connectivity_failed"), true);
     }
+
+    // Ping-check agents. Nothing here reaches the room: no seat state, no
+    // connection signals, just when to ping and whether to try again.
+    std::vector<quint64> probesToRestart;
+    std::vector<quint64> probesFailed;
+    for (auto it = m_probePeers.begin(); it != m_probePeers.end(); ++it)
+    {
+        const int state = static_cast<int>(LobbyIce::peer_state(it.key()));
+        if (it->lastState == state)
+            continue;
+        it->lastState = state;
+        writePingDiagnostic(QStringLiteral("PROBE_PEER_STATE"),
+                            QStringLiteral("peer=%1 state=%2 state_name=%3 generation=%4 selected=%5")
+                                .arg(pingUserLabel(it.key())).arg(state).arg(iceStateName(state))
+                                .arg(it->generation)
+                                .arg(QString::fromStdString(LobbyIce::peer_selected_addresses(it.key()))));
+        if (LobbyIce::peer_connected(it.key()))
+        {
+            if (it->nextProbeMs == 0)
+                it->nextProbeMs = monotonicMs();
+        }
+        else if (state == static_cast<int>(LobbyIcePeerState::Failed))
+        {
+            if (it->restarts < MAX_PROBE_PEER_RESTARTS)
+                probesToRestart.push_back(it.key());
+            else
+                probesFailed.push_back(it.key());
+        }
+    }
+    for (quint64 peerId : probesToRestart)
+    {
+        const auto probe = m_probePeers.constFind(peerId);
+        if (probe != m_probePeers.constEnd() &&
+            !restartProbePeer(peerId, probe->generation + 1, QStringLiteral("connectivity_failed"), true))
+            probesFailed.push_back(peerId);
+    }
+    for (quint64 peerId : probesFailed)
+    {
+        if (m_pingCheck.roomId != 0 && m_pingCheck.peerId == peerId)
+            finishPingCheck(-1, false, QStringLiteral("ice_failed"));
+        removeProbePeer(peerId, QStringLiteral("ice_failed"));
+    }
+}
+
+void LobbyClient::recordPingSample(quint64 sampleId, int rttMs, bool fromProbe)
+{
+    m_measuredPing.insert(sampleId, MeasuredPing{rttMs, monotonicMs(), fromProbe, false});
+    emit pingProbeMeasured(sampleId, rttMs);
+}
+
+void LobbyClient::checkMeasurementExpiry()
+{
+    const qint64 nowMs = monotonicMs();
+    if (nowMs < m_nextExpiryCheckMs)
+        return;
+    m_nextExpiryCheckMs = nowMs + 1'000;
+    QList<quint64> expired;
+    for (auto it = m_measuredPing.begin(); it != m_measuredPing.end(); ++it)
+    {
+        if (it->expiryAnnounced ||
+            LobbyPing::measurementCurrent(it->atMs, nowMs, LobbyIce::peer_connected(it.key())))
+            continue;
+        it->expiryAnnounced = true;
+        expired.append(it.key());
+    }
+    for (quint64 userId : expired)
+        emit pingMeasurementExpired(userId);
+}
+
+// -------- Ping checks (probe-only ICE agents) --------
+
+void LobbyClient::startProbePeer(quint64 peerId, quint64 displayId, qint64 expiresInMs,
+                                 quint64 challengeId, bool active, const QString& reason)
+{
+    if (!m_pingCheckSupported || peerId == 0 || isOnThisPc(peerId) || displayId == 0)
+        return;
+    // Already connected through the room mesh, which measures them anyway.
+    if (m_icePeerIds.contains(peerId))
+        return;
+
+    const qint64 expiresAtMs = monotonicMs() + std::clamp<qint64>(expiresInMs, 1'000, 5 * 60'000);
+    const auto existing = m_probePeers.find(peerId);
+    if (existing != m_probePeers.end())
+    {
+        // A second reason to measure the same PC shares its agent.
+        existing->expiresAtMs = std::max(existing->expiresAtMs, expiresAtMs);
+        existing->active = existing->active || active;
+        if (challengeId != 0)
+            existing->challengeIds.insert(challengeId);
+        return;
+    }
+    if (!LobbyIce::add_peer(peerId, true))
+    {
+        writePingDiagnostic(QStringLiteral("PROBE_PEER_ADD_FAILED"),
+                            QStringLiteral("peer=%1 reason=%2").arg(pingUserLabel(peerId), reason));
+        return;
+    }
+    ProbePeer probe;
+    probe.displayId = displayId;
+    probe.expiresAtMs = expiresAtMs;
+    probe.active = active;
+    if (const auto last = m_probeGenerations.constFind(peerId); last != m_probeGenerations.constEnd())
+        probe.generation = last.value() + 1;
+    m_probeGenerations.insert(peerId, probe.generation);
+    if (challengeId != 0)
+        probe.challengeIds.insert(challengeId);
+    m_probePeers.insert(peerId, probe);
+    writePingDiagnostic(QStringLiteral("PROBE_PEER_ADDED"),
+                        QStringLiteral("peer=%1 reason=%2 active=%3 expires_in_ms=%4")
+                            .arg(pingUserLabel(peerId), reason,
+                                 active ? QStringLiteral("true") : QStringLiteral("false"))
+                            .arg(expiresInMs));
+}
+
+void LobbyClient::removeProbePeer(quint64 peerId, const QString& reason)
+{
+    if (!m_probePeers.remove(peerId))
+        return;
+    m_iceProbes.cancel(peerId);
+    // The mesh may hold an agent under the same id by now; that one stays.
+    if (!m_icePeerIds.contains(peerId))
+        LobbyIce::remove_peer(peerId);
+    writePingDiagnostic(QStringLiteral("PROBE_PEER_REMOVED"),
+                        QStringLiteral("peer=%1 reason=%2").arg(pingUserLabel(peerId), reason));
+}
+
+void LobbyClient::dropProbePeerForMesh(quint64 userId)
+{
+    if (userId == 0 || userId == m_selfUserId)
+        return;
+    // A ping check's sample came over its own agent, not the room's: the room
+    // measures again before it gates Start or sets anyone's delay.
+    const auto dropProbeSample = [this](quint64 id) {
+        const auto sample = m_measuredPing.constFind(id);
+        if (sample != m_measuredPing.constEnd() && sample->fromProbe)
+            m_measuredPing.erase(sample);
+    };
+    dropProbeSample(userId);
+    const auto probe = m_probePeers.constFind(userId);
+    if (probe == m_probePeers.constEnd())
+        return;
+    dropProbeSample(probe->displayId);
+    if (m_pingCheck.roomId != 0 && m_pingCheck.peerId == userId)
+        m_pingCheck = PingCheck{};
+    removeProbePeer(userId, QStringLiteral("room_mesh"));
+}
+
+bool LobbyClient::restartProbePeer(quint64 peerId, quint32 generation, const QString& reason, bool notifyPeer)
+{
+    const auto probe = m_probePeers.find(peerId);
+    if (probe == m_probePeers.end() || generation <= probe->generation || m_icePeerIds.contains(peerId))
+        return false;
+    if (notifyPeer)
+    {
+        QJsonObject data;
+        data["targetUserId"] = QJsonValue(qint64(peerId));
+        data["roomId"] = 0;
+        data["probe"] = true;
+        data["kind"] = QStringLiteral("restart");
+        data["generation"] = int(generation);
+        sendEnvelope("ICE_SIGNAL", data);
+    }
+    probe->generation = generation;
+    m_probeGenerations.insert(peerId, generation);
+    probe->restarts += 1;
+    probe->lastState = -1;
+    probe->nextProbeMs = 0;
+    m_iceProbes.cancel(peerId);
+    LobbyIce::remove_peer(peerId);
+    const bool added = LobbyIce::add_peer(peerId, true);
+    writePingDiagnostic(QStringLiteral("PROBE_PEER_RESTART"),
+                        QStringLiteral("peer=%1 generation=%2 reason=%3 added=%4")
+                            .arg(pingUserLabel(peerId)).arg(generation).arg(reason)
+                            .arg(added ? QStringLiteral("true") : QStringLiteral("false")));
+    return added;
+}
+
+void LobbyClient::handleProbeIceSignal(const QJsonObject& data)
+{
+    const quint64 fromUserId = static_cast<quint64>(data.value("fromUserId").toDouble());
+    const QString kind = data.value("kind").toString();
+    const quint32 generation = static_cast<quint32>(data.value("generation").toInt());
+    const auto probe = m_probePeers.find(fromUserId);
+    // Only a ping check this PC is part of, and never one the mesh owns now:
+    // a late trickle from their old probe agent must not reach the room's.
+    if (!m_pingCheckSupported || probe == m_probePeers.end() || m_icePeerIds.contains(fromUserId))
+    {
+        writePingDiagnostic(QStringLiteral("PROBE_SIGNAL_IN_DROPPED"),
+                            QStringLiteral("from_user=%1 kind=%2 generation=%3 reason=no_ping_check")
+                                .arg(fromUserId).arg(kind).arg(generation));
+        return;
+    }
+    if (generation < probe->generation)
+    {
+        writePingDiagnostic(QStringLiteral("PROBE_SIGNAL_IN_DROPPED"),
+                            QStringLiteral("peer=%1 kind=%2 generation=%3 current_generation=%4 reason=stale_generation")
+                                .arg(pingUserLabel(fromUserId), kind).arg(generation).arg(probe->generation));
+        return;
+    }
+    if (kind == QStringLiteral("restart"))
+    {
+        if (generation > probe->generation)
+            restartProbePeer(fromUserId, generation, QStringLiteral("remote_request"), false);
+        return;
+    }
+    // Like the mesh: a newer generation's description is a restart too.
+    if (generation > probe->generation &&
+        !restartProbePeer(fromUserId, generation, QStringLiteral("new_generation_signal"), false))
+        return;
+    // Never into LobbyIce's queue for an agent that doesn't exist: that queue
+    // feeds whatever agent gets the id next, which could be the room's.
+    if (!LobbyIce::has_peer(fromUserId))
+        return;
+    const QString value = data.value("value").toString();
+    const bool accepted = LobbyIce::handle_remote_signal(fromUserId, kind.toStdString(), value.toStdString());
+    writePingDiagnostic(QStringLiteral("PROBE_SIGNAL_IN"),
+                        QStringLiteral("peer=%1 kind=%2 generation=%3 accepted=%4 %5")
+                            .arg(pingUserLabel(fromUserId), kind).arg(generation)
+                            .arg(accepted ? QStringLiteral("true") : QStringLiteral("false"))
+                            .arg(iceSignalSummary(kind, value)));
+}
+
+void LobbyClient::serviceProbePeers()
+{
+    if (m_probePeers.isEmpty() && m_pingCheck.roomId == 0)
+        return;
+    const qint64 nowMs = monotonicMs();
+
+    if (m_pingCheck.roomId != 0 && nowMs >= m_pingCheck.deadlineMs)
+    {
+        if (m_pingCheck.samples.isEmpty())
+            finishPingCheck(-1, false, QStringLiteral("timeout"));
+        else
+            finishPingCheck(*std::min_element(m_pingCheck.samples.cbegin(), m_pingCheck.samples.cend()),
+                            true, QStringLiteral("timeout_with_samples"));
+    }
+
+    QList<quint64> expired;
+    for (auto it = m_probePeers.begin(); it != m_probePeers.end(); ++it)
+    {
+        if (nowMs >= it->expiresAtMs)
+        {
+            expired.append(it.key());
+            continue;
+        }
+        if (!it->active || it->nextProbeMs == 0 || nowMs < it->nextProbeMs ||
+            !LobbyIce::peer_connected(it.key()))
+            continue;
+        if (startIcePingSeries(it.key()))
+        {
+            it->nextProbeMs = nowMs + probePeerIntervalMs(it->seriesStarted);
+            it->seriesStarted += 1;
+        }
+    }
+    for (quint64 peerId : expired)
+    {
+        if (m_pingCheck.roomId != 0 && m_pingCheck.peerId == peerId)
+            finishPingCheck(-1, false, QStringLiteral("grant_expired"));
+        removeProbePeer(peerId, QStringLiteral("expired"));
+    }
+}
+
+bool LobbyClient::startPingCheck(quint64 roomId, const QString& password, quint64 hostId, int maxPingMs)
+{
+    if (!m_pingCheckSupported || m_state != ConnectionState::Connected || roomId == 0 ||
+        hostId == 0 || maxPingMs <= 0)
+        return false;
+    cancelPingCheck();
+
+    PingCheck check;
+    check.roomId = roomId;
+    check.hostId = hostId;
+    check.maxPingMs = maxPingMs;
+    check.requestId = QStringLiteral("ping-check-%1").arg(++m_pingCheckSeq);
+    check.deadlineMs = monotonicMs() + PING_CHECK_TIMEOUT_MS;
+    QJsonObject d;
+    d["roomId"] = QJsonValue(qint64(roomId));
+    if (!password.isEmpty())
+        d["password"] = password;
+    if (sendEnvelope("PING_CHECK_REQUEST", d, check.requestId) <= 0)
+        return false;
+    m_pingCheck = check;
+    writePingDiagnostic(QStringLiteral("PING_CHECK_REQUEST"),
+                        QStringLiteral("room=%1 host=%2 max_ping_ms=%3")
+                            .arg(roomId).arg(pingUserLabel(hostId)).arg(maxPingMs));
+    return true;
+}
+
+void LobbyClient::cancelPingCheck()
+{
+    if (m_pingCheck.roomId == 0)
+        return;
+    const PingCheck check = m_pingCheck;
+    m_pingCheck = PingCheck{};
+    writePingDiagnostic(QStringLiteral("PING_CHECK_CANCELLED"), QStringLiteral("room=%1").arg(check.roomId));
+    const auto probe = m_probePeers.constFind(check.peerId);
+    if (check.peerId != 0 && probe != m_probePeers.constEnd() && probe->challengeIds.isEmpty())
+        removeProbePeer(check.peerId, QStringLiteral("ping_check_cancelled"));
+}
+
+void LobbyClient::finishPingCheck(int pingMs, bool measured, const QString& reason)
+{
+    if (m_pingCheck.roomId == 0)
+        return;
+    const PingCheck check = m_pingCheck;
+    m_pingCheck = PingCheck{};
+    writePingDiagnostic(QStringLiteral("PING_CHECK_FINISHED"),
+                        QStringLiteral("room=%1 ping_ms=%2 measured=%3 samples=%4 reason=%5")
+                            .arg(check.roomId).arg(pingMs)
+                            .arg(measured ? QStringLiteral("true") : QStringLiteral("false"))
+                            .arg(check.samples.size()).arg(reason));
+    // Done with it: if the join goes ahead, the room's own agent replaces it.
+    const auto probe = m_probePeers.constFind(check.peerId);
+    if (check.peerId != 0 && probe != m_probePeers.constEnd() && probe->challengeIds.isEmpty())
+        removeProbePeer(check.peerId, QStringLiteral("ping_check_finished"));
+    emit pingCheckFinished(check.roomId, measured ? pingMs : -1, measured);
+}
+
+void LobbyClient::handlePingCheckReply(const QJsonObject& data, const QString& envelopeId)
+{
+    const quint64 roomId = static_cast<quint64>(data.value("roomId").toDouble());
+    // Only the check still waiting: a cancelled one's grant just runs out.
+    if (m_pingCheck.roomId == 0 || roomId != m_pingCheck.roomId ||
+        (!envelopeId.isEmpty() && envelopeId != m_pingCheck.requestId) || m_pingCheck.peerId != 0)
+        return;
+    const quint64 peerId = static_cast<quint64>(data.value("peerUserId").toDouble());
+    if (!data.value("ok").toBool() || peerId == 0 || isOnThisPc(peerId))
+    {
+        finishPingCheck(-1, false, QStringLiteral("refused:") + data.value("reason").toString());
+        return;
+    }
+    m_pingCheck.peerId = peerId;
+    startProbePeer(peerId, m_pingCheck.hostId,
+                   static_cast<qint64>(data.value("expiresInMs").toDouble()), 0, true,
+                   QStringLiteral("join_check"));
+    if (!m_probePeers.contains(peerId))
+        finishPingCheck(-1, false, QStringLiteral("agent_failed"));
+}
+
+void LobbyClient::handlePingCheckIncoming(const QJsonObject& data)
+{
+    // A player about to join our room measures us. Their side pings; ours
+    // only answers, which libjuice does as the packets arrive.
+    const quint64 fromUserId = static_cast<quint64>(data.value("fromUserId").toDouble());
+    startProbePeer(fromUserId, fromUserId,
+                   static_cast<qint64>(data.value("expiresInMs").toDouble()) + PROBE_PEER_SLACK_MS,
+                   0, false, QStringLiteral("join_check_host"));
+}
+
+void LobbyClient::handlePingCheckEnd(const QJsonObject& data)
+{
+    const quint64 peerId = static_cast<quint64>(data.value("peerUserId").toDouble());
+    if (!m_probePeers.contains(peerId))
+        return;
+    if (m_pingCheck.roomId != 0 && m_pingCheck.peerId == peerId)
+    {
+        if (m_pingCheck.samples.isEmpty())
+            finishPingCheck(-1, false, QStringLiteral("ended"));
+        else
+            finishPingCheck(*std::min_element(m_pingCheck.samples.cbegin(), m_pingCheck.samples.cend()),
+                            true, QStringLiteral("ended_with_samples"));
+    }
+    removeProbePeer(peerId, QStringLiteral("ping_check_end"));
 }
 
 void LobbyClient::handleChatMsg(const QJsonObject& data)
@@ -1641,6 +2348,9 @@ void LobbyClient::handleChatMsg(const QJsonObject& data)
     m.message        = data.value("message").toString();
     m.serverTimeMs   = static_cast<qint64>(data.value("serverTime").toDouble());
     m.fromAdmin      = data.value("admin").toBool();
+    m.fromPlayer     = data.value("fromPlayer").toBool();
+    m.toUserId       = static_cast<quint64>(data.value("toUserId").toDouble());
+    m.toUsername     = data.value("toUsername").toString();
     emit chatMessageReceived(m);
 }
 
@@ -1906,9 +2616,44 @@ void LobbyClient::sendProbeBurst(const QHostAddress& addr, quint16 port, quint64
 
 void LobbyClient::onProbeRetryTimer()
 {
+    // ICE ping series: every retry goes out under a fresh nonce.
+    if (!m_iceProbes.empty())
+    {
+        std::vector<LobbyPing::ProbeSeries::Attempt> resend;
+        std::vector<std::uint64_t> failed;
+        m_iceProbes.tick(monotonicMs(), []() { return QRandomGenerator::global()->generate64(); },
+                         resend, failed);
+        for (const auto& attempt : resend)
+        {
+            sendIcePing(attempt.peer, attempt.nonce);
+            writePingDiagnostic(QStringLiteral("PROBE_RETRY"),
+                                QStringLiteral("peer=%1 transport=ice nonce=%2 attempt=%3/%4")
+                                    .arg(pingUserLabel(attempt.peer))
+                                    .arg(attempt.nonce)
+                                    .arg(attempt.attempt)
+                                    .arg(PROBE_ATTEMPTS));
+            // A ping check's misses aren't a seat's: nothing to show for them.
+            if (!m_probePeers.contains(attempt.peer))
+                emit pingProbeRetrying(attempt.peer, attempt.attempt, PROBE_ATTEMPTS);
+        }
+        for (const std::uint64_t peer : failed)
+        {
+            writePingDiagnostic(QStringLiteral("PROBE_FAILED"),
+                                QStringLiteral("peer=%1 transport=ice attempts=%2")
+                                    .arg(pingUserLabel(peer))
+                                    .arg(PROBE_ATTEMPTS));
+            if (!m_probePeers.contains(peer))
+                noteProbeSeriesFailed(peer);
+        }
+    }
+
+    serviceProbePeers();
+    checkMeasurementExpiry();
+
     if (m_pendingProbes.isEmpty())
         return;
 
+    // What's left are legacy UDP-anchor series: they retry as bursts over UDP.
     const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
     for (auto it = m_pendingProbes.begin(); it != m_pendingProbes.end(); )
     {
@@ -1924,7 +2669,7 @@ void LobbyClient::onProbeRetryTimer()
             // stale sweep so the room hears about it promptly.
             const quint64 uid = it->targetUserId;
             writePingDiagnostic(QStringLiteral("PROBE_FAILED"),
-                                QStringLiteral("peer=%1 transport=ice attempts=%2 age_ms=%3")
+                                QStringLiteral("peer=%1 transport=udp attempts=%2 age_ms=%3")
                                     .arg(pingUserLabel(uid))
                                     .arg(PROBE_ATTEMPTS)
                                     .arg(nowMs - it->sendMs));
@@ -1936,9 +2681,14 @@ void LobbyClient::onProbeRetryTimer()
         it->attempt      += 1;
         it->attemptSendMs = nowMs;
         it->nextAttemptMs = nowMs + PROBE_RETRY_INTERVAL_MS;
-        sendIcePing(it->targetUserId, it.key());
+        QHostAddress addr;
+        quint16 port = 0;
+        if (parseEndpoint(it->endpoint, addr, port))
+            sendProbeBurst(addr, port, it.key());
+        if (!it->altEndpoint.isEmpty() && parseEndpoint(it->altEndpoint, addr, port))
+            sendProbeBurst(addr, port, it.key());
         writePingDiagnostic(QStringLiteral("PROBE_RETRY"),
-                            QStringLiteral("peer=%1 transport=ice nonce=%2 attempt=%3/%4")
+                            QStringLiteral("peer=%1 transport=udp nonce=%2 attempt=%3/%4")
                                 .arg(pingUserLabel(it->targetUserId))
                                 .arg(it.key())
                                 .arg(it->attempt)
@@ -2013,6 +2763,9 @@ static LobbyClient::LobbyMatchPeer parseMatchPeer(const QJsonObject& o)
     p.localIp    = o.value("localIp").toString();
     p.slot       = o.value("slot").toInt();
     p.iceSupported = o.value("iceSupported").toBool();
+    p.peerId     = static_cast<quint64>(o.value("peerId").toDouble());
+    if (p.peerId == 0)
+        p.peerId = p.userId;
     return p;
 }
 
@@ -2027,6 +2780,10 @@ void LobbyClient::handleMatchBegin(const QJsonObject& data)
     // lobbies don't send it; keep 30 s for them. Same bounds as the lobby.
     const int keyframeSec = data.value("keyframeIntervalSec").toInt(0);
     m_broadcastKeyframeIntervalMs = keyframeSec > 0 ? qint64(std::clamp(keyframeSec, 10, 600)) * 1000 : 30'000;
+    // On demand, the lobby asks for a keyframe when a viewer joins and its
+    // cached one is older than the interval, saving the upload while nobody
+    // joins. Older lobbies don't send it; keep uploading on the interval.
+    m_broadcastKeyframeOnDemand = data.value("keyframeOnDemand").toBool(false);
     emit matchBegin(matchId, peers);
 }
 
@@ -2035,14 +2792,24 @@ void LobbyClient::handleMatchAdmitBegin(const QJsonObject& data)
     QList<LobbyMatchPeer> peers;
     for (const auto& v : data.value("peers").toArray())
         peers.append(parseMatchPeer(v.toObject()));
+    const LobbyMatchPeer joiner = parseMatchPeer(data.value("joiner").toObject());
+    QList<LobbyMatchPeer> joiners;
+    for (const auto& v : data.value("joiners").toArray())
+        joiners.append(parseMatchPeer(v.toObject()));
+    if (joiners.isEmpty())
+        joiners.append(joiner);
     m_admitBlobId = 0;
     m_admitBlobParts.clear();
+    const quint64 admitId = static_cast<quint64>(data.value("admitId").toDouble());
+    const quint64 hostId = static_cast<quint64>(data.value("hostId").toDouble());
+    const bool joinerIsSelf = m_selfUserId != 0 && joiner.userId == m_selfUserId;
+    m_admitJoinId = joinerIsSelf ? admitId : 0;
+    m_admitJoinHostId = joinerIsSelf ? hostId : 0;
     emit matchAdmitBegin(static_cast<quint64>(data.value("matchId").toDouble()),
-                         static_cast<quint64>(data.value("admitId").toDouble()),
+                         admitId,
                          data.value("epoch").toInt(),
                          qBound(0, data.value("seats").toInt(), 4),
-                         static_cast<quint64>(data.value("hostId").toDouble()),
-                         parseMatchPeer(data.value("joiner").toObject()), peers);
+                         hostId, joiner, joiners, peers);
 }
 
 void LobbyClient::handleMatchAdmitSignal(const QJsonObject& data)
@@ -2060,7 +2827,18 @@ void LobbyClient::handleMatchAdmitSignal(const QJsonObject& data)
     }
 
     // A blob step arrives as `count` chunks, in order over the one socket.
+    // Only the host of the join that is adding this client sends one, and
+    // only the settings and the game state travel this way.
     const int index = data.value("index").toInt();
+    if (count > MAX_RECEIVED_CHUNK_COUNT || index < 0 || index >= count)
+        return;
+    const bool isManifest = step == QStringLiteral("manifest");
+    if (admitId == 0 || admitId != m_admitJoinId ||
+        static_cast<quint64>(data.value("fromUserId").toDouble()) != m_admitJoinHostId ||
+        (!isManifest && step != QStringLiteral("state")))
+        return;
+    const int maxRawBytes = isManifest ? MAX_RELAYED_MANIFEST_BYTES : MAX_KEYFRAME_RAW_BYTES;
+    const int maxEncodedBytes = maxRawBytes + 6 + 4;
     if (index == 0 || m_admitBlobId != admitId || m_admitBlobStep != step ||
         m_admitBlobParts.size() != count)
     {
@@ -2069,12 +2847,22 @@ void LobbyClient::handleMatchAdmitSignal(const QJsonObject& data)
         m_admitBlobParts.clear();
         m_admitBlobParts.resize(count);
     }
-    if (index < 0 || index >= count)
-        return;
-    m_admitBlobParts[index] = QByteArray::fromBase64(data.value("data").toString().toLatin1());
-    for (const QByteArray& part : std::as_const(m_admitBlobParts))
+    QByteArray part = QByteArray::fromBase64(data.value("data").toString().toLatin1());
+    qsizetype held = part.size();
+    for (const QByteArray& other : std::as_const(m_admitBlobParts))
+        held += other.size();
+    if (part.size() > MAX_RECEIVED_CHUNK_BYTES || held > maxEncodedBytes)
     {
-        if (part.isEmpty())
+        // Too big to be a real blob; drop it, and the step times out.
+        qWarning() << "Rollback lobby late join: dropped an oversized" << step;
+        m_admitBlobParts.clear();
+        m_admitBlobId = 0;
+        return;
+    }
+    m_admitBlobParts[index] = std::move(part);
+    for (const QByteArray& other : std::as_const(m_admitBlobParts))
+    {
+        if (other.isEmpty())
             return;
     }
     QByteArray encoded;
@@ -2084,7 +2872,7 @@ void LobbyClient::handleMatchAdmitSignal(const QJsonObject& data)
     m_admitBlobId = 0;
 
     QByteArray raw;
-    if (!decodeSpectateKeyframe(encoded, raw))
+    if (!decodeSpectateKeyframe(encoded, raw, maxRawBytes))
     {
         qWarning() << "Rollback lobby late join: couldn't decode" << step;
         raw.clear();
@@ -2151,6 +2939,7 @@ void LobbyClient::ensureIcePeer(quint64 userId)
     if (userId == 0 || userId == m_selfUserId || m_icePeerIds.contains(userId) ||
         m_currentIceRoomId == 0)
         return;
+    dropProbePeerForMesh(userId);
     if (!m_iceGenerations.contains(userId))
         m_iceGenerations.insert(userId, 0);
     if (!m_iceRestartAttempts.contains(userId))
@@ -2182,6 +2971,9 @@ void LobbyClient::handleMatchPeerLeft(const QJsonObject& data)
 void LobbyClient::handleQuickMatchStatus(const QJsonObject& data)
 {
     emit quickMatchStatus(data.value("searching").toBool(), data.value("queueSize").toInt());
+    const QString reason = data.value("reason").toString();
+    if (!reason.isEmpty())
+        emit quickMatchRefused(reason);
 }
 
 void LobbyClient::handleSpectateBegin(const QJsonObject& data)
@@ -2209,8 +3001,11 @@ void LobbyClient::handleSpectateKeyframe(const QJsonObject& data)
     const int frame      = data.value("frame").toInt();
     const int chunkIndex = data.value("chunkIndex").toInt();
     const int chunkCount = data.value("chunkCount").toInt();
+    if (matchId == 0 || matchId != m_spectateMatchId)
+        return; // not the match being watched
     const QByteArray raw = QByteArray::fromBase64(data.value("data").toString().toLatin1());
-    if (chunkCount <= 0 || chunkIndex < 0 || chunkIndex >= chunkCount)
+    if (chunkCount <= 0 || chunkCount > MAX_RECEIVED_CHUNK_COUNT ||
+        chunkIndex < 0 || chunkIndex >= chunkCount || raw.size() > MAX_RECEIVED_CHUNK_BYTES)
         return;
 
     // (Re)start reassembly when a new keyframe appears. Chunks arrive in order over
@@ -2227,6 +3022,18 @@ void LobbyClient::handleSpectateKeyframe(const QJsonObject& data)
     }
     if (!m_kfRecvChunkSeen[chunkIndex])
     {
+        if (m_kfRecvBuf.size() + raw.size() > MAX_KEYFRAME_ENCODED_BYTES)
+        {
+            qWarning() << "lobby: rejected oversized live replay keyframe";
+            m_kfRecvFrame = -1;
+            m_kfRecvCount = 0;
+            m_kfRecvGot = 0;
+            m_kfRecvBuf.clear();
+            m_kfRecvChunkSeen = QList<bool>();
+            stopSpectate(matchId);
+            emit spectateFailed(matchId, QStringLiteral("invalid_keyframe"));
+            return;
+        }
         m_kfRecvChunkSeen[chunkIndex] = true;
         m_kfRecvBuf.append(raw); // in-order append (server sends chunks sequentially)
         m_kfRecvGot++;
@@ -2260,14 +3067,18 @@ void LobbyClient::handleSpectateKeyframe(const QJsonObject& data)
 
 void LobbyClient::handleSpectateEnd(const QJsonObject& data)
 {
-    emit spectateEnded(static_cast<quint64>(data.value("matchId").toDouble()),
-                       data.value("reason").toString());
+    const quint64 matchId = static_cast<quint64>(data.value("matchId").toDouble());
+    if (matchId == m_spectateMatchId)
+        m_spectateMatchId = 0;
+    emit spectateEnded(matchId, data.value("reason").toString());
 }
 
 void LobbyClient::handleSpectateFail(const QJsonObject& data)
 {
-    emit spectateFailed(static_cast<quint64>(data.value("matchId").toDouble()),
-                        data.value("reason").toString());
+    const quint64 matchId = static_cast<quint64>(data.value("matchId").toDouble());
+    if (matchId == m_spectateMatchId)
+        m_spectateMatchId = 0;
+    emit spectateFailed(matchId, data.value("reason").toString());
 }
 
 void LobbyClient::handleBroadcastViewerCount(const QJsonObject& data)
@@ -2283,6 +3094,13 @@ void LobbyClient::handleBroadcastViewerCount(const QJsonObject& data)
     emit broadcastViewerCount(matchId, viewerCount);
 }
 
+void LobbyClient::handleBroadcastKeyframeRequest(const QJsonObject& data)
+{
+    const quint64 matchId = static_cast<quint64>(data.value("matchId").toDouble());
+    if (matchId != 0)
+        emit broadcastKeyframeRequested(matchId);
+}
+
 // -------- Heartbeat --------
 
 void LobbyClient::onHeartbeatTimer()
@@ -2290,10 +3108,26 @@ void LobbyClient::onHeartbeatTimer()
     if (m_state != ConnectionState::Connected)
         return;
     QJsonObject data;
-    // TODO: include measured ping to server once we add WS ping/pong sampling
+    if (m_serverRttMs > 0)
+        data["pingToServer"] = std::clamp(m_serverRttMs, 1, 65535);
     m_reportedAway = (QDateTime::currentMSecsSinceEpoch() - m_lastActivityMs) >= AWAY_AFTER_MS;
     data["away"] = m_reportedAway;
-    sendEnvelope("HEARTBEAT", data);
+
+    // The lobby echoes the envelope id in its ACK. A heartbeat queued behind
+    // an upload would time the upload, so only one sent on an idle socket is
+    // timed.
+    const qint64 nowMs = monotonicMs();
+    for (auto it = m_heartbeatSentMs.begin(); it != m_heartbeatSentMs.end();)
+    {
+        if (nowMs - it.value() > HEARTBEAT_ACK_TIMEOUT_MS)
+            it = m_heartbeatSentMs.erase(it);
+        else
+            ++it;
+    }
+    const QString id = QStringLiteral("hb-%1").arg(++m_heartbeatSeq);
+    const bool timed = m_ws->bytesToWrite() == 0;
+    if (sendEnvelope("HEARTBEAT", data, id) > 0 && timed)
+        m_heartbeatSentMs.insert(id, nowMs);
 }
 
 bool LobbyClient::eventFilter(QObject* watched, QEvent* event)
@@ -2581,7 +3415,7 @@ bool LobbyClient::syncPrematchManifest(const QList<LobbyMatchPeer>& peers, int l
         uint64_t manifestHash = 0;
         size_t cheatCount = 0;
         if (!buildPrematchManifest(romFile, m_prematchSaveData ? &*m_prematchSaveData : nullptr,
-                                   manifest, manifestHash, cheatCount))
+                                   m_prematchGameOptions, manifest, manifestHash, cheatCount))
         {
             error = QString::fromStdString(CoreGetError().empty()
                 ? std::string("Pre-match sync failed: could not build manifest") : CoreGetError());
@@ -2680,7 +3514,8 @@ bool LobbyClient::syncPrematchManifest(const QList<LobbyMatchPeer>& peers, int l
                     !readPrematchU16(datagram, 23, count) ||
                     !readPrematchU32(datagram, 25, totalBytes) ||
                     count == 0 || count > 2048 || index >= count ||
-                    totalBytes == 0 || totalBytes > 2 * 1024 * 1024)
+                    totalBytes == 0 || totalBytes > 2 * 1024 * 1024 ||
+                    datagram.size() - 29 > PREMATCH_FRAGMENT_PAYLOAD_BYTES)
                     continue;
                 if (fragmentHash != incomingHash || fragmentCount != count ||
                     fragmentTotalBytes != totalBytes)
@@ -2822,7 +3657,7 @@ bool LobbyClient::syncPrematchManifest(const QList<LobbyMatchPeer>& peers, int l
         std::string manifest;
         uint64_t manifestHash = 0;
         size_t cheatCount = 0;
-        if (!buildPrematchManifest(romFile, nullptr, manifest, manifestHash, cheatCount))
+        if (!buildPrematchManifest(romFile, nullptr, {}, manifest, manifestHash, cheatCount))
         {
             error = QString::fromStdString(CoreGetError().empty() ? std::string("Pre-match sync failed: could not build manifest") : CoreGetError());
             return false;
@@ -3175,7 +4010,7 @@ void LobbyClient::onUdpReadyRead()
             if (m_recentlyMatchedNonces.size() >= PROBE_MATCHED_NONCE_CAP)
                 m_recentlyMatchedNonces.clear();
             m_recentlyMatchedNonces.insert(nonce);
-            m_measuredPing[uid] = rttMs;
+            m_measuredPing.insert(uid, MeasuredPing{rttMs, monotonicMs(), false, false});
             m_probeFailStreak.remove(uid);
             writePingDiagnostic(QStringLiteral("RTT"),
                                 QStringLiteral("peer=%1 rtt_ms=%2 attempt=%3/%4 nonce=%5 from=%6:%7")
@@ -3223,8 +4058,27 @@ void LobbyClient::onUdpReadyRead()
 
 int LobbyClient::measuredPingMs(quint64 userId) const
 {
-    const auto it = m_measuredPing.constFind(userId);
-    return it == m_measuredPing.constEnd() ? -1 : it.value();
+    // A seat's ping is its connection's.
+    const quint64 peerId = m_seatPeers.value(userId, userId);
+    const auto it = m_measuredPing.constFind(peerId);
+    if (it == m_measuredPing.constEnd())
+        return -1;
+    // A number from a room left long ago says little about the path now.
+    if (!LobbyPing::measurementCurrent(it->atMs, monotonicMs(), LobbyIce::peer_connected(peerId)))
+        return -1;
+    return it->ms;
+}
+
+int LobbyClient::pairPingMs(quint64 first, quint64 second) const
+{
+    first = m_seatPeers.value(first, first);
+    second = m_seatPeers.value(second, second);
+    if (first == second)
+        return 0;
+    if (first == m_selfUserId || second == m_selfUserId)
+        return measuredPingMs(first == m_selfUserId ? second : first);
+    // Reported by the lower id of the two.
+    return m_roomPeerPings.value(std::min(first, second)).value(std::max(first, second), -1);
 }
 
 int LobbyClient::worstRoomPingMs(const QList<quint64>& roomUserIds, bool* complete) const
@@ -3273,7 +4127,7 @@ bool LobbyClient::allIcePeersConnected(const QList<LobbyMatchPeer>& peers, QStri
 {
     for (const LobbyMatchPeer& peer : peers)
     {
-        if (peer.userId == m_selfUserId)
+        if (peer.peerId == m_selfUserId)
             continue;
         if (!peer.iceSupported)
         {
@@ -3282,7 +4136,8 @@ bool LobbyClient::allIcePeersConnected(const QList<LobbyMatchPeer>& peers, QStri
                              .arg(peer.username.isEmpty() ? QString::number(peer.userId) : peer.username);
             return false;
         }
-        if (!LobbyIce::peer_connected(peer.userId))
+        // A ping check's agent is no connection for a match.
+        if (!LobbyIce::peer_connected(peer.peerId) || m_probePeers.contains(peer.peerId))
         {
             if (error)
                 *error = QCoreApplication::translate("LobbyClient","Waiting for a direct ICE connection to %1.")
@@ -3312,6 +4167,169 @@ void LobbyClient::requestChatHistory(const QString& channel)
     sendEnvelope("CHAT_HISTORY", d);
 }
 
+void LobbyClient::sendPrivateMessage(quint64 toUserId, quint64 asUserId, const QString& message)
+{
+    QJsonObject d;
+    d["channel"] = QStringLiteral("pm");
+    d["message"] = message;
+    d["toUserId"] = static_cast<double>(toUserId);
+    if (asUserId != 0 && asUserId != m_selfUserId)
+        d["asUserId"] = static_cast<double>(asUserId);
+    sendEnvelope("CHAT_SEND", d);
+}
+
+void LobbyClient::handleChatFail(const QJsonObject& data)
+{
+    emit privateMessageFailed(static_cast<quint64>(data.value("toUserId").toDouble()),
+                              data.value("reason").toString());
+}
+
+// -------- Challenges --------
+
+void LobbyClient::sendChallenge(quint64 toUserId, const QString& romName, const QString& romMd5,
+                                const QString& note, bool liveReplay)
+{
+    QJsonObject rom;
+    rom["name"] = romName;
+    rom["md5"]  = romMd5;
+    QJsonObject d;
+    d["toUserId"] = static_cast<double>(toUserId);
+    d["rom"] = rom;
+    if (!note.isEmpty())
+        d["note"] = note;
+    if (liveReplay)
+        d["liveReplay"] = true;
+    sendEnvelope("CHALLENGE_SEND", d);
+}
+
+void LobbyClient::cancelChallenge(quint64 challengeId)
+{
+    QJsonObject d;
+    d["challengeId"] = static_cast<double>(challengeId);
+    sendEnvelope("CHALLENGE_CANCEL", d);
+}
+
+void LobbyClient::respondToChallenge(quint64 challengeId, bool accept)
+{
+    QJsonObject d;
+    d["challengeId"] = static_cast<double>(challengeId);
+    d["accept"] = accept;
+    sendEnvelope("CHALLENGE_RESPOND", d);
+}
+
+void LobbyClient::requestSharedGames(quint64 toUserId)
+{
+    QJsonObject d;
+    d["toUserId"] = static_cast<double>(toUserId);
+    sendEnvelope("CHALLENGE_GAMES", d);
+}
+
+void LobbyClient::setChallengesOff(bool off)
+{
+    if (m_challengesOff == off)
+        return;
+    m_challengesOff = off;
+    if (m_state != ConnectionState::Connected || !m_challengeSettingsSupported)
+        return;
+    QJsonObject d;
+    d["off"] = off;
+    sendEnvelope("CHALLENGE_SETTINGS", d);
+}
+
+void LobbyClient::setPrivateMessagesOff(bool off)
+{
+    if (m_privateMessagesOff == off)
+        return;
+    m_privateMessagesOff = off;
+    if (m_state != ConnectionState::Connected || !m_pmSettingsSupported)
+        return;
+    QJsonObject d;
+    d["off"] = off;
+    sendEnvelope("PM_SETTINGS", d);
+}
+
+void LobbyClient::handleChallengeSent(const QJsonObject& data)
+{
+    const QJsonObject rom = data.value("rom").toObject();
+    Challenge c;
+    c.id = static_cast<quint64>(data.value("challengeId").toDouble());
+    c.fromUserId = m_selfUserId;
+    c.toUserId = static_cast<quint64>(data.value("toUserId").toDouble());
+    c.toUsername = data.value("toUsername").toString();
+    c.romName = rom.value("name").toString();
+    c.romMd5 = rom.value("md5").toString();
+    const qint64 expiresInMs = static_cast<qint64>(data.value("expiresInMs").toDouble());
+    c.expiresAtMs = QDateTime::currentMSecsSinceEpoch() + expiresInMs;
+    c.invite = data.value("invite").toBool();
+    c.pingPeerUserId = static_cast<quint64>(data.value("pingPeerUserId").toDouble());
+    // Measure them while they make up their mind.
+    if (c.pingPeerUserId != 0)
+    {
+        startProbePeer(c.pingPeerUserId, c.pingPeerUserId,
+                       expiresInMs + PROBE_PEER_GRACE_MS + PROBE_PEER_SLACK_MS, c.id, true,
+                       QStringLiteral("challenge_sent"));
+    }
+    emit challengeSent(c);
+}
+
+void LobbyClient::handleChallengeIncoming(const QJsonObject& data)
+{
+    const QJsonObject rom = data.value("rom").toObject();
+    Challenge c;
+    c.id = static_cast<quint64>(data.value("challengeId").toDouble());
+    c.fromUserId = static_cast<quint64>(data.value("fromUserId").toDouble());
+    c.fromUsername = data.value("fromUsername").toString();
+    c.toUserId = static_cast<quint64>(data.value("toUserId").toDouble());
+    c.toUsername = data.value("toUsername").toString();
+    c.romName = rom.value("name").toString();
+    c.romMd5 = rom.value("md5").toString();
+    c.note = data.value("note").toString();
+    c.expiresAtMs = QDateTime::currentMSecsSinceEpoch() + static_cast<qint64>(data.value("expiresInMs").toDouble());
+    c.invite = data.value("invite").toBool();
+    c.roomName = data.value("roomName").toString();
+    c.roomPlayers = data.value("roomPlayers").toInt();
+    c.roomMaxPlayers = data.value("roomMaxPlayers").toInt();
+    c.pingPeerUserId = static_cast<quint64>(data.value("pingPeerUserId").toDouble());
+    emit challengeIncoming(c);
+}
+
+void LobbyClient::measureChallengePing(const Challenge& challenge)
+{
+    if (challenge.pingPeerUserId == 0)
+        return;
+    const qint64 expiresInMs = challenge.expiresAtMs - QDateTime::currentMSecsSinceEpoch();
+    startProbePeer(challenge.pingPeerUserId, challenge.pingPeerUserId,
+                   expiresInMs + PROBE_PEER_GRACE_MS + PROBE_PEER_SLACK_MS, challenge.id, true,
+                   QStringLiteral("challenge_incoming"));
+}
+
+void LobbyClient::handleChallengeResult(const QJsonObject& data)
+{
+    const quint64 challengeId = static_cast<quint64>(data.value("challengeId").toDouble());
+    // The lobby keeps the pair's grant a few seconds past the end, so a last
+    // sample can land; then PING_CHECK_END, or this, closes the agent.
+    if (challengeId != 0)
+    {
+        const qint64 endsAtMs = monotonicMs() + PROBE_PEER_GRACE_MS;
+        for (auto it = m_probePeers.begin(); it != m_probePeers.end(); ++it)
+        {
+            if (it->challengeIds.remove(challengeId) && it->challengeIds.isEmpty())
+                it->expiresAtMs = std::min(it->expiresAtMs, endsAtMs);
+        }
+    }
+    emit challengeEnded(challengeId,
+                        static_cast<quint64>(data.value("toUserId").toDouble()),
+                        data.value("result").toString());
+}
+
+void LobbyClient::handleChallengeGamesReply(const QJsonObject& data)
+{
+    QStringList md5s;
+    for (const QJsonValue& value : data.value("md5s").toArray())
+        md5s << value.toString();
+    emit sharedGamesReceived(static_cast<quint64>(data.value("toUserId").toDouble()), md5s);
+}
+
 // --- Moderation ---
 
 void LobbyClient::sendAdminAuth(const QString& password)
@@ -3330,6 +4348,40 @@ void LobbyClient::sendModAction(const QString& action, const QString& target,
     if (!duration.isEmpty()) d["duration"] = duration;
     if (!reason.isEmpty())   d["reason"]   = reason;
     sendEnvelope("MOD_ACTION", d);
+}
+
+void LobbyClient::sendAdminLogout()
+{
+    sendEnvelope("ADMIN_LOGOUT");
+}
+
+void LobbyClient::handleAdminLoggedOut()
+{
+    m_isModerator = false;
+    m_moderatorUsers.clear();
+    emit adminLoggedOut();
+}
+
+void LobbyClient::handleModResult(const QJsonObject& data)
+{
+    emit modResult(data.value("action").toString(), data.value("target").toString(),
+                   data.value("ip").toString(), static_cast<qint64>(data.value("until").toDouble()));
+}
+
+void LobbyClient::handleModTargetInfo(const QJsonObject& data)
+{
+    QStringList others;
+    for (const QJsonValue& value : data.value("others").toArray())
+        others << value.toString();
+    emit modTargetInfo(data.value("target").toString(), others, data.value("moderator").toBool());
+}
+
+void LobbyClient::handleModPeers(const QJsonObject& data)
+{
+    m_moderatorUsers.clear();
+    for (const QJsonValue& value : data.value("userIds").toArray())
+        m_moderatorUsers.insert(static_cast<quint64>(value.toDouble()));
+    emit moderatorsChanged();
 }
 
 void LobbyClient::handleAdminAuthOk(const QJsonObject& data)
@@ -3358,7 +4410,7 @@ void LobbyClient::handleModList(const QJsonObject& data)
 
 void LobbyClient::createRoom(const QString& name, const QString& romName, const QString& romMd5,
                               const QString& romRegion, int maxPlayers, int delay, int prediction,
-                              int pacing, const QString& password)
+                              int pacing, const QString& password, int maxPing, bool wiredOnly)
 {
     QJsonObject rom;
     rom["name"]   = romName;
@@ -3374,16 +4426,28 @@ void LobbyClient::createRoom(const QString& name, const QString& romName, const 
     d["pacing"]     = pacing;
     if (!password.isEmpty())
         d["password"] = password;
+    if (maxPing > 0)
+        d["maxPing"] = maxPing;
+    if (wiredOnly)
+        d["wiredOnly"] = true;
 
     sendEnvelope("ROOM_CREATE", d);
 }
 
-void LobbyClient::joinRoom(quint64 roomId, const QString& password)
+void LobbyClient::joinRoom(quint64 roomId, const QString& password, int pingMs, bool pingMeasured)
 {
     QJsonObject d;
     d["roomId"] = QJsonValue(qint64(roomId));
     if (!password.isEmpty())
         d["password"] = password;
+    // A lobby with ping checks reads pingMeasured and lets an estimate through;
+    // one without compares whatever comes, so it only hears a measurement.
+    // A measured 0 ms (same PC or LAN) is still a measurement, not "unknown".
+    const bool measured = pingMeasured && pingMs >= 0;
+    if (measured || (pingMs > 0 && m_pingCheckSupported))
+        d["pingMs"] = std::max(0, pingMs);
+    if (m_pingCheckSupported)
+        d["pingMeasured"] = measured;
     sendEnvelope("ROOM_JOIN", d);
 }
 
@@ -3411,6 +4475,21 @@ void LobbyClient::updateRoomLateJoin(bool enabled)
     sendEnvelope("ROOM_UPDATE_LATE_JOIN", d);
 }
 
+void LobbyClient::updateRoomJoinLimits(int maxPing, bool wiredOnly)
+{
+    QJsonObject d;
+    d["maxPing"] = maxPing;
+    d["wiredOnly"] = wiredOnly;
+    sendEnvelope("ROOM_UPDATE_JOIN_LIMITS", d);
+}
+
+void LobbyClient::updateRoomMaxPlayers(int maxPlayers)
+{
+    QJsonObject d;
+    d["maxPlayers"] = maxPlayers;
+    sendEnvelope("ROOM_UPDATE_MAX_PLAYERS", d);
+}
+
 void LobbyClient::updateRoomSaveData(bool enabled, const QString& label, const QStringList& kinds,
                                      int bytes, const QString& hash)
 {
@@ -3424,6 +4503,51 @@ void LobbyClient::updateRoomSaveData(bool enabled, const QString& label, const Q
         d["hash"] = hash;
     }
     sendEnvelope("ROOM_UPDATE_SAVE_DATA", d);
+}
+
+void LobbyClient::updateRoomGameOptions(const QList<LobbyGameOption>& options, const LobbyGameOption& preset)
+{
+    QJsonArray list;
+    for (const LobbyGameOption& option : options)
+    {
+        QJsonObject o;
+        o["id"] = option.id;
+        o["label"] = option.label;
+        list.append(o);
+    }
+    QJsonObject d;
+    d["options"] = list;
+    // Servers from before presets ignore it; the room just shows the options.
+    if (!preset.id.isEmpty() && !options.isEmpty())
+    {
+        QJsonObject p;
+        p["id"] = preset.id;
+        p["label"] = preset.label;
+        d["preset"] = p;
+    }
+    sendEnvelope("ROOM_UPDATE_GAME_OPTIONS", d);
+}
+
+QList<LobbyClient::LobbyGameOption> LobbyClient::parseGameOptions(const QJsonValue& value)
+{
+    QList<LobbyGameOption> options;
+    for (const auto& v : value.toArray())
+    {
+        const QJsonObject o = v.toObject();
+        LobbyGameOption option{ o.value("id").toString(), o.value("label").toString() };
+        if (!option.id.isEmpty())
+            options.append(option);
+    }
+    return options;
+}
+
+LobbyClient::LobbyGameOption LobbyClient::parseGameOptionsPreset(const QJsonValue& value)
+{
+    const QJsonObject o = value.toObject();
+    LobbyGameOption preset{ o.value("id").toString(), o.value("label").toString() };
+    if (preset.id.isEmpty() || preset.label.isEmpty())
+        return {};
+    return preset;
 }
 
 void LobbyClient::updateLocalFrameDelay(int delay, bool delayAuto)
@@ -3462,29 +4586,28 @@ void LobbyClient::swapSeats(int slotA, int slotB)
 
 void LobbyClient::requestPingProbe(quint64 targetUserId)
 {
-    if (targetUserId == 0 || targetUserId == m_selfUserId ||
-        !LobbyIce::peer_connected(targetUserId))
+    // A seat is measured through its connection.
+    targetUserId = m_seatPeers.value(targetUserId, targetUserId);
+    if (targetUserId == 0 || targetUserId == m_selfUserId)
         return;
-    for (auto it = m_pendingProbes.cbegin(); it != m_pendingProbes.cend(); ++it)
-    {
-        if (it->targetUserId == targetUserId)
-            return;
-    }
+    startIcePingSeries(targetUserId);
+}
 
-    quint64 nonce = QRandomGenerator::global()->generate64();
-    while (nonce == 0 || m_pendingProbes.contains(nonce))
+bool LobbyClient::startIcePingSeries(quint64 peerId)
+{
+    if (peerId == 0 || !LobbyIce::peer_connected(peerId) || m_iceProbes.inFlight(peerId))
+        return false;
+    // start() refuses only a zero or taken nonce now; draw another.
+    quint64 nonce = 0;
+    const qint64 nowMs = monotonicMs();
+    do
         nonce = QRandomGenerator::global()->generate64();
-    const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
-    ProbeInFlight probe;
-    probe.targetUserId = targetUserId;
-    probe.sendMs = nowMs;
-    probe.attemptSendMs = nowMs;
-    probe.nextAttemptMs = nowMs + PROBE_RETRY_INTERVAL_MS;
-    m_pendingProbes.insert(nonce, probe);
-    sendIcePing(targetUserId, nonce);
+    while (!m_iceProbes.start(peerId, nonce, nowMs));
+    sendIcePing(peerId, nonce);
     writePingDiagnostic(QStringLiteral("PROBE_REQUEST"),
                         QStringLiteral("peer=%1 transport=ice nonce=%2")
-                            .arg(pingUserLabel(targetUserId)).arg(nonce));
+                            .arg(pingUserLabel(peerId)).arg(nonce));
+    return true;
 }
 
 void LobbyClient::reportMatchConnected(quint64 matchId, quint64 peerUserId)
@@ -3518,6 +4641,10 @@ bool LobbyClient::sendBroadcastBegin(quint64 matchId)
     QJsonObject d;
     d["matchId"] = QJsonValue(qint64(matchId));
     d["manifest"] = QString::fromLatin1(m_prematchManifest.toBase64());
+    // Say we'll upload keyframes when asked. Without it the lobby expects them
+    // on the interval and never asks, as for an older client.
+    if (m_broadcastKeyframeOnDemand)
+        d["keyframeOnDemand"] = true;
     sendEnvelope("BROADCAST_BEGIN", d);
     return true;
 }
@@ -3526,7 +4653,7 @@ bool LobbyClient::applySpectateManifest(const QByteArray& manifest)
 {
     uint64_t manifestHash = 0;
     size_t cheatCount = 0;
-    if (manifest.isEmpty() || manifest.size() > 512 * 1024 ||
+    if (manifest.isEmpty() || manifest.size() > MAX_RELAYED_MANIFEST_BYTES ||
         !applyPrematchManifest(manifest.toStdString(), manifestHash, cheatCount))
         return false;
     qInfo() << "Rollback lobby spectator prematch complete"
@@ -3581,6 +4708,7 @@ void LobbyClient::startSpectate(quint64 matchId)
 {
     QJsonObject d;
     d["matchId"] = QJsonValue(qint64(matchId));
+    m_spectateMatchId = matchId;
     sendEnvelope("SPECTATE_START", d);
 }
 
@@ -3588,6 +4716,8 @@ void LobbyClient::stopSpectate(quint64 matchId)
 {
     QJsonObject d;
     d["matchId"] = QJsonValue(qint64(matchId));
+    if (matchId == m_spectateMatchId)
+        m_spectateMatchId = 0;
     sendEnvelope("SPECTATE_STOP", d);
 }
 
@@ -3620,6 +4750,9 @@ LobbyClient::LobbyUser LobbyClient::parsePresenceUser(const QJsonObject& obj)
     u.currentRoomId   = static_cast<quint64>(obj.value("currentRoomId").toDouble());
     u.currentRoomName = obj.value("currentRoomName").toString();
     u.searchingRom    = obj.value("searchingRom").toString();
+    u.social = obj.value("social").toBool();
+    u.noChallenges = obj.value("noChallenges").toBool();
+    u.noPrivateMessages = obj.value("noPrivateMessages").toBool();
     return u;
 }
 

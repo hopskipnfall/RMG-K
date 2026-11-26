@@ -11,16 +11,17 @@
 #include <optional>
 #include <vector>
 
-class QCheckBox;
 class QLabel;
 class QLineEdit;
 class QListWidget;
-class QPushButton;
 
 namespace UserInterface
 {
 namespace Dialog
 {
+class CartridgeTile;
+class LobbyButton;
+class ToggleSwitch;
 
 // The save a room's next match starts from, as the host picked it.
 struct NetplaySaveChoice
@@ -33,6 +34,9 @@ struct NetplaySaveChoice
     // After a match that changed the save, the next one starts from where it
     // ended instead of from this save again.
     bool ContinueAfterMatch = true;
+    // The game's saves are written back to File (a netplay save the host
+    // kept) as the match goes, so the file always holds the latest progress.
+    bool KeepFileUpdated = false;
 };
 
 // "EEPROM 4K", "SRAM", "FlashRAM": the kinds data holds.
@@ -54,7 +58,18 @@ class StartingSaveDialog : public QDialog
                        const std::optional<NetplaySaveChoice>& current,
                        const std::optional<CoreNetplaySaveData>& lastMatch, QWidget* parent = nullptr);
 
+    void setCoverPath(const QString& coverPath);
     NetplaySaveChoice choice(void) const;
+    // Where choice() is from, so a later room can pick it again: "blank",
+    // "offline" or "file" (choice().File), or empty for where the last match
+    // left off, which a later room doesn't have.
+    QString source(void) const;
+    // That save picked again for a new room of the same game, read afresh,
+    // without the dialog. None when it can't be picked now: the file is gone,
+    // unreadable or made with another ROM, or there's no offline save.
+    static std::optional<NetplaySaveChoice> pickAgain(const QString& source, const QString& file,
+                                                      bool continueAfterMatch, bool keepFileUpdated,
+                                                      const QString& romFile, const QString& romMd5);
 
   private:
     struct Entry
@@ -67,19 +82,26 @@ class StartingSaveDialog : public QDialog
         bool Native = false;    // a plain emulator save file: no record of its game
         bool OtherRom = false;  // a .rmgsave made with a different ROM
         bool Blank = false;     // a new cartridge: nothing saved yet
+        bool Offline = false;   // the host's offline save for the game
     };
 
     void addEntry(Entry entry, bool select);
     void browse(void);
     void showDetails(void);
+    // The picked entry is a netplay save file the match can write back to.
+    bool canKeepFile(int row) const;
 
     QString m_romMd5;
     QString m_gameName;
     std::vector<Entry> m_entries;
+    CartridgeTile* m_tile = nullptr;
     QListWidget* m_list = nullptr;
     QLabel* m_details = nullptr;
-    QCheckBox* m_continueCheck = nullptr;
-    QPushButton* m_useButton = nullptr;
+    ToggleSwitch* m_continueCheck = nullptr;
+    ToggleSwitch* m_keepFileCheck = nullptr;
+    // What the host last chose for the box, kept while it's hidden.
+    bool m_keepFileWanted = true;
+    LobbyButton* m_useButton = nullptr;
 };
 
 // Save As for the match's save: a name and folder, and whether to keep the
@@ -92,6 +114,7 @@ class SaveNetplaySaveDialog : public QDialog
     SaveNetplaySaveDialog(const QString& gameName, const QString& currentFile, bool keepUpdated,
                           QWidget* parent = nullptr);
 
+    void setCoverPath(const QString& coverPath);
     QString filePath(void) const;
     bool keepUpdated(void) const;
 
@@ -99,9 +122,11 @@ class SaveNetplaySaveDialog : public QDialog
     void accept(void) override;
 
   private:
+    QString m_gameName;
+    CartridgeTile* m_tile = nullptr;
     QLineEdit* m_name = nullptr;
     QLineEdit* m_folder = nullptr;
-    QCheckBox* m_keepCheck = nullptr;
+    ToggleSwitch* m_keepCheck = nullptr;
 };
 
 } // namespace Dialog

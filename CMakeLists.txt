@@ -143,7 +143,7 @@ endif()
 add_subdirectory(Source/RMG-Core)
 add_subdirectory(Source/RMG)
 add_subdirectory(Source/RMG-Audio)
-if (WIN32 AND NETPLAY)
+if (NETPLAY)
     add_subdirectory(Source/RMG-Audio-Capture)
 endif()
 add_subdirectory(Source/RMG-Input)
@@ -157,7 +157,7 @@ install(TARGETS RMG
 install(TARGETS RMG-Audio
     DESTINATION ${PLUGIN_INSTALL_PATH}/Audio
 )
-if (WIN32 AND NETPLAY)
+if (NETPLAY)
     install(TARGETS RMG-Audio-Capture
         DESTINATION ${PLUGIN_INSTALL_PATH}/Audio
     )
@@ -197,6 +197,11 @@ if (INSTALL_CHEATS)
         DESTINATION ${DATA_INSTALL_PATH}/Cheats
     )
 endif(INSTALL_CHEATS)
+# Netplay game options packs, with the README and patch sources beside them.
+install(DIRECTORY ${CMAKE_SOURCE_DIR}/Data/GameOptions/
+    DESTINATION ${DATA_INSTALL_PATH}/GameOptions
+    FILES_MATCHING PATTERN "*.json" PATTERN "*.md" PATTERN "*.asm"
+)
 install(FILES ${MUPEN64PLUS_PLUGIN_RSP_CXD4}
     DESTINATION ${PLUGIN_INSTALL_PATH}/RSP
     PERMISSIONS ${LIB_PERMISSIONS}

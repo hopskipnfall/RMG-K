@@ -9,17 +9,29 @@
  */
 #include "OnScreenDisplay.hpp"
 
+#include <RMG-Core/Directories.hpp>
 #include <RMG-Core/Settings.hpp>
+#include <RMG-Core/VulkanOverlay.h>
 
 #include <backends/imgui_impl_opengl3.h>
+#include <backends/imgui_impl_vulkan.h>
 #include <imgui.h>
+#include <QLocale>
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <chrono>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <deque>
+#include <filesystem>
+#include <fstream>
+#include <future>
 #include <mutex>
 #include <string>
+#include <vector>
 
 //
 // Local Variables
@@ -28,6 +40,16 @@
 static bool l_Initialized     = false;
 static bool l_Enabled         = false;
 static bool l_RenderingPaused = false;
+
+// With a Vulkan graphics plugin (Parallel) there is no OpenGL context. The plugin
+// owns the device, so the Vulkan side is set up from the first frame it offers
+// (see VulkanOverlay.h) and the draws go into the plugin's own render pass.
+static bool l_VulkanMode   = false;
+static bool l_VulkanReady  = false;
+static bool l_VulkanFailed = false;
+static RmgkVulkanOverlayFrame l_VulkanFrame = {};
+static VkRenderPass l_VulkanRenderPass = VK_NULL_HANDLE;
+static PFN_vkDestroyRenderPass l_VulkanDestroyRenderPass = nullptr;
 
 enum class OnScreenDisplayMessageType
 {
@@ -64,6 +86,19 @@ static size_t      l_KailleraChatMaxMessages = 5;
 static bool        l_KailleraChatEnabled = true;
 static bool        l_FontsDirty      = true;
 static const float l_BaseFontSize    = 13.0f;
+// font.ttf covers Latin, Greek and Cyrillic. Japanese, Chinese, Korean and emoji
+// come from fonts already on the system. Those are 13-20 MB each, so they're only
+// read once such a character shows up, and off the emulation thread so it can't
+// stall a running match. Until then the character draws as a placeholder.
+struct OnScreenDisplayFallbackFont
+{
+    std::vector<char> data;
+    int index = 0;
+};
+static std::atomic<bool> l_FallbackFontsWanted = false;
+static bool l_FallbackFontsAdded = false;
+static std::future<std::vector<OnScreenDisplayFallbackFont>> l_FallbackFontLoad;
+static std::vector<OnScreenDisplayFallbackFont> l_FallbackFonts;
 static const float l_MessageFadeoutDurationSeconds = 0.26f;
 static const float l_MessageSlideInDurationSeconds = 0.31f;
 static bool        l_InputPromptActive = false;
@@ -71,6 +106,7 @@ static std::string l_InputPrompt;
 static bool        l_KailleraPortLabelsEnabled = false;
 static int         l_KailleraPortLabelPlayerCount = 0;
 static std::array<std::string, 4> l_KailleraPortLabelPlayerNames;
+static bool        l_KailleraPortLabelsNamed = false; // a port of this game has had a name
 static constexpr std::array<float, 4> l_KailleraPortLabelCenterOffset720p = { 19.0f, 0.0f, -19.0f, -70.0f };
 // Big centered banner (e.g. "Stream is buffering...") drawn over everything while
 // a spectator fast-forwards toward a broadcast's live edge. Empty = hidden.
@@ -174,24 +210,226 @@ static void OnScreenDisplayEnforceQueueLimitWithFade(const std::chrono::time_poi
     }
 }
 
-static void OnScreenDisplayUpdateFonts(void)
+// Notes when text needs a font beyond font.ttf: from Hangul Jamo up, leaving out
+// the punctuation and Latin extensions in between.
+static void OnScreenDisplayCheckFallbackFonts(const std::string& text)
 {
-    if (!l_FontsDirty)
+    if (l_FallbackFontsWanted.load(std::memory_order_relaxed))
     {
         return;
     }
 
+    for (size_t i = 0; i < text.size(); ++i)
+    {
+        const unsigned char lead = static_cast<unsigned char>(text[i]);
+        const bool hangulJamo = lead == 0xE1 && i + 1 < text.size() &&
+            static_cast<unsigned char>(text[i + 1]) >= 0x84 && static_cast<unsigned char>(text[i + 1]) <= 0x87;
+        const bool symbols = lead == 0xE2 && i + 1 < text.size() &&
+            static_cast<unsigned char>(text[i + 1]) >= 0x98; // U+2600 and up
+        if (lead >= 0xE3 || hangulJamo || symbols)
+        {
+            l_FallbackFontsWanted.store(true, std::memory_order_relaxed);
+            return;
+        }
+    }
+}
+
+// Variation selectors ask for a presentation the OSD can't do anyway, and the emoji
+// font gives them a wide blank glyph, which leaves a gap after the emoji.
+static void OnScreenDisplayDropVariationSelectors(std::string& text)
+{
+    for (const char* selector : {"ï¸", "ï¸"})
+    {
+        for (size_t at = text.find(selector); at != std::string::npos; at = text.find(selector, at))
+        {
+            text.erase(at, 3);
+        }
+    }
+}
+
+static std::vector<OnScreenDisplayFallbackFont> OnScreenDisplayReadFallbackFonts(void)
+{
+    struct Candidate
+    {
+        const char* path;
+        int index;
+    };
+    using Candidates = std::vector<Candidate>;
+
+#ifdef _WIN32
+    const char* windowsDirectory = std::getenv("WINDIR");
+    const std::filesystem::path directory =
+        std::filesystem::path(windowsDirectory != nullptr ? windowsDirectory : "C:\\Windows") / "Fonts";
+    const Candidates japanese = {{"YuGothM.ttc", 0}, {"meiryo.ttc", 0}, {"msgothic.ttc", 0}};
+    const Candidates chinese = {{"msyh.ttc", 0}, {"msyh.ttf", 0}, {"msjh.ttc", 0}, {"simsun.ttc", 0}};
+    const Candidates korean = {{"malgun.ttf", 0}};
+    const Candidates emoji = {{"seguiemj.ttf", 0}, {"seguisym.ttf", 0}};
+#else
+    const std::filesystem::path directory = "/usr/share/fonts";
+    // Noto Sans CJK puts every language in one file; the index picks which one wins.
+    const char* notoPaths[] = {"opentype/noto/NotoSansCJK-Regular.ttc", "noto-cjk/NotoSansCJK-Regular.ttc",
+                               "google-noto-sans-cjk-fonts/NotoSansCJK-Regular.ttc",
+                               "OTF/NotoSansCJK-Regular.ttc", "noto/NotoSansCJK-Regular.ttc"};
+    const auto noto = [&notoPaths](int index) {
+        Candidates candidates;
+        for (const char* path : notoPaths)
+        {
+            candidates.push_back({path, index});
+        }
+        return candidates;
+    };
+    Candidates japanese = noto(0);
+    japanese.push_back({"truetype/fonts-japanese-gothic.ttf", 0});
+    Candidates chinese = noto(2);
+    chinese.push_back({"truetype/wqy/wqy-microhei.ttc", 0});
+    chinese.push_back({"truetype/wqy/wqy-zenhei.ttc", 0});
+    Candidates korean = noto(1);
+    korean.push_back({"truetype/nanum/NanumGothic.ttf", 0});
+    const Candidates emoji = {{"truetype/noto/NotoEmoji-Regular.ttf", 0}, {"noto/NotoEmoji-Regular.ttf", 0},
+                              {"truetype/dejavu/DejaVuSans.ttf", 0}};
+#endif
+
+    // The same Han character is drawn differently per language, so the player's
+    // own language goes first. Everyone else gets Japanese first, the likeliest
+    // non-Latin names in this community.
+    const QLocale::Language language = QLocale::system().language();
+    std::vector<const Candidates*> order = {&japanese, &chinese, &korean};
+    if (language == QLocale::Chinese)
+    {
+        order = {&chinese, &japanese, &korean};
+    }
+    else if (language == QLocale::Korean)
+    {
+        order = {&korean, &japanese, &chinese};
+    }
+    order.push_back(&emoji);
+
+    std::vector<OnScreenDisplayFallbackFont> fonts;
+    for (const Candidates* candidates : order)
+    {
+        for (const Candidate& candidate : *candidates)
+        {
+            std::ifstream file(directory / candidate.path, std::ios::binary);
+            if (!file)
+            {
+                continue;
+            }
+            OnScreenDisplayFallbackFont font;
+            font.data.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+            font.index = candidate.index;
+            fonts.push_back(std::move(font));
+            break;
+        }
+    }
+    return fonts;
+}
+
+// ImGui sizes a font by its line height, and how much of that a font's glyphs fill
+// varies a lot: Noto Sans CJK draws a quarter smaller than Yu Gothic at the same size.
+// This reads a font's line height in ems from its header, so they can all be evened out.
+static float OnScreenDisplayFontLineHeightInEms(const std::vector<char>& data, int index)
+{
+    const auto read16 = [&data](size_t at) -> int {
+        if (at + 2 > data.size())
+        {
+            return 0;
+        }
+        return (static_cast<unsigned char>(data[at]) << 8) | static_cast<unsigned char>(data[at + 1]);
+    };
+    const auto read32 = [&read16](size_t at) -> size_t {
+        return (static_cast<size_t>(read16(at)) << 16) | static_cast<size_t>(read16(at + 2));
+    };
+
+    size_t offset = 0;
+    if (data.size() >= 4 && std::memcmp(data.data(), "ttcf", 4) == 0)
+    {
+        offset = read32(12 + 4 * static_cast<size_t>(index));
+    }
+
+    int unitsPerEm = 0;
+    int ascent = 0;
+    int descent = 0;
+    const int tableCount = read16(offset + 4);
+    for (int i = 0; i < tableCount; ++i)
+    {
+        const size_t record = offset + 12 + 16 * static_cast<size_t>(i);
+        if (record + 16 > data.size())
+        {
+            break;
+        }
+        const size_t table = read32(record + 8);
+        if (std::memcmp(data.data() + record, "head", 4) == 0)
+        {
+            unitsPerEm = read16(table + 18);
+        }
+        else if (std::memcmp(data.data() + record, "hhea", 4) == 0)
+        {
+            ascent = static_cast<int16_t>(read16(table + 4));
+            descent = static_cast<int16_t>(read16(table + 6));
+        }
+    }
+
+    if (unitsPerEm <= 0 || ascent <= descent)
+    {
+        return 1.0f;
+    }
+    return static_cast<float>(ascent - descent) / static_cast<float>(unitsPerEm);
+}
+
+static void OnScreenDisplayUpdateFonts(void)
+{
     ImGuiIO& io = ImGui::GetIO();
-    ImFontConfig config;
-    config.SizePixels = l_BaseFontSize * l_MessageScale;
 
-    io.Fonts->Clear();
-    io.FontDefault = io.Fonts->AddFontDefault(&config);
+    if (io.Fonts->Fonts.empty())
+    {
+        const std::filesystem::path fontPath = CoreGetSharedDataDirectory() / "font.ttf";
+        std::error_code error;
+        if (std::filesystem::exists(fontPath, error))
+        {
+            io.Fonts->AddFontFromFileTTF(fontPath.string().c_str(), l_BaseFontSize);
+        }
+        if (io.Fonts->Fonts.empty())
+        {
+            io.Fonts->AddFontDefault();
+        }
+    }
 
-    ImGui_ImplOpenGL3_DestroyFontsTexture();
-    ImGui_ImplOpenGL3_CreateFontsTexture();
+    if (l_FontsDirty)
+    {
+        // glyphs are drawn on demand at each size in use, so nothing needs rebuilding
+        ImGui::GetStyle().FontSizeBase = l_BaseFontSize * l_MessageScale;
+        l_FontsDirty = false;
+    }
 
-    l_FontsDirty = false;
+    if (l_FallbackFontsAdded)
+    {
+        return;
+    }
+    if (!l_FallbackFontLoad.valid())
+    {
+        if (l_FallbackFontsWanted.load(std::memory_order_relaxed))
+        {
+            l_FallbackFontLoad = std::async(std::launch::async, OnScreenDisplayReadFallbackFonts);
+        }
+        return;
+    }
+    if (l_FallbackFontLoad.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+    {
+        return;
+    }
+
+    l_FallbackFonts = l_FallbackFontLoad.get();
+    for (OnScreenDisplayFallbackFont& font : l_FallbackFonts)
+    {
+        ImFontConfig config;
+        config.MergeMode = true;
+        config.FontNo = font.index;
+        config.FontDataOwnedByAtlas = false;
+        // A merged font's size is relative to the base font's. 0.92 em sits well beside font.ttf.
+        const float size = l_BaseFontSize * 0.92f * OnScreenDisplayFontLineHeightInEms(font.data, font.index);
+        io.Fonts->AddFontFromMemoryTTF(font.data.data(), static_cast<int>(font.data.size()), size, &config);
+    }
+    l_FallbackFontsAdded = true;
 }
 
 static std::string OnScreenDisplayNormalizePortLabelName(const std::string& name, int playerIndex)
@@ -224,7 +462,15 @@ static std::string OnScreenDisplayTruncateToWidth(std::string label, float textS
         {
             return label;
         }
-        label.pop_back();
+        // drop one whole character: its continuation bytes, then its lead byte
+        while (!label.empty() && (static_cast<unsigned char>(label.back()) & 0xC0) == 0x80)
+        {
+            label.pop_back();
+        }
+        if (!label.empty())
+        {
+            label.pop_back();
+        }
     }
 
     return label;
@@ -270,6 +516,15 @@ static void OnScreenDisplayRenderKailleraPortLabels(void)
 
     for (int i = 0; i < playerCount; ++i)
     {
+        // In a game with names, a port without one is an empty seat: one a
+        // late join match keeps for a player who hasn't joined yet, a gap
+        // between seated players, or a player who dropped. It gets no label,
+        // as if the port weren't there, until someone takes it. Only a game
+        // that never had names (an old KRC0 replay, say) shows P1, P2...
+        if (l_KailleraPortLabelsNamed && l_KailleraPortLabelPlayerNames[static_cast<size_t>(i)].empty())
+        {
+            continue;
+        }
         std::string label = OnScreenDisplayNormalizePortLabelName(l_KailleraPortLabelPlayerNames[static_cast<size_t>(i)], i);
         const float maxTextWidth = std::max(0.0f, portWidth - (8.0f * baseScale));
         float activeFontScale = fontScale;
@@ -420,11 +675,212 @@ static void OnScreenDisplayRenderLagReport(void)
     ImGui::PopStyleColor(2);
 }
 
+static bool OnScreenDisplayBuildFrame(void);
+
+// The plugin's swapchain render pass isn't handed over, and doesn't need to be:
+// a pipeline works in any render pass with the same attachment formats.
+static VkRenderPass OnScreenDisplayVulkanCreateRenderPass(const RmgkVulkanOverlayFrame& frame)
+{
+    const auto createRenderPass = reinterpret_cast<PFN_vkCreateRenderPass>(
+        frame.getInstanceProcAddr(frame.instance, "vkCreateRenderPass"));
+    l_VulkanDestroyRenderPass = reinterpret_cast<PFN_vkDestroyRenderPass>(
+        frame.getInstanceProcAddr(frame.instance, "vkDestroyRenderPass"));
+    if (createRenderPass == nullptr || l_VulkanDestroyRenderPass == nullptr)
+    {
+        return VK_NULL_HANDLE;
+    }
+
+    VkAttachmentDescription attachment = {};
+    attachment.format = static_cast<VkFormat>(frame.format);
+    attachment.samples = VK_SAMPLE_COUNT_1_BIT;
+    attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    attachment.initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    attachment.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    VkAttachmentReference color = {0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkSubpassDescription subpass = {};
+    subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    subpass.colorAttachmentCount = 1;
+    subpass.pColorAttachments = &color;
+    VkRenderPassCreateInfo info = {};
+    info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+    info.attachmentCount = 1;
+    info.pAttachments = &attachment;
+    info.subpassCount = 1;
+    info.pSubpasses = &subpass;
+
+    VkRenderPass renderPass = VK_NULL_HANDLE;
+    if (createRenderPass(static_cast<VkDevice>(frame.device), &info, nullptr, &renderPass) != VK_SUCCESS)
+    {
+        return VK_NULL_HANDLE;
+    }
+    return renderPass;
+}
+
+static void OnScreenDisplayVulkanDestroyRenderPass(void)
+{
+    if (l_VulkanRenderPass != VK_NULL_HANDLE && l_VulkanDestroyRenderPass != nullptr)
+    {
+        l_VulkanDestroyRenderPass(static_cast<VkDevice>(l_VulkanFrame.device), l_VulkanRenderPass, nullptr);
+    }
+    l_VulkanRenderPass = VK_NULL_HANDLE;
+}
+
+static bool OnScreenDisplayVulkanCreate(const RmgkVulkanOverlayFrame& frame)
+{
+    if (frame.getInstanceProcAddr == nullptr || frame.instance == nullptr || frame.device == nullptr)
+    {
+        return false;
+    }
+
+    const bool loaded = ImGui_ImplVulkan_LoadFunctions(VK_API_VERSION_1_1,
+        [](const char* name, void* userData) -> PFN_vkVoidFunction {
+            const RmgkVulkanOverlayFrame* from = static_cast<const RmgkVulkanOverlayFrame*>(userData);
+            return reinterpret_cast<PFN_vkVoidFunction>(from->getInstanceProcAddr(from->instance, name));
+        }, const_cast<RmgkVulkanOverlayFrame*>(&frame));
+    if (!loaded)
+    {
+        return false;
+    }
+
+    l_VulkanFrame = frame;
+    l_VulkanRenderPass = OnScreenDisplayVulkanCreateRenderPass(frame);
+    if (l_VulkanRenderPass == VK_NULL_HANDLE)
+    {
+        return false;
+    }
+
+    ImGui_ImplVulkan_InitInfo info = {};
+    info.ApiVersion = VK_API_VERSION_1_1;
+    info.Instance = static_cast<VkInstance>(frame.instance);
+    info.PhysicalDevice = static_cast<VkPhysicalDevice>(frame.physicalDevice);
+    info.Device = static_cast<VkDevice>(frame.device);
+    info.QueueFamily = frame.queueFamily;
+    info.Queue = static_cast<VkQueue>(frame.queue);
+    // One per font texture alive at once. A texture is replaced whenever the atlas
+    // grows (a resize bakes new sizes every frame) and the old one lingers a few frames.
+    info.DescriptorPoolSize = IMGUI_IMPL_VULKAN_MINIMUM_SAMPLED_IMAGE_POOL_SIZE * 2;
+    info.MinImageCount = 2;
+    info.ImageCount = std::max<uint32_t>(2, frame.imageCount);
+    info.PipelineInfoMain.RenderPass = l_VulkanRenderPass;
+    info.PipelineInfoMain.Subpass = 0;
+    info.PipelineInfoMain.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
+    if (!ImGui_ImplVulkan_Init(&info))
+    {
+        OnScreenDisplayVulkanDestroyRenderPass();
+        return false;
+    }
+
+    l_VulkanReady = true;
+    return true;
+}
+
+static void OnScreenDisplayVulkanDestroy(void)
+{
+    if (!l_VulkanReady)
+    {
+        return;
+    }
+    ImGui_ImplVulkan_Shutdown();
+    OnScreenDisplayVulkanDestroyRenderPass();
+    l_VulkanReady = false;
+}
+
+static int OnScreenDisplayVulkanPrepare(const RmgkVulkanOverlayFrame* frame)
+{
+    if (!l_Initialized || !l_VulkanMode || l_VulkanFailed || frame == nullptr ||
+        frame->width == 0 || frame->height == 0)
+    {
+        return 0;
+    }
+
+    if (l_VulkanReady && frame->device != l_VulkanFrame.device)
+    {
+        OnScreenDisplayVulkanDestroy();
+    }
+    if (!l_VulkanReady && !OnScreenDisplayVulkanCreate(*frame))
+    {
+        // not every frame: one failure is the answer for this device
+        l_VulkanFailed = true;
+        return 0;
+    }
+    if (frame->format != l_VulkanFrame.format)
+    {
+        // the swapchain came back in another format: same pipeline, new render pass
+        const VkRenderPass renderPass = OnScreenDisplayVulkanCreateRenderPass(*frame);
+        if (renderPass == VK_NULL_HANDLE)
+        {
+            return 0;
+        }
+        ImGui_ImplVulkan_PipelineInfo pipeline = {};
+        pipeline.RenderPass = renderPass;
+        pipeline.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
+        ImGui_ImplVulkan_CreateMainPipeline(&pipeline);
+        OnScreenDisplayVulkanDestroyRenderPass();
+        l_VulkanRenderPass = renderPass;
+    }
+    l_VulkanFrame = *frame;
+
+    ImGui::GetIO().DisplaySize = ImVec2(static_cast<float>(frame->width), static_cast<float>(frame->height));
+    if (!OnScreenDisplayBuildFrame())
+    {
+        return 0;
+    }
+
+    // Font glyphs new this frame. The upload goes to the plugin's queue, so it's
+    // done here under the plugin's lock, not while the plugin has a render pass open.
+    const ImDrawData* drawData = ImGui::GetDrawData();
+    bool texturesPending = false;
+    if (drawData->Textures != nullptr)
+    {
+        for (const ImTextureData* texture : *drawData->Textures)
+        {
+            texturesPending = texturesPending || texture->Status != ImTextureStatus_OK;
+        }
+    }
+    if (texturesPending)
+    {
+        if (frame->queueLock != nullptr)
+        {
+            frame->queueLock(frame->userData);
+        }
+        for (ImTextureData* texture : *drawData->Textures)
+        {
+            if (texture->Status != ImTextureStatus_OK)
+            {
+                ImGui_ImplVulkan_UpdateTexture(texture);
+            }
+        }
+        if (frame->queueUnlock != nullptr)
+        {
+            frame->queueUnlock(frame->userData);
+        }
+    }
+    return 1;
+}
+
+static void OnScreenDisplayVulkanDraw(void* commandBuffer)
+{
+    if (!l_VulkanReady || commandBuffer == nullptr)
+    {
+        return;
+    }
+    ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), static_cast<VkCommandBuffer>(commandBuffer));
+}
+
+static void OnScreenDisplayVulkanShutdown(void)
+{
+    OnScreenDisplayVulkanDestroy();
+    l_VulkanFailed = false;
+}
+
 //
 // Exported Functions
 //
 
-bool OnScreenDisplayInit(void)
+bool OnScreenDisplayInit(bool vulkan)
 {
     if (l_Initialized)
     {
@@ -435,11 +891,15 @@ bool OnScreenDisplayInit(void)
     ImGui::CreateContext();
     ImGui::StyleColorsDark();
 
-    if (!ImGui_ImplOpenGL3_Init())
+    if (!vulkan && !ImGui_ImplOpenGL3_Init())
     {
+        ImGui::DestroyContext();
         return false;
     }
 
+    l_VulkanMode = vulkan;
+    l_VulkanReady = false;
+    l_VulkanFailed = false;
     l_FontsDirty = true;
     l_Initialized = true;
     return true;
@@ -452,8 +912,35 @@ void OnScreenDisplayShutdown(void)
         return;
     }
 
-    ImGui_ImplOpenGL3_Shutdown();
+    if (l_VulkanMode)
+    {
+        // The plugin asks for the Vulkan side to go before its device does. If it
+        // didn't, the device is gone by now and there is nothing left to free.
+        if (l_VulkanReady)
+        {
+            ImGuiIO& io = ImGui::GetIO();
+            io.BackendRendererName = nullptr;
+            io.BackendRendererUserData = nullptr;
+            ImGui::GetPlatformIO().ClearRendererHandlers();
+            l_VulkanReady = false;
+        }
+        l_VulkanRenderPass = VK_NULL_HANDLE;
+        l_VulkanMode = false;
+    }
+    else
+    {
+        ImGui_ImplOpenGL3_Shutdown();
+    }
     ImGui::DestroyContext();
+
+    if (l_FallbackFontLoad.valid())
+    {
+        l_FallbackFontLoad.wait();
+        l_FallbackFontLoad = {};
+    }
+    l_FallbackFonts.clear();
+    l_FallbackFontsAdded = false;
+    l_FallbackFontsWanted.store(false, std::memory_order_relaxed);
 
     l_MessageQueue.clear();
     l_InputPromptActive = false;
@@ -463,6 +950,7 @@ void OnScreenDisplayShutdown(void)
         std::lock_guard<std::mutex> lock(l_KailleraOverlayMutex);
         l_KailleraPortLabelPlayerCount = 0;
         l_KailleraPortLabelPlayerNames = {};
+        l_KailleraPortLabelsNamed = false;
         l_CenterMessage.clear();
     }
     {
@@ -572,6 +1060,7 @@ void OnScreenDisplaySetMessage(std::string message)
         return;
     }
 
+    OnScreenDisplayCheckFallbackFonts(message);
     l_MessageQueue.push_back({std::move(message), std::chrono::high_resolution_clock::now(), OnScreenDisplayMessageType::System});
     OnScreenDisplayEnforceQueueLimitWithFade(std::chrono::high_resolution_clock::now());
 }
@@ -604,6 +1093,8 @@ void OnScreenDisplaySetKailleraChatMessage(std::string message)
         return;
     }
 
+    OnScreenDisplayDropVariationSelectors(message);
+    OnScreenDisplayCheckFallbackFonts(message);
     l_MessageQueue.push_back({std::move(message), std::chrono::high_resolution_clock::now(), OnScreenDisplayMessageType::Chat});
     OnScreenDisplayEnforceQueueLimitWithFade(std::chrono::high_resolution_clock::now());
 }
@@ -660,6 +1151,8 @@ void OnScreenDisplaySetKailleraChatMessageImmediate(std::string message)
         return;
     }
 
+    OnScreenDisplayDropVariationSelectors(message);
+    OnScreenDisplayCheckFallbackFonts(message);
     l_MessageQueue.push_back({std::move(message), std::chrono::high_resolution_clock::now(), OnScreenDisplayMessageType::Chat, true});
     OnScreenDisplayEnforceQueueLimitWithFade(std::chrono::high_resolution_clock::now());
 }
@@ -678,21 +1171,39 @@ void OnScreenDisplaySetInputPrompt(std::string message)
         return;
     }
 
+    OnScreenDisplayDropVariationSelectors(message);
+    OnScreenDisplayCheckFallbackFonts(message);
     l_InputPromptActive = true;
     l_InputPrompt = std::move(message);
 }
 
+static bool OnScreenDisplayAnyPortNamed(const std::array<std::string, 4>& playerNames)
+{
+    return std::any_of(playerNames.begin(), playerNames.end(),
+                       [](const std::string& name) { return !name.empty(); });
+}
+
 void OnScreenDisplaySetKailleraPortLabels(int playerCount, const std::array<std::string, 4>& playerNames)
 {
+    for (const std::string& name : playerNames)
+    {
+        OnScreenDisplayCheckFallbackFonts(name);
+    }
     std::lock_guard<std::mutex> lock(l_KailleraOverlayMutex);
     l_KailleraPortLabelPlayerCount = std::clamp(playerCount, 0, 4);
     l_KailleraPortLabelPlayerNames = playerNames;
+    l_KailleraPortLabelsNamed = OnScreenDisplayAnyPortNamed(playerNames);
 }
 
 void OnScreenDisplaySetKailleraPortLabelNames(const std::array<std::string, 4>& playerNames)
 {
+    for (const std::string& name : playerNames)
+    {
+        OnScreenDisplayCheckFallbackFonts(name);
+    }
     std::lock_guard<std::mutex> lock(l_KailleraOverlayMutex);
     l_KailleraPortLabelPlayerNames = playerNames;
+    l_KailleraPortLabelsNamed = l_KailleraPortLabelsNamed || OnScreenDisplayAnyPortNamed(playerNames);
 }
 
 void OnScreenDisplayClearKailleraPortLabels(void)
@@ -700,10 +1211,12 @@ void OnScreenDisplayClearKailleraPortLabels(void)
     std::lock_guard<std::mutex> lock(l_KailleraOverlayMutex);
     l_KailleraPortLabelPlayerCount = 0;
     l_KailleraPortLabelPlayerNames = {};
+    l_KailleraPortLabelsNamed = false;
 }
 
 void OnScreenDisplaySetCenterMessage(const std::string& message)
 {
+    OnScreenDisplayCheckFallbackFonts(message);
     std::lock_guard<std::mutex> lock(l_KailleraOverlayMutex);
     l_CenterMessage = message;
 }
@@ -711,6 +1224,16 @@ void OnScreenDisplaySetCenterMessage(const std::string& message)
 void OnScreenDisplaySetLagReport(const std::string& headline, const std::string& detail,
                                  const std::vector<std::vector<std::string>>& table, int seconds)
 {
+    // Japanese labels and non-Latin names need the system fonts.
+    OnScreenDisplayCheckFallbackFonts(headline);
+    OnScreenDisplayCheckFallbackFonts(detail);
+    for (const std::vector<std::string>& row : table)
+    {
+        for (const std::string& cell : row)
+        {
+            OnScreenDisplayCheckFallbackFonts(cell);
+        }
+    }
     std::lock_guard<std::mutex> lock(l_KailleraOverlayMutex);
     l_LagReportHeadline = seconds > 0 ? headline : std::string();
     l_LagReportDetail = detail;
@@ -726,11 +1249,33 @@ void OnScreenDisplaySetLiveReplayStatus(const std::string& message)
     l_LiveReplayStatus = message;
 }
 
+const RmgkVulkanOverlayHooks* OnScreenDisplayGetVulkanHooks(void)
+{
+    static const RmgkVulkanOverlayHooks hooks = {
+        &OnScreenDisplayVulkanPrepare, &OnScreenDisplayVulkanDraw, &OnScreenDisplayVulkanShutdown
+    };
+    return &hooks;
+}
+
 void OnScreenDisplayRender(void)
+{
+    if (l_VulkanMode)
+    {
+        return;
+    }
+    if (OnScreenDisplayBuildFrame())
+    {
+        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+    }
+}
+
+// Lays this frame's OSD out. False when there is nothing to show, and then
+// there is no frame to draw.
+static bool OnScreenDisplayBuildFrame(void)
 {
     if (!l_Initialized || l_RenderingPaused)
     {
-        return;
+        return false;
     }
 
     const auto currentTime = std::chrono::high_resolution_clock::now();
@@ -799,11 +1344,18 @@ void OnScreenDisplayRender(void)
 
     if (!hasMessages)
     {
-        return;
+        return false;
     }
 
     OnScreenDisplayUpdateFonts();
-    ImGui_ImplOpenGL3_NewFrame();
+    if (l_VulkanMode)
+    {
+        ImGui_ImplVulkan_NewFrame();
+    }
+    else
+    {
+        ImGui_ImplOpenGL3_NewFrame();
+    }
     ImGui::NewFrame();
     
     ImGuiIO& io = ImGui::GetIO();
@@ -855,6 +1407,13 @@ void OnScreenDisplayRender(void)
         break;
     }
 
+    // ImGui stacks windows by when each was first created, not by draw order, and
+    // NoBringToFrontOnFocus creates a window behind all the others. Port labels
+    // keep that flag and chat and the prompt don't, which puts chat on top however
+    // the two came to be created.
+    const ImGuiWindowFlags chatWindowFlags = ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoDecoration |
+        ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoFocusOnAppearing;
+
     const bool anchorBottom = (l_MessagePosition == 0 || l_MessagePosition == 3);
     const float stackSpacingFactor = 1.5f;
     float offsetY = 0.0f;
@@ -884,7 +1443,7 @@ void OnScreenDisplayRender(void)
         const float posY = anchorBottom ? (baseY - offsetY) : (baseY + offsetY);
         ImGui::SetNextWindowPos(ImVec2(baseX, posY), ImGuiCond_Always, pivot);
 
-        ImGui::Begin("OSD Input", nullptr, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoFocusOnAppearing);
+        ImGui::Begin("OSD Input", nullptr, chatWindowFlags);
         if (maxWrapWidth > 0.0f)
         {
             ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + maxWrapWidth);
@@ -934,7 +1493,7 @@ void OnScreenDisplayRender(void)
 
         const std::string windowName = "OSD Message##" + std::to_string(messageIndex);
         ImGui::PushStyleVar(ImGuiStyleVar_Alpha, messageAlpha);
-        ImGui::Begin(windowName.c_str(), nullptr, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoFocusOnAppearing);
+        ImGui::Begin(windowName.c_str(), nullptr, chatWindowFlags);
         if (maxWrapWidth > 0.0f)
         {
             ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + maxWrapWidth);
@@ -961,8 +1520,7 @@ void OnScreenDisplayRender(void)
     OnScreenDisplayRenderCenterMessage();
 
     ImGui::Render();
-
-    ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+    return true;
 }
 
 void OnScreenDisplayPause(void)

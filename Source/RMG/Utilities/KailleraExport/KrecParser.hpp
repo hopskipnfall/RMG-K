@@ -29,6 +29,15 @@ struct KrecChatLine
     std::string message;
 };
 
+// A port change (0x14 record), in effect from input record `record` on: a
+// player who drops leaves the port empty, and a late joiner taking it names it.
+struct KrecPortChange
+{
+    int record = 0;
+    int slot = 0; // 1-4
+    std::string name; // empty when the port was left
+};
+
 struct KrecData
 {
     KrecHeader header;
@@ -37,10 +46,19 @@ struct KrecData
     int delayFrames = 0;
     // The save the match started from (its 0x16 record), empty when blank.
     std::string saveData;
+    // The game options it was played with (its 0x17 record, RMG-Core's
+    // serialized section), empty when none.
+    std::string gameOptions;
     std::vector<KrecChatLine> chat;
+    std::vector<KrecPortChange> portChanges;
 };
 
 bool ParseKrecFile(const std::filesystem::path& path, KrecData& outData, std::string* errorMessage);
+
+// A .krec's game options section (see KrecData::gameOptions) without reading
+// past the records ahead of its inputs. False when the file isn't a krec;
+// section is empty when the match had no game options.
+bool ReadKrecGameOptions(const std::filesystem::path& path, std::string& section);
 
 // Replay metadata (JSON: bookmarks, and for ranked replays the module and
 // its write journal) appended to a finished .krec:

@@ -50,6 +50,8 @@
 #include <QCoreApplication>
 #include <QDesktopServices>
 #include <QGuiApplication>
+#include <QInputMethod>
+#include <QTextBoundaryFinder>
 #include <QStyleFactory>
 #include <QActionGroup>
 #include <QFileDialog>
@@ -166,6 +168,7 @@ public:
 #include <RMG-Core/SpeedLimiter.hpp>
 #include <RMG-Core/Directories.hpp>
 #include <RMG-Core/NetplaySave.hpp>
+#include <RMG-Core/GameOptions.hpp>
 #include <RMG-Core/SpeedFactor.hpp>
 #include <RMG-Core/Screenshot.hpp>
 #include <RMG-Core/Emulation.hpp>
@@ -1967,6 +1970,7 @@ void MainWindow::initializeUI(bool launchROM)
     this->ui_Widget_Dummy = new Widget::DummyWidget(this);
 
     this->ui_EventFilter = new EventFilter(this);
+    this->ui_InputMethodFilter = new InputMethodFilter(this);
     this->ui_StatusBar_Label = new QLabel(this);
     this->controllerStartupNotice.shown = CoreSettingsGetBoolValue(SettingsID::RaphnetInput_StartupNoticeShown);
     this->controllerNoticeClock.start();
@@ -2013,6 +2017,12 @@ void MainWindow::initializeUI(bool launchROM)
             &MainWindow::on_EventFilter_KeyReleased);
     connect(this->ui_EventFilter, &EventFilter::on_EventFilter_FileDropped, this,
             &MainWindow::on_EventFilter_FileDropped);
+#ifdef NETPLAY
+    connect(this->ui_InputMethodFilter, &InputMethodFilter::on_InputMethodFilter_Query, this,
+            &MainWindow::on_InputMethodFilter_Query);
+    connect(this->ui_InputMethodFilter, &InputMethodFilter::on_InputMethodFilter_Event, this,
+            &MainWindow::on_InputMethodFilter_Event);
+#endif // NETPLAY
 }
 
 void MainWindow::configureUI(QApplication* app, bool showUI)
@@ -3204,7 +3214,6 @@ void MainWindow::connectActionSignals(void)
     connect(this->action_Settings_Settings, &QAction::triggered, this, &MainWindow::on_Action_Settings_Settings);
     connect(this->action_Settings_Plugins, &QAction::triggered, this, &MainWindow::on_Action_Settings_Plugins);
     connect(this->action_Toolbar_Input, &QAction::triggered, this, &MainWindow::on_Action_Settings_Input);
-    connect(this->action_Toolbar_Playback, &QAction::triggered, this, &MainWindow::on_Action_Playback);
 
     connect(this->action_View_Toolbar, &QAction::toggled, this, &MainWindow::on_Action_View_Toolbar);
     connect(this->action_View_StatusBar, &QAction::toggled, this, &MainWindow::on_Action_View_StatusBar);
@@ -3217,6 +3226,7 @@ void MainWindow::connectActionSignals(void)
     connect(this->action_View_Log, &QAction::triggered, this, &MainWindow::on_Action_View_Log);
     connect(this->action_View_Search, &QAction::triggered, this, &MainWindow::on_Action_View_Search);
 
+    connect(this->action_Netplay_Replays, &QAction::triggered, this, &MainWindow::on_Action_Playback);
     // Menu-bar Netplay: legacy (delay) server + peer-to-peer open the launcher
     // straight to their tab; rollback lobby is the streamlined entry.
     connect(this->action_Netplay_BrowseSessions, &QAction::triggered, this, &MainWindow::on_Action_Netplay_LegacyServer);
@@ -4380,6 +4390,12 @@ void MainWindow::on_Lobby_SpectateLaunch(quint64 matchId, QString gameName, QStr
     {
         return; // already spectating
     }
+    // Switching from one live replay to another launches as the last game
+    // reports finished, when its thread may still be on its way out.
+    if (this->emulationThread->isRunning() && !CoreIsEmulationRunning())
+    {
+        this->emulationThread->wait(500);
+    }
     if (this->emulationThread->isRunning())
     {
         this->showErrorMessage("Busy", "Stop the current game before watching a live replay.");
@@ -4445,7 +4461,13 @@ void MainWindow::on_Lobby_SpectateData(QByteArray bytes, int liveFrame, qint64 o
     // Track the broadcaster's live edge (monotonic) — the fast-forward target.
     if (liveFrame > this->ui_SpectateLiveFrame)
         this->ui_SpectateLiveFrame = liveFrame;
-    n02::playbackAppendBytes(bytes.constData(), static_cast<int>(bytes.size()));
+    if (!n02::playbackAppendBytes(bytes.constData(), static_cast<int>(bytes.size())))
+    {
+        this->stopLobbySpectate();
+        this->showErrorMessage(QStringLiteral("Live Replay Error"),
+            QStringLiteral("The live replay sent data that can't be played. Playback was stopped."));
+        return;
+    }
     this->ui_SpectateExpectedOffset += bytes.size();
 
     // The krec header carries the slot-ordered player names; once it has been
@@ -4537,6 +4559,7 @@ void MainWindow::cleanupLobbySpectateSession()
     this->ui_SpectateCleanupPending = false;
     CoreSetNetplayCheats({}); // also clear a manifest staged before the ROM opened
     CoreClearNetplaySaveData();
+    CoreClearNetplayGameOptions();
 
     if (this->kailleraSessionManager != nullptr)
     {
@@ -4626,6 +4649,7 @@ void MainWindow::on_Action_Settings_Settings(void)
     }
 
     Dialog::SettingsDialog dialog(this);
+    dialog.SetControllerConfigAction(this->action_Toolbar_Input);
     const int result = dialog.exec();
 
     if (result == QDialog::Accepted)
@@ -4667,6 +4691,7 @@ void MainWindow::on_Action_Settings_Plugins(void)
     }
 
     Dialog::SettingsDialog dialog(this);
+    dialog.SetControllerConfigAction(this->action_Toolbar_Input);
     dialog.ShowPluginsTab();
     const int result = dialog.exec();
 
@@ -4979,6 +5004,19 @@ void MainWindow::ensureRollbackLobbyDialog()
                 if (this->emulationThread && this->emulationThread->isRunning())
                     CoreStopEmulation();
             });
+    // "Back to Game" in the room. Only the minimized flag is cleared, so a
+    // maximized or fullscreen game comes back the way it was left; showNormal()
+    // would drop fullscreen. Activating the window is what clicking on it does,
+    // and the game's key handling already works from there.
+    connect(this->rollbackLobbyDialog, &Dialog::RollbackLobbyDialog::gameWindowRequested,
+            this, [this]() {
+                if (!this->emulationThread || !this->emulationThread->isRunning())
+                    return;
+                if (this->isMinimized())
+                    this->setWindowState(this->windowState() & ~Qt::WindowMinimized);
+                this->raise();
+                this->activateWindow();
+            });
     connect(this->rollbackLobbyDialog, &Dialog::RollbackLobbyDialog::matchServerConnectionLost,
             this, [this](const QString& message) {
                 if (this->emulationThread && this->emulationThread->isRunning())
@@ -5254,7 +5292,8 @@ void MainWindow::on_Lobby_SessionRequested(QString gameName, QString romFile, QS
     // the highest occupied seat; the player count would drop the top player and
     // shift every label past the gap. Each remotePeers entry is "slot,ip,port",
     // or an option: "seats=N" (a match open to late joiners emulates every
-    // seat) and "join=E" (this client is joining the running match).
+    // seat), "join=E" (this client is joining the running match) and
+    // "local=S:C" (another player on this PC, in seat S on controller C).
     int seatCount = localPlayer;
     bool lateJoiner = false;
     for (const QString& peer : remotePeers)
@@ -5269,6 +5308,11 @@ void MainWindow::on_Lobby_SessionRequested(QString gameName, QString romFile, QS
             lateJoiner = true;
             continue;
         }
+        if (peer.startsWith(QStringLiteral("local=")))
+        {
+            seatCount = std::max(seatCount, peer.mid(6).section(':', 0, 0).toInt());
+            continue;
+        }
         const int slot = peer.section(',', 0, 0).toInt();
         if (slot > seatCount)
             seatCount = slot;
@@ -5278,11 +5322,16 @@ void MainWindow::on_Lobby_SessionRequested(QString gameName, QString romFile, QS
     // from, so it records nothing; the players who started the match have all of it.
     if (!lateJoiner)
     {
-        // A match that starts from save data keeps it in the replay file.
+        // A match that starts from save data keeps it in the replay file, and
+        // so does one played with game options.
         std::string saveData;
         if (!CoreGetNetplaySaveData().IsEmpty())
             CoreSerializeNetplaySaveData(CoreGetNetplaySaveData(), saveData);
         n02::recordingSetSaveData(saveData);
+        std::string gameOptions;
+        if (!CoreGetNetplayGameOptions().IsEmpty())
+            CoreSerializeNetplayGameOptions(CoreGetNetplayGameOptions(), gameOptions);
+        n02::recordingSetGameOptions(gameOptions);
         const std::string recAppName = "RMG-K " + CoreGetVersion();
         n02::recordingOpen(recAppName.c_str(), gameName.toStdString().c_str(),
                            localPlayer, seatCount);
@@ -5532,7 +5581,11 @@ bool MainWindow::handleNetplayChatKeyPress(QKeyEvent *event)
         {
             if (!this->ui_NetplayChatInput.isEmpty())
             {
-                this->ui_NetplayChatInput.chop(1);
+                // one visible character, which can be several code units
+                QTextBoundaryFinder boundary(QTextBoundaryFinder::Grapheme, this->ui_NetplayChatInput);
+                boundary.toEnd();
+                const qsizetype start = boundary.toPreviousBoundary();
+                this->ui_NetplayChatInput.truncate(start > 0 ? start : 0);
                 this->updateNetplayChatPrompt();
             }
             return true;
@@ -5541,17 +5594,7 @@ bool MainWindow::handleNetplayChatKeyPress(QKeyEvent *event)
         const QString text = event->text();
         if (!text.isEmpty())
         {
-            const int maxLength = 127;
-            if (this->ui_NetplayChatInput.size() < maxLength)
-            {
-                const QChar ch = text.at(0);
-                if (!ch.isNull() && (ch.isPrint() || ch.isSpace()))
-                {
-                    this->ui_NetplayChatInput.append(ch);
-                    this->updateNetplayChatPrompt();
-                }
-            }
-            return true;
+            this->appendNetplayChatText(text);
         }
 
         return true;
@@ -5573,9 +5616,7 @@ bool MainWindow::handleNetplayChatKeyPress(QKeyEvent *event)
     QKeySequence pressed(key | event->modifiers());
     if (expected.matches(pressed) == QKeySequence::ExactMatch)
     {
-        this->ui_NetplayChatInputActive = true;
-        this->ui_NetplayChatInput.clear();
-        this->updateNetplayChatPrompt();
+        this->openNetplayChatPrompt();
         return true;
     }
 
@@ -5584,9 +5625,7 @@ bool MainWindow::handleNetplayChatKeyPress(QKeyEvent *event)
         QKeySequence altPressed(Qt::Key_Return | event->modifiers());
         if (expected.matches(altPressed) == QKeySequence::ExactMatch)
         {
-            this->ui_NetplayChatInputActive = true;
-            this->ui_NetplayChatInput.clear();
-            this->updateNetplayChatPrompt();
+            this->openNetplayChatPrompt();
             return true;
         }
     }
@@ -5595,14 +5634,58 @@ bool MainWindow::handleNetplayChatKeyPress(QKeyEvent *event)
         QKeySequence altPressed(Qt::Key_Enter | event->modifiers());
         if (expected.matches(altPressed) == QKeySequence::ExactMatch)
         {
-            this->ui_NetplayChatInputActive = true;
-            this->ui_NetplayChatInput.clear();
-            this->updateNetplayChatPrompt();
+            this->openNetplayChatPrompt();
             return true;
         }
     }
 
     return false;
+}
+
+void MainWindow::openNetplayChatPrompt(void)
+{
+    this->ui_NetplayChatInputActive = true;
+    this->ui_NetplayChatInput.clear();
+    this->ui_NetplayChatPreedit.clear();
+    this->ui_NetplayChatHighSurrogate = QChar();
+    this->updateNetplayChatPrompt();
+
+    this->ui_InputMethodFilter->SetEnabled(true);
+    QGuiApplication::inputMethod()->update(Qt::ImEnabled | Qt::ImCursorRectangle);
+}
+
+void MainWindow::appendNetplayChatText(const QString& text)
+{
+    // Windows sends a character past U+FFFF as two key events, one for each half.
+    QString whole = text;
+    if (!this->ui_NetplayChatHighSurrogate.isNull())
+    {
+        whole.prepend(this->ui_NetplayChatHighSurrogate);
+        this->ui_NetplayChatHighSurrogate = QChar();
+    }
+    if (whole.back().isHighSurrogate())
+    {
+        this->ui_NetplayChatHighSurrogate = whole.back();
+        whole.chop(1);
+    }
+
+    QString accepted;
+    for (const char32_t codePoint : whole.toUcs4())
+    {
+        // the joiners aren't printable, but they're how emoji combine
+        const bool wanted = QChar::isPrint(codePoint) || QChar::isSpace(codePoint) || codePoint == 0x200C || codePoint == 0x200D;
+        if (wanted && codePoint != QChar::ReplacementCharacter)
+        {
+            accepted += QString::fromUcs4(&codePoint, 1);
+        }
+    }
+
+    const int maxLength = 127;
+    if (!accepted.isEmpty() && this->ui_NetplayChatInput.size() + accepted.size() <= maxLength)
+    {
+        this->ui_NetplayChatInput += accepted;
+        this->updateNetplayChatPrompt();
+    }
 }
 
 void MainWindow::updateNetplayChatPrompt(void)
@@ -5612,7 +5695,7 @@ void MainWindow::updateNetplayChatPrompt(void)
         return;
     }
 
-    const std::string prompt = "> " + this->ui_NetplayChatInput.toStdString();
+    const std::string prompt = "> " + (this->ui_NetplayChatInput + this->ui_NetplayChatPreedit).toStdString();
     OnScreenDisplaySetInputPrompt(prompt);
 }
 
@@ -5620,7 +5703,64 @@ void MainWindow::closeNetplayChatPrompt(void)
 {
     this->ui_NetplayChatInputActive = false;
     this->ui_NetplayChatInput.clear();
+    this->ui_NetplayChatPreedit.clear();
     OnScreenDisplaySetInputPrompt("");
+
+    QGuiApplication::inputMethod()->reset();
+    this->ui_InputMethodFilter->SetEnabled(false);
+    QGuiApplication::inputMethod()->update(Qt::ImEnabled);
+}
+
+void MainWindow::on_InputMethodFilter_Query(QInputMethodQueryEvent *event)
+{
+    const Qt::InputMethodQueries queries = event->queries();
+    if (queries & Qt::ImEnabled)
+    {
+        event->setValue(Qt::ImEnabled, true);
+    }
+    if (queries & Qt::ImHints)
+    {
+        event->setValue(Qt::ImHints, static_cast<int>(Qt::ImhNone));
+    }
+    if (queries & Qt::ImSurroundingText)
+    {
+        event->setValue(Qt::ImSurroundingText, this->ui_NetplayChatInput);
+    }
+    if (queries & Qt::ImCursorPosition)
+    {
+        event->setValue(Qt::ImCursorPosition, static_cast<int>(this->ui_NetplayChatInput.size()));
+    }
+    if (queries & Qt::ImCurrentSelection)
+    {
+        event->setValue(Qt::ImCurrentSelection, QString());
+    }
+    if (queries & Qt::ImCursorRectangle)
+    {
+        // Where the prompt sits, near enough for the input method's candidate list
+        // to open beside it rather than in a corner of the screen.
+        const QWidget* surface = this->ui_Widgets->currentWidget();
+        const int location = CoreSettingsGetIntValue(SettingsID::GUI_OnScreenDisplayLocation);
+        const int padX = CoreSettingsGetIntValue(SettingsID::GUI_OnScreenDisplayPaddingX);
+        const int padY = CoreSettingsGetIntValue(SettingsID::GUI_OnScreenDisplayPaddingY);
+        const int promptHeight = 32;
+        const bool right = location == 2 || location == 3;
+        const bool bottom = location == 0 || location == 3;
+        const int x = right ? surface->width() - padX : padX;
+        const int y = bottom ? surface->height() - padY - promptHeight : padY;
+        event->setValue(Qt::ImCursorRectangle, QRect(x, y, 1, promptHeight));
+    }
+    event->accept();
+}
+
+void MainWindow::on_InputMethodFilter_Event(QInputMethodEvent *event)
+{
+    if (!event->commitString().isEmpty())
+    {
+        this->appendNetplayChatText(event->commitString());
+    }
+    this->ui_NetplayChatPreedit = event->preeditString();
+    this->updateNetplayChatPrompt();
+    event->accept();
 }
 
 void MainWindow::showLagReportOverlay(bool wholeMatch)
@@ -5636,9 +5776,11 @@ void MainWindow::showLagReportOverlay(bool wholeMatch)
     {
         // Outside the lobby nobody sends us their numbers; this side's view
         // of the match still tells who it waited on.
-        const QString localNickname = QString::fromStdString(CoreSettingsGetStringValue(SettingsID::Kaillera_Username)).trimmed();
+        const std::array<std::string, 4> labels = GetLiveKailleraPortLabelNames();
         report = Dialog::LagStats::build(
-            Dialog::LagStats::localPlayers(0, [&localNickname](quint64) { return localNickname.isEmpty() ? tr("You") : localNickname; }),
+            Dialog::LagStats::localPlayers(0, [&labels](int slot, quint64) {
+                return slot >= 1 && slot <= 4 ? QString::fromStdString(labels[static_cast<size_t>(slot - 1)]) : QString();
+            }),
             wholeMatch);
     }
 
@@ -6010,6 +6152,7 @@ void MainWindow::on_RomBrowser_EditGameSettings(QString file)
     }
 
     Dialog::SettingsDialog dialog(this, file);
+    dialog.SetControllerConfigAction(this->action_Toolbar_Input);
     dialog.ShowGameTab();
     const int result = dialog.exec();
 
