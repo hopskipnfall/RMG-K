@@ -32,7 +32,7 @@ struct PortMatchInfo
     // the attacker: how many hits *this port* has taken in its current
     // unbroken chain. 0 = no active chain, 1 = a single hit (not yet a
     // "combo" by convention), 2+ = an actual combo. Both zero the instant
-    // the chain breaks. See docs/RMGR_SPEC.md section 7.5 / smashremix
+    // the chain breaks. See docs/RMGR_SPEC.md section 5.2 / smashremix
     // docs/ram-map.md section 13.
     uint32_t comboHitCount;
     uint32_t comboDamage;
@@ -107,7 +107,7 @@ struct ItemObject
     // WPKind value) - which enum `kind` means depends on this.
     uint8_t  linkId;
     // ITKind (linkId == 4) or WPKind (linkId == 5) - see docs/RMGR_SPEC.md
-    // section 7.6 for both enums.
+    // section 8.6 for both enums.
     int32_t  kind;
     float    positionX;
     float    positionY;
